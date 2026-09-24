@@ -70,6 +70,11 @@ pub trait Backend: Send + Sync {
     fn flush_conntrack(&self) -> Result<(), BackendError>;
     /// Whether Ghostnector's table exists in the kernel right now.
     fn table_present(&self) -> Result<bool, BackendError>;
+    /// The policy as the kernel currently reports it, for comparison against what was applied.
+    ///
+    /// An absent table is reported as an empty string rather than an error: "the policy is gone" is
+    /// an answer, not a failure of the tool.
+    fn list_table(&self) -> Result<String, BackendError>;
 }
 
 /// The real backend: `nft` for policy, `conntrack` for flow state.
@@ -187,40 +192,31 @@ impl Backend for NftCli {
     }
 
     fn table_present(&self) -> Result<bool, BackendError> {
+        Ok(!self.list_table()?.is_empty())
+    }
+
+    fn list_table(&self) -> Result<String, BackendError> {
         let output = Command::new(&self.nft)
-            .args(["-j", "list", "tables"])
+            .args(["list", "table", "inet", TABLE_NAME])
             .output()
             .map_err(|error| BackendError::Io {
                 path: self.nft.clone(),
                 reason: error.to_string(),
             })?;
 
-        if !output.status.success() {
-            return Err(BackendError::Listing(describe_failure(
-                &output.stderr,
-                output.status.code(),
-            )));
+        if output.status.success() {
+            return Ok(String::from_utf8_lossy(&output.stdout).to_string());
         }
 
-        let parsed: serde_json::Value =
-            serde_json::from_slice(&output.stdout).map_err(|error| BackendError::Unparsable {
-                path: self.nft.clone(),
-                reason: error.to_string(),
-            })?;
-
-        let tables = parsed
-            .get("nftables")
-            .and_then(|value| value.as_array())
-            .ok_or_else(|| BackendError::Unparsable {
-                path: self.nft.clone(),
-                reason: "no table list in the output".to_string(),
-            })?;
-
-        Ok(tables.iter().any(|entry| {
-            let table = entry.get("table");
-            table.and_then(|t| t.get("name")).and_then(|n| n.as_str()) == Some(TABLE_NAME)
-                && table.and_then(|t| t.get("family")).and_then(|f| f.as_str()) == Some("inet")
-        }))
+        // A missing table is the answer "there is no policy", not a tool failure.
+        let said = String::from_utf8_lossy(&output.stderr);
+        if said.contains("No such file or directory") {
+            return Ok(String::new());
+        }
+        Err(BackendError::Listing(describe_failure(
+            &output.stderr,
+            output.status.code(),
+        )))
     }
 }
 

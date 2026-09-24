@@ -11,7 +11,7 @@
 use std::fmt;
 
 use crate::ir::{Chain, Expr, Proto, RuleOrigin, Ruleset, Verdict};
-use ghostnector_spec::exemption::Exemption;
+use ghostnector_spec::exemption::{Exemption, SUBJECT_DHCP};
 use ghostnector_spec::profile::Scope;
 use serde::{Deserialize, Serialize};
 
@@ -159,6 +159,9 @@ pub enum ViolationCode {
     UndeclaredSetReference,
     /// A rule matches a destination port without a transport protocol, which is not a valid match.
     InvalidRuleShape,
+    /// A DHCP exemption does not match the client's own port as a source, so it permits the
+    /// direction a client never sends and drops the one it does.
+    DhcpExemptionDirection,
 }
 
 impl ViolationCode {
@@ -192,6 +195,7 @@ impl ViolationCode {
             }
             ViolationCode::UndeclaredSetReference => "undeclared_set_reference",
             ViolationCode::InvalidRuleShape => "invalid_rule_shape",
+            ViolationCode::DhcpExemptionDirection => "dhcp_exemption_direction",
         }
     }
 }
@@ -343,6 +347,23 @@ fn check_egress(
                                 index,
                                 ViolationCode::UnenumeratedAccept,
                                 format!("exemption '{subject}' is not in the effective list"),
+                            ));
+                        }
+                        // A DHCP client sends *from* its own port *to* the server's. An exemption
+                        // that matches only a destination port permits the direction a client never
+                        // uses and drops the one it does, so the link dies while the policy claims
+                        // to keep it alive.
+                        if subject == SUBJECT_DHCP
+                            && !rule
+                                .exprs
+                                .iter()
+                                .any(|expr| matches!(expr, Expr::Sport { .. }))
+                        {
+                            out.push(InvariantViolation::in_rule(
+                                chain,
+                                index,
+                                ViolationCode::DhcpExemptionDirection,
+                                "a DHCP exemption must match the client's port as a source",
                             ));
                         }
                     }
@@ -675,7 +696,8 @@ mod tests {
                             rule(
                                 vec![
                                     Expr::L4Proto { proto: Proto::Udp },
-                                    Expr::Dport { port: 68 },
+                                    Expr::Sport { port: 68 },
+                                    Expr::Dport { port: 67 },
                                 ],
                                 Verdict::Accept,
                                 exemption("dhcp-client"),
@@ -805,6 +827,38 @@ mod tests {
         assert!(violations
             .iter()
             .any(|v| v.code == ViolationCode::UnenumeratedAccept));
+    }
+
+    #[test]
+    fn a_dhcp_exemption_matching_only_a_destination_is_caught() {
+        let exemptions = tor_baseline();
+        let ports = [TRANS_PORT, DNS_PORT];
+        let mut ruleset = good_ruleset();
+        {
+            let rules = &mut ruleset.chain_mut("out_filter").expect("out_filter").rules;
+            let dhcp = rules
+                .iter_mut()
+                .find(|rule| {
+                    matches!(
+                        &rule.origin,
+                        RuleOrigin::Exemption { subject } if subject == "dhcp-client"
+                    )
+                })
+                .expect("the reference ruleset has a DHCP exemption");
+            // The inverted shape, which the reference ruleset used to carry: the destination port a
+            // server would send to, and no source-port match at all.
+            dhcp.exprs = vec![
+                Expr::L4Proto { proto: Proto::Udp },
+                Expr::Dport { port: 68 },
+            ];
+        }
+        let violations = check(&ruleset, &context(&exemptions, &ports, Scope::System)).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.code == ViolationCode::DhcpExemptionDirection),
+            "{violations:?}"
+        );
     }
 
     #[test]

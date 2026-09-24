@@ -15,6 +15,7 @@ use crate::identities::{Identities, IdentityError};
 pub struct MockBackend {
     applied: Mutex<Vec<String>>,
     table: Mutex<bool>,
+    live: Mutex<String>,
     flush_calls: Mutex<usize>,
     fail_apply: Mutex<Option<String>>,
     conntrack_usable: bool,
@@ -53,6 +54,13 @@ impl MockBackend {
     pub fn force_table(&self, present: bool) {
         *self.table.lock().expect("mock lock") = present;
     }
+
+    /// Add a line to what the kernel reports, as another tool would.
+    pub fn tamper(&self, extra: &str) {
+        let mut live = self.live.lock().expect("mock lock");
+        live.push('\n');
+        live.push_str(extra);
+    }
 }
 
 impl Backend for MockBackend {
@@ -65,7 +73,18 @@ impl Backend for MockBackend {
             .expect("mock lock")
             .push(script.to_string());
         // A replacement script defines the table; a revert script only destroys it.
-        *self.table.lock().expect("mock lock") = script.contains("table inet ghostnector {");
+        let defines = script.contains("table inet ghostnector {");
+        *self.table.lock().expect("mock lock") = defines;
+        // What the kernel would report back: the table, without the replacement's destroy line.
+        *self.live.lock().expect("mock lock") = if defines {
+            script
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("destroy table"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            String::new()
+        };
         Ok(())
     }
 
@@ -82,6 +101,13 @@ impl Backend for MockBackend {
 
     fn table_present(&self) -> Result<bool, BackendError> {
         Ok(*self.table.lock().expect("mock lock"))
+    }
+
+    fn list_table(&self) -> Result<String, BackendError> {
+        if !*self.table.lock().expect("mock lock") {
+            return Ok(String::new());
+        }
+        Ok(self.live.lock().expect("mock lock").clone())
     }
 }
 

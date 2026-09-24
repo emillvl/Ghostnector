@@ -34,6 +34,11 @@ Two consequences follow, and both are load-bearing:
 - `Protected` is **bounded in time**: a result older than the configured window stops counting, and
   the state falls back to `Degraded`. The bound is the verification interval plus its timeout.
 
+One check is not a probe of traffic but a comparison of the kernel's own ruleset against the one the
+helper applied. It exists because a policy change that no probe traverses cannot be found by any
+amount of probing, and it is what makes PC-08 hold for changes rather than for probed changes only.
+The comparison is text from the same formatter on both sides, so it is exact rather than heuristic.
+
 `Protected` does **not** mean anonymous, unlinkable, or safe from a compromised host. It does not mean
 "nothing can escape". Those are not claims this program makes anywhere.
 
@@ -55,7 +60,7 @@ everything until a person looks at it.
 | Falsifies | A TCP segment from a protected uid observed at an independent boundary addressed to a clearnet destination; or a direct connection succeeding while the state claims protection. |
 | Inconclusive | The boundary was not observed; or the attempt failed for a reason unrelated to the policy (no route, no listener). |
 | On falsification | `Blocked`, fail-closed baseline applied, the mismatch reported. Release blocker. |
-| Evidence today | **Policy level: verified** (`policy-netns-test.sh`: uid 0 delivers 0 packets to the destination, `arrival_packets=0`). **Through the full stack: not yet observed** (see G2). |
+| Evidence today | **Verified end to end.** AS-1 reaches the destination exactly once with nothing crossing from the machine's address; the transition storm (AL-1) and the fail-closed panic (AL-7) put zero prohibited packets on the wire; a link flap, a route change, an address change and a new interface (AN-1…AN-5) open no path. The only direct egress from the machine's own address that was ever observed is the exempted Tor uid (AE-1). |
 
 ### PC-02 — Ordinary UDP egress is denied
 
@@ -69,7 +74,7 @@ everything until a person looks at it.
 | Falsifies | Any reply. A reply is proof that the datagram left. |
 | Inconclusive | No UDP endpoint configured; or the send failed locally for an unrelated reason. |
 | On falsification | `Blocked`, fail-closed baseline applied. This is implemented and exercised. |
-| Evidence today | **Verified**, including end to end: the check runs as an ordinary process, and the tamper test (PC-08) shows that one hand-edited rule makes it alarm. |
+| Evidence today | **Verified end to end**: AS-2 and the transition storms (AL-1/AL-4/AL-7) put no datagram on the wire; AC-4 shows one hand-edited UDP-permitting rule is enough to alarm; AE-1 shows UDP from the machine's address arrives only from the Tor uid. |
 
 ### PC-03 — DNS leaves only through the chokepoint
 
@@ -83,7 +88,7 @@ everything until a person looks at it.
 | Falsifies | A port-53 datagram from a protected uid observed at an independent boundary; or an answer from a resolver other than the chokepoint. |
 | Inconclusive | No canary configured, so a wrong answer cannot be told from a right one. |
 | On falsification | `Blocked`, fail-closed baseline applied. |
-| Evidence today | **Partially verified**: a hand-aimed query lands on the chokepoint and reaches the configured upstream (end to end). The "the ISP resolver never sees it" half is **not testable without the vantage point** (G8). |
+| Evidence today | **Verified end to end**: AS-5 and AS-6 send to a foreign resolver and the chokepoint answers with the configured upstream's address while the machine's own address puts nothing on the wire; AE-4 confirms there is no resolver exemption in Tor mode. **RC1 falsified this claim**: D-15 (shared chain priority) let redirects race the filter, so a query could leave without the chokepoint ever being involved. The fixes are in the priority split and the loopback destination sets (D-16), and the claim holds only from those commits on. The "the resolver that would have received it never sees it" half still needs an external vantage (G8). |
 
 ### PC-04 — IPv4 is covered by PC-01, PC-02 and PC-03
 
@@ -107,19 +112,19 @@ everything until a person looks at it.
 | Falsifies | An IPv6 packet from a protected uid observed at an independent boundary; or a successful IPv6 connection while protection is claimed. |
 | Inconclusive | **The machine has no IPv6 connectivity at all.** A failed IPv6 attempt on a IPv4-only link proves nothing about the policy and must never be recorded as a pass. |
 | On falsification | `Blocked`, fail-closed baseline applied. |
-| Evidence today | **Not yet observed.** Every existing test is IPv4-only. This is the largest untested area of confinement (G1). |
+| Evidence today | **Verified on a v6-capable link**: AS-3 attempts an IPv6 connection with addresses and a default route present and observes no IPv6 packet from the machine; AS-4 records INCONCLUSIVE on a run that has no IPv6, as required; AN-4 removes the IPv6 address while protected and nothing changes. **Still unobserved**: `system-user:tor` reaching a relay over IPv6 when the network is v6-only — the exemption's own v6 path (G1). |
 
 ### PC-08 — Tampering with the policy is noticed
 
 | | |
 |---|---|
 | Property | A modification of Ghostnector's kernel policy that would permit prohibited traffic is detected, and the machine is denied before it is trusted again. |
-| Responsible | The verification probes (specifically the UDP check) and the engine's escalate-then-reapply: on an alarm the fail-closed baseline replaces whatever is in the kernel. |
+| Responsible | The verification probes, the effective-policy comparison (`netd` reports what the kernel holds and compares it against what was applied), and the engine's escalate-then-reapply: on an alarm the fail-closed baseline replaces whatever is in the kernel. |
 | In scope | Any change to `table inet ghostnector` made by anything other than `netd`. |
-| Falsifies | A change that permits traffic a configured check exercises goes unnoticed for longer than one verification interval plus timeout. |
-| Inconclusive | The change permits only traffic that no configured check exercises — **this is the known gap, and it is not a pass** (G3). |
+| Falsifies | A change that permits prohibited traffic goes unnoticed for longer than one verification interval plus timeout. |
+| Inconclusive | The comparison could not run (the helper could not be reached), so the policy's contents were not checked. The state falls back to `Degraded`; this is not a pass. |
 | On falsification | `Blocked` and re-deny. |
-| Evidence today | **Verified for the probed class**: a hand-edited `udp accept` rule is detected within the interval, the machine is denied, the reason is stated, and the tampered table is replaced. **Not covered**: a change that leaves UDP denied, such as allowing one TCP destination (G3). |
+| Evidence today | **Verified for changes to the policy.** A hand-edited `udp accept` rule is detected within the interval (AC-4); a change that leaves UDP denied but permits one TCP destination is detected by comparing the kernel's ruleset against the one that was applied (AC-5), and the tampered table is replaced. **RC1 did not hold this claim**: only the probed class was covered, which is what AC-5 demonstrated (gap G3). The comparison is not cryptographic and does not pretend to be: it detects a change to the ruleset, and a process that holds `CAP_NET_ADMIN` can replace the comparison's subject or remove the policy entirely — that is the same out-of-scope line as root (G10). |
 
 ### PC-16 — The policy disappearing is noticed
 
@@ -130,7 +135,7 @@ everything until a person looks at it.
 | Confirms | `nft destroy table inet ghostnector` is followed, within one verification interval plus timeout, by `Blocked` with the baseline in the kernel. |
 | Falsifies | The table gone and the state still claiming protection after that bound. |
 | Inconclusive | The bound has not yet elapsed. **The claim is therefore bounded, and the bound is part of the claim.** |
-| Evidence today | **Verified** for the removal case by the same test as PC-08. |
+| Evidence today | **Verified** for the removal case: AC-3 destroys the table by hand, observes the machine's own address putting packets on the wire during the window (the injected fault, 290 packets), then within one interval plus timeout observes `no traffic can leave` with the baseline in the kernel and zero packets afterwards. |
 
 ## Claims about availability
 
@@ -148,7 +153,7 @@ reason reported is different, and it must read differently to a person.
 | Falsifies | The endpoint does not answer while protection is claimed. |
 | Inconclusive | No endpoint configured; a non-200 answer from an endpoint that is merely broken. |
 | On falsification | `Blocked`, fail-closed baseline applied, reason says availability rather than confinement. |
-| Evidence today | **Unit-tested** against local stand-ins. **Not observed end to end**, because the end-to-end run configures only the UDP check (G2). |
+| Evidence today | **Verified end to end.** The full-stack runs configure the HTTP check endpoint, the UDP check and the canary, and reach `protected - and verified`, which requires the endpoint to answer `200` to a request made by an ordinary unprivileged identity through the policy. **RC1 falsified this claim** in the same run as PC-03 (D-15/D-16: the redirect raced the filter, so the path was not reliably the chokepoint's), and the fix restored it. |
 
 ### PC-07 — The exit is not this machine
 
@@ -160,7 +165,7 @@ reason reported is different, and it must read differently to a person.
 | Confirms | A `200` whose body's first address is not one of this machine's addresses. |
 | Falsifies | The reported address is one of this machine's own addresses. |
 | Inconclusive | The endpoint answers `200` without reporting an address. **This is not a pass.** |
-| Evidence today | **Unit-tested** with a local stand-in. **Not observed end to end** (G2). |
+| Evidence today | **Verified against a standalone endpoint**: the end-to-end runs configure a check URL whose body reports an address in TEST-NET-3, the check compares it against this machine's interfaces, and the state reaches `protected - and verified`. That the reported address belongs to a **Tor exit** remains outside the claim and needs an external vantage (G8). |
 
 ### PC-11 — Tor stopping does not open anything
 
@@ -172,7 +177,7 @@ reason reported is different, and it must read differently to a person.
 | Falsifies | Any protected traffic reaching the boundary after Tor stopped. |
 | Inconclusive | Nothing attempted. |
 | On falsification | `Blocked`. |
-| Evidence today | **Not yet tested** (G4). |
+| Evidence today | **Verified end to end**: AF-1 kills Tor, a protected connection then fails, and the machine's own address puts nothing on the wire afterwards. |
 
 ### PC-13 — The DNS relay stopping does not open anything
 
@@ -182,7 +187,7 @@ reason reported is different, and it must read differently to a person.
 | Responsible | The redirect points at a port where nothing listens; the filter's default deny is the second line. |
 | Confirms | With the relay killed, a protected query gets no answer, and no port-53 packet arrives at the boundary. |
 | Falsifies | A port-53 datagram from a protected uid at the boundary. |
-| Evidence today | **Not yet tested** (G4). |
+| Evidence today | **Verified end to end**: AF-2 kills the relay, resolution then fails, and nothing reaches the boundary. |
 
 ## Claims about state
 
@@ -196,7 +201,7 @@ reason reported is different, and it must read differently to a person.
 | Confirms, in both directions | (a) the exempted identity performs the documented traffic; (b) an identity **not** covered by that exemption cannot obtain the same path. |
 | Falsifies | Traffic from a non-exempt identity taking an exempt path; or an exemption in the kernel that the report does not list. |
 | Inconclusive | The test itself ran with privileges that produced the path — **an exemption that passes because the test was special is not evidence**. |
-| Evidence today | **Verified for `system-user:tor` and `system-user:dnscrypt-proxy`** in both directions (the policy test allows exactly those uids and blocks uid 0 with 0 packets observed). **Not tested**: the DHCP and LAN exemptions (G7). |
+| Evidence today | **Verified in both directions for all four documented subjects**: `system-user:tor` (AE-1: the Tor uid's direct connection arrived from the machine's own address while an ordinary uid's did not), `dhcp-client` (AE-2: a request from 68 to 67 left; an ordinary source port and the inverted shape did not), the LAN set (AE-3: unreachable by default, directly reachable when opted in), and the resolver (AE-4/PC-03: loopback only, no exemption). **RC1 did not hold this claim**: the DHCP exemption was compiled against the wrong port (D-18) and permitted the one direction a client never sends. The machine's own confinement is verified by the policy test (uid 0 puts 0 packets on the wire). **Known narrowing**: the DHCP exemption is IPv4 only, because IPv6 is denied in every profile; a network whose connectivity can only be maintained by DHCPv6 lease renewal is not supported while protected (G11). |
 
 ### PC-10 — Boot with protection requested
 
@@ -220,7 +225,7 @@ reason reported is different, and it must read differently to a person.
 | Confirms | With `core` killed, the policy is still in the kernel and protected traffic is still confined. |
 | Falsifies | Any loosening coincident with `core` dying. |
 | Inconclusive | **Nobody can be asked for the state.** "Cannot reach the control plane" is not evidence of a leak, and must never be shown as one. |
-| Evidence today | **Not yet tested** (G4). |
+| Evidence today | **Verified end to end**: AF-3 kills the control plane and the policy is still in the kernel with nothing crossing; AF-4 does the same for the privileged helper. |
 
 ### PC-14 — Transitions never widen the policy
 
@@ -231,7 +236,7 @@ reason reported is different, and it must read differently to a person.
 | Confirms | A storm of connect/disconnect with a storm of traffic from a protected process produces **zero** prohibited packets at an independent boundary. |
 | Falsifies | One prohibited packet observed during any transition. |
 | Inconclusive | No traffic attempted during the window. |
-| Evidence today | The ordering is unit-tested. **The storm is not** (G5). |
+| Evidence today | **Verified with a sampling oracle**: rather than counting packets before and after, the oracle reads the packet count and the reported state together, and a violation is an increase while the machine still reports protection. AL-1 (connect under load), AL-4 (disconnect under load) and AL-7 (panic under load) all hold. The oracle also found **D-19** — the state was updated after the policy was removed, so for a few hundred microseconds a caller would have been told "protected" while there was no policy; the transition is now announced before anything is touched. |
 
 ### PC-15 — Disconnecting restores what was there
 
@@ -253,27 +258,56 @@ reason reported is different, and it must read differently to a person.
 - **Not protection for anything outside the scope.** A machine-wide scope covers local processes; it
   does not cover other machines, and `USER` scope does not cover root daemons.
 - **Not protection against the host.** Root, the kernel, and a compromised boot chain are out of
-  scope, as is anything an application reveals about itself.
+  scope, as is anything an application reveals about itself. In particular, anything holding
+  `CAP_NET_ADMIN` can replace the policy, or the comparison that watches it (G10).
 - **Not a claim that unconfigured checks passed.** They did not run.
+- **Not a claim about DHCPv6.** The DHCP exemption is IPv4; a network that can only maintain
+  connectivity through DHCPv6 lease renewal is not supported while protected (G11).
 
 ## Gaps
 
 Every gap here is a place where the implementation may be right but the claim is not yet supported by
-an observation. They are the agenda for the adversarial phase.
+an observation. They are the agenda for the adversarial phase. A gap that was closed by an
+observation is marked **closed**, with the case that closed it; a gap that changed shape is marked
+**narrowed**.
 
 | # | Gap | Claim affected |
 |---|---|---|
-| G1 | IPv6 has never been exercised. A v4-only link makes an IPv6 test inconclusive, so this needs a v6-capable environment. | PC-05 |
-| G2 | The end-to-end run configures only the UDP check, so availability and identity were never observed through the full stack. | PC-06, PC-07 |
-| G3 | Only the probed class of tampering is detected. A change that leaves UDP denied is invisible. | PC-08 |
-| G4 | No test kills Tor, the relay, or the control plane. | PC-11, PC-12, PC-13 |
-| G5 | Transition storms have never been run against an independent boundary. | PC-14 |
-| G6 | The boot ordering claim is not observed: we know the policy is applied, not that nothing left before it was. | PC-10 |
-| G7 | The DHCP and LAN exemptions are untested in both directions. | PC-09 |
-| G8 | No vantage point outside the machine, so the ISP-facing half of DNS and the "is it a Tor exit" question cannot be answered. | PC-03, PC-07 |
-| G9 | `Protected` is reachable with only a subset of checks configured. The interface lists what did not run, but nothing forces a minimum. | the definition of `Protected` |
+| G1 | **Narrowed.** IPv6 *denial* is now verified on a v6-capable link (AS-3) and correctly INCONCLUSIVE on a v4-only one (AS-4). Still unobserved: `system-user:tor` reaching a relay over IPv6 when the network is v6-only. | PC-05, PC-09 |
+| G2 | **Closed.** The end-to-end runs configure the HTTP check endpoint, the UDP check and the canary, so availability and exit identity are observed through the full stack (PC-06, PC-07). | PC-06, PC-07 |
+| G3 | **Closed.** The helper compares the kernel's own ruleset against the one it applied; a change no probe traverses is detected within one interval and overwritten (AC-5). | PC-08 |
+| G4 | **Closed.** AF-1…AF-4 kill Tor, the relay, the control plane and the helper; the policy survives each, and nothing crosses. | PC-11, PC-12, PC-13 |
+| G5 | **Closed.** AL-1, AL-4 and AL-7 run the storms under a sampling oracle that attributes every crossing to the state reported at that moment. | PC-14 |
+| G6 | **Open.** The boot ordering claim is not observed: we know the policy is applied at boot, not that nothing left before it was. | PC-10 |
+| G7 | **Closed.** The Tor uid, the DHCP client and the LAN set are all exercised in both directions (AE-1…AE-3), and the resolver's absence is exercised too (AE-4). | PC-09 |
+| G8 | **Open.** No vantage point outside the machine, so the ISP-facing half of DNS and the "is it a Tor exit" question cannot be answered. | PC-03, PC-07 |
+| G9 | **Open.** `Protected` is reachable with only a subset of checks configured. The interface lists what did not run, but nothing forces a minimum. | the definition of `Protected` |
+| G10 | **Out of scope, stated.** Root and anything holding `CAP_NET_ADMIN` can replace the policy, the comparison's subject, or the helper. This is the same line as the host being trusted; the comparison detects accidental and non-privileged divergence, not a privileged attacker. | PC-08, all confinement claims |
+| G11 | **Narrowing.** The DHCP exemption is IPv4 only, because IPv6 is denied in every profile. A network whose connectivity can only be maintained by DHCPv6 lease renewal is not supported while protected. | PC-09 |
+| G12 | **New, availability.** A transient loss of connectivity can leave the machine `Blocked` until a person acts, because a verification failure is answered with the fail-closed baseline (observed in AN-1). This is deliberate, and it is a cost rather than a leak. | PC-06, PC-14 |
+| G13 | **New, residual.** The exemption list is derived from the rules that cite it and the invariant checker refuses an accept citing no listed exemption, but a one-by-one kernel-versus-report diff is not executed end to end. | PC-09 |
 
-## Appendix — what was verified for this candidate
+## What RC1 got wrong, and what M7 changed
+
+RC1 (`v1.0.0-rc1`) is preserved as it was, and it was **not** a candidate whose claims all held. The
+adversarial campaign falsified two of them, found three more defects behind them, and demonstrated
+that a fourth claim was narrower than it read. That is recorded here rather than rewritten, because a
+claim that was never falsified has not been tested.
+
+| Defect | What it did to a claim | Fix |
+|---|---|---|
+| D-15, D-16 | **Falsified PC-03 and PC-06.** The `nat` and `filter` chains shared one priority, so their order was undefined and a redirect could race the filter that denies; and because the kernel recomputes the route after the filter verdict, a redirected packet's output interface in the filter chain is its *original* one, so the loopback allowance never matched redirected traffic. | Distinct priorities (`nat -100`, `filter 0`), an invariant that refuses a nat chain which can precede the filter, and loopback matched as a destination set (`127.0.0.0/8`, `::1/128`) in both chains. |
+| D-17 | A relay that started and immediately exited was reported as protection. | The engine checks the relay is still running after start and fails the connect. |
+| D-18 | **PC-09 was narrower than it read**: the DHCP exemption was compiled as `udp dport 68`, so it permitted the direction a client never sends and discarded the one it does — the link would die at the first renewal while the policy claimed to keep it alive. | `udp sport 68 udp dport 67`, a `Sport` expression in the IR, an invariant that refuses a DHCP exemption without a source-port match, and AE-2 observing both directions. |
+| D-19 | **PC-14 was narrower than it read**: a disconnect removed the policy before the state stopped reporting protection, so for a few hundred microseconds a caller would have been told "protected" with no policy in the kernel. | The transition is announced before anything is touched, and a machine already `Off` announces nothing. |
+| — | **PC-08 was not held as this document uses the term**: only tampering that a probe traverses could be detected (G3, demonstrated by AC-5). | The helper records the kernel's own report of the policy it applied and compares against it; a difference is an alarm and the fail-closed baseline replaces the table. |
+
+What remains unverified is the list of open gaps above, and it is never to be read as passing.
+
+## Appendix A — RC1, as it was
+
+**Two claims below were subsequently falsified by the M7 campaign** (PC-03, PC-06, through D-15 and
+D-16); the entries are left as they stood so the falsification can be read against them.
 
 - **Commit under test:** `14586614f98fca7759dc3bec5bd884dd66464566` (tagged `v1.0.0-rc1`)
 - **Environment:** Ubuntu 24.04.5 LTS, kernel 6.18.33.2-microsoft-standard-WSL2, nftables 1.0.9,
@@ -289,3 +323,28 @@ The clippy gate found two lints in the first pass that the Windows-hosted clippy
 because the affected crate is `#![cfg(unix)]` and compiles to nothing on Windows. They were fixed
 before the tag. This is recorded because it is a property of the gate, not of the code: **clippy must
 be run against the target platform, not the development host.**
+
+## Appendix B — RC2, and what M7 verified for it
+
+- **Commit under test:** the commit this document is part of, tagged `v1.0.0-rc2`
+- **Environment:** Ubuntu 24.04.5 LTS, kernel 6.18.33.2-microsoft-standard-WSL2, nftables 1.0.9,
+  rustc/cargo 1.98.1
+- **Unit tests:** 291 passed, 0 failed
+- **Integration:** `policy-netns-test.sh` PASS · `netd-socket-test.sh` PASS · `bootguard-test.sh`
+  PASS · `core-cli-test.sh` PASS
+- **Adversarial suite** (`scripts/adversarial.sh`, 27 cases): **26 held, 0 contradicted, 1
+  inconclusive by design** (AS-4: IPv6 denial is not demonstrated on a run whose link has no IPv6;
+  it is demonstrated on the v6-capable runs, AS-3). No expected-failure marker remains: the case
+  that demonstrated a gap at RC1 (AC-5) now holds.
+- **Static checks:** `cargo clippy --workspace --all-targets -D warnings` clean · `cargo check
+  --workspace --all-targets` clean · `cargo fmt --all --check` clean
+- **Defects found and fixed in this campaign:** D-15…D-20, each with a regression test that fails on
+  the old behaviour (see `ADVERSARIAL-TEST-PLAN.md`, Appendix A)
+- **Claims changed by the campaign:** PC-03, PC-06 and PC-09 falsified at RC1 and verified after the
+  fixes; PC-08 widened from "probed changes" to "changes to the policy"; PC-14 tightened by D-19;
+  PC-01, PC-02, PC-05, PC-07, PC-11, PC-12, PC-13 moved from "not observed" to verified end to end
+- **Open, and not passing:** G6 (boot ordering), G8 (external vantage), G9 (a minimum set of
+  configured checks), G10 (privileged attackers, out of scope), G11 (DHCPv6), G12 (a transient
+  outage can leave the machine blocked until a person acts), G13 (one-by-one exemption diff)
+- **Working tree:** clean at the tag. The release-qualification suite was then re-run against a fresh
+  checkout of the tagged commit; its result is appended below.

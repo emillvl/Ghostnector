@@ -38,7 +38,7 @@ table inet ghostnector {
         ip6 daddr @loopback6 counter accept comment "traffic to a loopback address cannot leave the machine"
         oifname "lo" counter accept comment "loopback cannot reach the clearnet"
         meta skuid 987 counter accept comment "Tor's own egress"
-        udp dport 68 counter accept comment "keep the link alive"
+        udp sport 68 udp dport 67 counter accept comment "keep the link alive"
         ip daddr @lan4 counter accept comment "the local network is opted in"
         ip6 daddr @lan6 counter accept comment "the local network is opted in"
         meta l4proto udp counter reject with icmpx type port-unreachable comment "QUIC and real-time clients must fail in milliseconds, not hang"

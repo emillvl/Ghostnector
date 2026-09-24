@@ -132,6 +132,14 @@ pub enum HelperResponse {
     },
     /// The current state, with nothing changed.
     Report(crate::backend::Report),
+    /// The answer to [`crate::backend::Verb::Verify`].
+    Verified {
+        /// Whether the kernel's policy is the one that was applied.
+        matches: bool,
+        /// The first difference, or a note when there is none. Policy text only: no destinations
+        /// and no traffic.
+        detail: String,
+    },
     /// The verb failed.
     Error(ErrorBody),
 }

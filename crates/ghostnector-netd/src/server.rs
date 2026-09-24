@@ -65,8 +65,44 @@ pub enum ServerError {
 #[derive(Debug, Default)]
 struct Applied {
     profile: Option<ProfileId>,
+    params: Option<Params>,
     exemptions: Vec<Exemption>,
     notes: Vec<String>,
+    /// The kernel's own report of the policy that was applied, canonicalised. The comparison at
+    /// verification time is against *this*, not against what the helper intended to write, so a
+    /// change made by anything else is visible even though the helper knows nothing about it.
+    effective: Option<String>,
+}
+
+/// Reduce a kernel ruleset listing to the part that describes policy rather than traffic.
+///
+/// Counters carry live values, so they change with use and are not part of the policy. Everything
+/// else is compared exactly: this runs against two listings from the same formatter, so there is no
+/// brittleness to trade against precision.
+fn canonical(ruleset: &str) -> String {
+    let mut out = String::new();
+    for line in ruleset.lines() {
+        if line.trim_start().starts_with("destroy table") {
+            continue;
+        }
+        let mut kept: Vec<&str> = Vec::new();
+        let mut tokens = line.split_whitespace().peekable();
+        while let Some(token) = tokens.next() {
+            if (token == "packets" || token == "bytes")
+                && kept.last().is_some_and(|last| *last == "counter")
+            {
+                tokens.next(); // the number that follows
+                continue;
+            }
+            kept.push(token);
+        }
+        if kept.is_empty() {
+            continue;
+        }
+        out.push_str(&kept.join(" "));
+        out.push('\n');
+    }
+    out
 }
 
 /// The privileged helper.
@@ -145,6 +181,10 @@ impl<B: Backend + 'static, I: Identities + 'static> Server<B, I> {
             },
             Verb::FlushConntrack => match self.flush() {
                 Ok(report) => HelperResponse::Applied { report },
+                Err(body) => HelperResponse::Error(body),
+            },
+            Verb::Verify => match self.verify_policy() {
+                Ok((matches, detail)) => HelperResponse::Verified { matches, detail },
                 Err(body) => HelperResponse::Error(body),
             },
             Verb::Report => HelperResponse::Report(self.report()),
@@ -275,6 +315,14 @@ impl<B: Backend + 'static, I: Identities + 'static> Server<B, I> {
             Err(error) => return Err(self.problem(ErrorCode::BackendFailure, error.to_string())),
         }
 
+        // Record what the kernel says it has. Everything later is compared against this, so a change
+        // made by anything else is visible even though this helper knows nothing about it.
+        let effective = self
+            .backend
+            .list_table()
+            .map(|live| canonical(&live))
+            .map_err(|error| self.problem(ErrorCode::BackendFailure, error.to_string()))?;
+
         let mut notes = Vec::new();
         if let Err(error) = self.backend.flush_conntrack() {
             notes.push(format!(
@@ -296,8 +344,10 @@ impl<B: Backend + 'static, I: Identities + 'static> Server<B, I> {
         {
             let mut applied = self.lock();
             applied.profile = Some(profile);
+            applied.params = Some(params.clone());
             applied.exemptions = compiled.exemptions;
             applied.notes = notes;
+            applied.effective = Some(effective);
         }
         Ok(self.report())
     }
@@ -313,12 +363,70 @@ impl<B: Backend + 'static, I: Identities + 'static> Server<B, I> {
         }
         Ok(self.report())
     }
-
     fn flush(&self) -> Result<Report, ErrorBody> {
         self.backend
             .flush_conntrack()
             .map_err(|error| self.problem(ErrorCode::BackendFailure, error.to_string()))?;
         Ok(self.report())
+    }
+
+    /// Compare the kernel's policy against the one that was applied, and say where they differ.
+    fn verify_policy(&self) -> Result<(bool, String), ErrorBody> {
+        let expected = self.lock().effective.clone();
+        let Some(expected) = expected else {
+            return Ok((
+                true,
+                "nothing is applied, so there is nothing to compare".to_string(),
+            ));
+        };
+
+        let live = self
+            .backend
+            .list_table()
+            .map_err(|error| self.problem(ErrorCode::BackendFailure, error.to_string()))?;
+        let live = canonical(&live);
+        if live == expected {
+            return Ok((
+                true,
+                "the kernel's policy is the one that was applied".to_string(),
+            ));
+        }
+
+        if live.is_empty() {
+            return Ok((
+                false,
+                "the policy is no longer in the kernel at all".to_string(),
+            ));
+        }
+
+        // Name the first difference, which is policy text and contains no destinations.
+        let expected_lines: Vec<&str> = expected.lines().collect();
+        let live_lines: Vec<&str> = live.lines().collect();
+        for (index, (want, got)) in expected_lines.iter().zip(live_lines.iter()).enumerate() {
+            if want != got {
+                return Ok((
+                    false,
+                    format!(
+                        "line {} of the policy differs: applied '{want}' but the kernel has '{got}'",
+                        index + 1
+                    ),
+                ));
+            }
+        }
+        let difference = if live_lines.len() > expected_lines.len() {
+            format!(
+                "the kernel has a line that was not applied: '{}'",
+                live_lines[expected_lines.len()]
+            )
+        } else if live_lines.len() < expected_lines.len() {
+            format!(
+                "the kernel is missing a line that was applied: '{}'",
+                expected_lines[live_lines.len()]
+            )
+        } else {
+            "the policy in the kernel differs from the one that was applied".to_string()
+        };
+        Ok((false, difference))
     }
 
     fn environment(&self) -> Environment {
@@ -582,6 +690,70 @@ mod tests {
         assert_eq!(report.ports.trans, server.config().trans_port);
         assert_eq!(report.ports.chokepoint, server.config().chokepoint_port);
         assert_eq!(report.ports.socks, server.config().socks_port);
+    }
+
+    #[test]
+    fn counters_are_not_part_of_the_policy() {
+        let live = "\ttable inet ghostnector {\n\t\tcounter packets 42 bytes 900 accept\n\t}\n";
+        let without = canonical(live);
+        assert!(!without.contains("42"), "{without}");
+        assert!(!without.contains("900"), "{without}");
+        assert!(without.contains("counter accept"), "{without}");
+    }
+
+    #[test]
+    fn the_effective_policy_is_compared_against_what_was_applied() {
+        let (backend, server) = server();
+        let mut out = Vec::new();
+        exchange(
+            &server,
+            &format!(
+                "{}{}\n",
+                handshake(),
+                serde_json::to_string(&connect_request()).expect("encode")
+            ),
+            &mut out,
+        );
+
+        match server.handle(Verb::Verify) {
+            HelperResponse::Verified { matches, detail } => {
+                assert!(matches, "an untouched policy must compare equal: {detail}")
+            }
+            other => panic!("expected a verification answer, got {other:?}"),
+        }
+
+        // Something else adds a rule, exactly as the adversarial case does by hand.
+        backend.tamper("meta l4proto tcp dport 18080 counter accept");
+        match server.handle(Verb::Verify) {
+            HelperResponse::Verified { matches, detail } => {
+                assert!(!matches, "an added line must be visible");
+                assert!(detail.contains("18080"), "{detail}");
+            }
+            other => panic!("expected a verification answer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_policy_that_vanishes_does_not_compare_equal() {
+        let (backend, server) = server();
+        let mut out = Vec::new();
+        exchange(
+            &server,
+            &format!(
+                "{}{}\n",
+                handshake(),
+                serde_json::to_string(&connect_request()).expect("encode")
+            ),
+            &mut out,
+        );
+        backend.force_table(false);
+        match server.handle(Verb::Verify) {
+            HelperResponse::Verified { matches, detail } => {
+                assert!(!matches);
+                assert!(detail.contains("no longer in the kernel"), "{detail}");
+            }
+            other => panic!("expected a verification answer, got {other:?}"),
+        }
     }
 
     #[test]

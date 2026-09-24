@@ -284,6 +284,15 @@ pub enum Expr {
         /// Port number.
         port: u16,
     },
+    /// Match the source port.
+    ///
+    /// Source ports are the *client's* identity in the protocols that use them that way — DHCP is
+    /// the one that matters here: its requests go from the client's port to the server's, so an
+    /// exemption that matched the destination would permit the reply and drop the request.
+    Sport {
+        /// Port number.
+        port: u16,
+    },
     /// Match the destination address against a named set.
     DaddrInSet {
         /// Set name, which must exist in the same table.

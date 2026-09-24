@@ -172,6 +172,7 @@ fn answer_kind(answer: &HelperResponse) -> &'static str {
         HelperResponse::Hello { .. } => "handshake",
         HelperResponse::Applied { .. } => "applied",
         HelperResponse::Report(_) => "report",
+        HelperResponse::Verified { .. } => "verification",
         HelperResponse::Error(_) => "error",
     }
 }

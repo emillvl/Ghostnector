@@ -335,12 +335,21 @@ fn table_sets(allow_lan: bool) -> Vec<Set> {
     sets
 }
 
+/// Port a DHCP server listens on, which is where a client's request goes.
+const DHCP_SERVER_PORT: u16 = 67;
+
 fn dhcp_rule(env: &Environment) -> Rule {
+    // A client's request goes *from* its own port *to* the server's. Matching the destination
+    // instead would permit the direction a client never sends (server to client) and drop the one
+    // it does, so the exemption would exist on paper while the lease expired.
     rule(
         vec![
             Expr::L4Proto { proto: Proto::Udp },
-            Expr::Dport {
+            Expr::Sport {
                 port: env.dhcp_client_port,
+            },
+            Expr::Dport {
+                port: DHCP_SERVER_PORT,
             },
         ],
         Verdict::Accept,
@@ -647,6 +656,7 @@ fn dns_redirect_rule(proto: Proto, port: u16) -> Rule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render_table;
 
     fn env() -> Environment {
         Environment {
@@ -693,6 +703,38 @@ mod tests {
         assert!(
             !chain(&policy, "out_nat").rules.is_empty(),
             "the nat chain still has its loopback rules, even for this profile"
+        );
+    }
+
+    #[test]
+    fn the_dhcp_exemption_matches_the_direction_a_client_sends() {
+        // A DHCP client sends *from* its own port *to* the server's. Matching only a destination
+        // port would allow the direction a client never uses and reject the one it does. This is
+        // the regression test for the inverted exemption that RC1 shipped.
+        let policy = compile(ProfileId::TorSystem, &Params::default(), &env()).unwrap();
+        let dhcp = chain(&policy, "out_filter")
+            .rules
+            .iter()
+            .find(|rule| rule.comment == "keep the link alive")
+            .expect("every profile keeps the link alive");
+        assert!(
+            dhcp.exprs
+                .iter()
+                .any(|expr| matches!(expr, Expr::Sport { port: 68 })),
+            "the client's own port must be the source match: {:?}",
+            dhcp.exprs
+        );
+        assert!(
+            dhcp.exprs
+                .iter()
+                .any(|expr| matches!(expr, Expr::Dport { port: 67 })),
+            "the request goes to the server's port: {:?}",
+            dhcp.exprs
+        );
+        let rendered = render_table(&policy.ruleset);
+        assert!(
+            rendered.contains("udp sport 68 udp dport 67 counter accept"),
+            "{rendered}"
         );
     }
 

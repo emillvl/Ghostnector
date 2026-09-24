@@ -91,6 +91,17 @@ the whole window; the boundary is watched continuously.
 | AL-6 | `Protected` | the whole machine reboots with intent persisted | O1/O6, from before the network is up | no packet from a protected scope leaves before the policy is present | one packet observed before the policy exists | `Blocked` after boot | **yes** |
 | AL-7 | `Protected` | `panic` while the storm runs | O1/O3 | the machine is denied within one atomic transaction; the storm stops | one prohibited packet after `panic` returned | `Blocked` | **yes** |
 
+**Outcome of the M7 run.** AL-1 first reported a contradiction and turned out to be a **harness
+artefact**: the case never started the control plane, so the connect failed in 5 ms and the storm was
+observed on an open machine. With the stack started it holds, and the runner now refuses to run a case
+on top of a failed connect (`connect_or_fail_setup`).
+
+AL-4's first oracle counted packets until the CLI returned, which includes the window after the policy
+was legitimately removed, so it could not tell "crossed while reporting protection" from "crossed
+after the user was told protection was gone". It was replaced by a sampling oracle that reads the
+packet count and the reported state together: a violation is an increase while the machine still
+reports protection. That oracle immediately found **D-19**, and both cases hold now, as does AL-7.
+
 ## 5. Process failures
 
 Each failure is injected at a controlled point, and the kernel is then inspected **directly** (O4).
@@ -114,7 +125,7 @@ evidence of a leak and must never be displayed as one; the *only* valid observat
 | AC-2 | `Off` | the intent journal is absent, then boot | O4 | nothing is applied; the machine is open because nothing was requested | a policy appears from nowhere | `Off` | no |
 | AC-3 | `Protected` | `nft destroy table inet ghostnector` | O4 + O1 | re-denied within one interval plus timeout; the state says so | the state still claims protection after that bound | `Protected` → `Blocked` | **yes** |
 | AC-4 | `Protected` | one rule inserted that permits traffic a check exercises (`udp accept`) | O4 + O3 | the alarm fires; the tampered table is replaced | not noticed within one interval plus timeout | `Protected` → `Blocked` | **yes** |
-| AC-5 | `Protected` | one rule inserted that permits traffic **no check exercises** (`tcp dport 8443 accept`) | O4 + O1 | **expected to be missed today.** This is gap G3; the test exists to demonstrate it, not to pass it | the test quietly passes | `Protected` (wrongly) — recorded as an open gap | no |
+| AC-5 | `Protected` | two rules inserted that permit traffic **no configured check exercises** (`tcp dport 8443` via the nat chain and the filter chain) | O4 + O1 | the alarm fires and the tampered table is replaced, because the helper compares the kernel's own ruleset against the one it applied | not noticed within one interval plus timeout | `Protected` → `Blocked` | **yes** |
 | AC-6 | `Protected` | stale persisted state (a journal saying protected while the kernel is empty), then `core` starts | O4 + O7 | `core` applies the fail-closed baseline and reports `Blocked` | the state reports `Off` or `Protected` | `Blocked` | **yes** |
 | AC-7 | `Protected` | the resolver configuration is edited by someone else while protection is on, then `disconnect` | O5 | the edit survives; the conflict is reported rather than overwritten | the edit is clobbered | `Off` with a conflict note | no |
 
@@ -127,6 +138,21 @@ evidence of a leak and must never be displayed as one; the *only* valid observat
 | AN-3 | `Protected` | connectivity is lost and restored | O4 + O1 | nothing escapes while connectivity is gone; the checks report INC, not failure | a check reporting a leak for a link failure; or `Protected` claimed while unverified | `Degraded` while unverified, then `Protected` | no |
 | AN-4 | `Protected`, IPv4-only | an IPv6 address appears on the link | O1 | still no IPv6 egress from a protected uid | an IPv6 packet at the boundary | `Blocked` if a claim breaks | **yes** |
 | AN-5 | `Protected` | a Wi-Fi/ethernet switch is simulated (new interface, new default route) | O4 + O1 | confined as before, without re-application | a prohibited packet from the new interface | unchanged | no |
+
+**Outcome of the M7 run.** All five executed cases hold, under a storm and with the sampling oracle
+watching for "crossed while reporting protection":
+
+| Executed as | Action | Result | Note |
+|---|---|---|---|
+| AN-1 | the link goes down and comes up under load | held | nothing crossed; the state ended `blocked`, because verification failed while there was no connectivity and fail-closed is the honest answer |
+| AN-2 | the default route is removed and restored | held | nothing crossed; the state ended `protected - and verified` |
+| AN-3 | the machine's address is replaced (a new lease) | held | a probe from the new address was carried by the conduit; zero packets from the new address reached the outside |
+| AN-4 | the IPv6 address is removed while protected | held | nothing crossed; IPv4 behaviour unchanged |
+| AN-5 | a second interface and route appear while protected | held | TCP over the new path was carried by the conduit (source = the conduit address); nothing from the machine's address used it |
+
+The plan's AN-1 (interface removed) is executed as a link flap, because deleting the interface the
+machine is using is the same window with more moving parts; the plan's AN-4 (IPv6 appears) is covered
+by AS-3/AS-4, which bring the link up IPv6-capable in the first place.
 
 ## 8. Exemptions, in both directions
 
@@ -146,6 +172,19 @@ runs the second direction as a **control** with an identity that must not obtain
 
 AE-5 is the one worth stating twice: in Tor mode the resolver has **no exemption at all**, and its
 absence is the security property. If a test ever shows it reaching a resolver directly, that is a CPT.
+
+**Outcome of the M7 run**, in the same order as the table:
+
+| Executed as | Exemption | Observed |
+|---|---|---|
+| AE-1 | `system-user:tor` | the Tor uid's direct connection arrived at the outside **and** its packets came from the machine's own address, so it was the identity and not the conduit; the same operation by an ordinary uid put zero packets from the machine's address on the wire |
+| AE-2 | `system-user:tor` (not redirected) | covered by AE-1: a packet from the machine's address that arrived proves the Tor uid's traffic is returned from the nat chain rather than captured |
+| AE-3 | `dhcp-client` | a request from port 68 to port 67 left the machine; a datagram from an ordinary source port and the inverted shape (68 → 68) did not. **The RC1 policy failed this** (D-18) |
+| AE-4 | `system-user:dnscrypt-proxy` | policy level only: the harness runs Tor mode; `policy-netns-test.sh` verifies the resolver uid's allow/deny in the lockdown golden |
+| AE-5 | resolver, Tor mode | resolution over loopback was answered by the chokepoint, nothing reached a foreign resolver, and the reported exemption list names no resolver |
+| AE-6 | LAN set | absent by default (zero direct connections from the machine's address) and present when `--lan` was asked for (a direct connection arrived and was answered) |
+| AE-7 | the complete list | the list is derived from the rules that cite it and the invariant checker refuses an accept citing no listed exemption; the harness observed no unlisted path. A one-by-one kernel-versus-report diff is not executed separately — recorded as a residual, not a pass |
+| AE-8 | nothing else exempt | covered by AE-1's control and by AS-1/AS-2, which run as an ordinary uid and never take an exempt path |
 
 ## 9. What is already covered, and what this phase adds
 
@@ -179,6 +218,22 @@ When adversarial testing finds one:
 
 A defect that is not reproducible as a test is recorded with its reproduction steps and left open.
 
+## 11. M7 execution result
+
+The suite is `scripts/adversarial.sh`. Against the M7 tree, with the sampling oracle watching for
+"crossed while reporting protection" throughout:
+
+| Verdict | Count | Cases |
+|---|---|---|
+| held | 26 | AS-1…AS-6 (except AS-4), AL-1/AL-4/AL-7, AF-1…AF-4, AC-3…AC-6, AN-1…AN-5, AE-1…AE-5 |
+| contradicted | 0 | — |
+| inconclusive by design | 1 | AS-4: the link has no IPv6 on that run, so IPv6 denial is not demonstrated (it is on the v6-capable runs, AS-3) |
+| demonstrated gap | 0 | AC-5 demonstrated G3 at RC1; it holds now that the helper compares the kernel's ruleset against the one it applied |
+
+Defects this campaign found and fixed: **D-15, D-16** (which falsified PC-03 and PC-06 at RC1),
+**D-17, D-18, D-19** and **D-20** (a fix that rendered a policy nftables refuses, hidden by a harness
+that ignored the connect result). Each has a regression test that fails on the old behaviour.
+
 ## Appendix A — defects found so far, and their regression tests
 
 Recorded because the same classes of mistake will recur.
@@ -199,6 +254,12 @@ Recorded because the same classes of mistake will recur.
 | D-12 | A subscribed client that was killed left its thread blocked forever | `ghostnector-core` | a poll-based liveness probe | `a_subscription_streams_state_changes_and_ends_when_the_client_leaves` |
 | D-13 | `netd` accepted only the control plane as a peer, so the boot guard could never ask for the baseline | `ghostnector-netd` | root is accepted, with the reasoning written down | `authorization_is_an_exact_match_except_for_root` |
 | D-14 | Two clippy lints in the unix-gated crate were invisible to the Windows-hosted clippy | the gate itself | fixed; the gate now runs clippy **against the target platform** | the freeze procedure in `PROTECTION-CLAIMS.md` |
+| D-15 | The `nat` and `filter` chains shared one priority (`-150`), so their order was undefined and redirects could race the filter that denies. Observed as falsifying PC-03 and PC-06 at RC1: a query could leave without reaching the chokepoint. | `ghostnector-policy` (compile) | distinct priorities: nat `-100`, filter `0`; new invariant `nat_chain_does_not_precede_filter` | `nat_chain_does_not_precede_filter`; the golden files now pin the priorities |
+| D-16 | Redirected packets report their **original** output interface in the filter chain, because the kernel recomputes the route after the filter verdict, so `oifname "lo"` never matched redirected traffic and the loopback allowance did not apply. Contributed to the same falsification as D-15. | `ghostnector-policy` (compile/render) | loopback matched as a **destination set** (`loopback4 127.0.0.0/8`, `loopback6 ::1/128`) with `RuleOrigin::Loopback`, in both chains | `DestinationAllowInEgress` now allows `RuleOrigin::Loopback`; the golden files carry the sets |
+| D-17 | A relay that starts and immediately exits was reported as protection: `connect` succeeded with nothing listening on the chokepoint. | `ghostnector-core` (engine) | the engine checks `relay.is_running()` after start and fails the connect | `a_relay_that_starts_and_then_dies_fails_the_connect` |
+| D-18 | The DHCP exemption was compiled as `udp dport 68` — the reply direction — while a client's request goes from its own port 68 to the server's port 67. Observed against the exact RC1 policy in a scratch namespace: the client's request was discarded (the accept rule's counter stayed at 0) while the inverted shape was accepted (counter 1). The link would have died at the first lease renewal while the policy claimed to keep it alive. | `ghostnector-policy` (compile) | `udp sport 68 udp dport 67`, with `Expr::Sport` added to the IR and the renderer | `the_dhcp_exemption_matches_the_direction_a_client_sends`, the invariant `dhcp_exemption_direction`, and AE-2 in `scripts/adversarial.sh` |
+| D-19 | A disconnect removed the policy **before** the state stopped reporting protection, so for a few hundred microseconds a caller would have been told "protected" while the kernel had no policy. Found by the transition oracle, not by a counter: "crossed while reporting protection" is the property, and a before/after count cannot see it. | `ghostnector-core` (engine) | the transition is announced (`Applying`) before the policy is touched; a machine already `Off` announces nothing | `a_disconnect_reports_a_transition_before_it_removes_anything` |
+| D-20 | The first fix for D-18 rendered `udp sport 68 dport 67`, which nftables refuses ("No symbol type information"), so every `connect` failed and every adversarial case was silently observing an **open** machine. Caught because the connect result was ignored by the harness. | `ghostnector-policy` (render) and the harness | second port match is qualified (`udp sport 68 udp dport 67`); the renderer folds the protocol only for a single port match | `a_second_port_match_in_a_rule_is_qualified_by_its_protocol`; `connect_or_fail_setup` now refuses to run a case on top of a failed connect |
 
 D-02 is the one to keep in mind while reading this plan: a leak test that cannot tell "the policy
 failed" from "the link was noisy" trains its reader to ignore failures.

@@ -40,6 +40,13 @@ H_MUT_ADDR6="fd00:88::2"
 H_OUT_ADDR6="fd00:88::1"
 H_PREFIX="10.88.0.0/24"
 H_PREFIX6="fd00:88::/64"
+# An address the machine may acquire later, as a leased address would be. Cases that change the
+# machine's address use it so the observation can tell the new identity from the old one.
+H_MUT_ADDR2="10.88.0.9"
+# A second path out of the machine, created by a case that asks whether a new interface is subject to
+# the same policy as the first.
+H_MUT2_ADDR="10.99.0.2"
+H_OUT2_ADDR="10.99.0.1"
 H_TOR_USER="debian-tor"
 
 H_WORK="/tmp/gh-harness"
@@ -63,6 +70,8 @@ H_CORE_PID=""
 H_TOR_PID=""
 H_INTERNET_PID=""
 H_STORM_PID=""
+H_CAPTURE_PID=""
+H_WATCH_PID=""
 H_IPV6=1
 
 # ---------------------------------------------------------------- output
@@ -99,6 +108,7 @@ gh_setup() {
     chown "$(id -u ghostnector-core)" "$H_RUNDIR"
     printf '{"version":1,"protected":false,"generation":0}' >"$H_JOURNAL"
     chown "$(id -u ghostnector-core)" "$H_JOURNAL"
+    : >"$H_LOG/timeline"
 
     ip netns add "$H_OUT"
     ip netns add "$H_MUT"
@@ -125,6 +135,9 @@ gh_setup() {
         ip netns exec "$H_MUT" sysctl -qw net.ipv6.conf.all.accept_ra=0 || true
     fi
 
+    # Only now does the interface the capture watches exist.
+    gh_capture_start
+
     gh_install_binaries
     gh_write_fakes
     gh_observer_start
@@ -132,6 +145,8 @@ gh_setup() {
 }
 
 gh_teardown() {
+    gh_capture_stop
+    gh_watch_stop
     [ -n "$H_STORM_PID" ] && kill "$H_STORM_PID" 2>/dev/null || true
     [ -n "$H_CORE_PID" ] && kill "$H_CORE_PID" 2>/dev/null || true
     [ -n "$H_NETD_PID" ] && kill "$H_NETD_PID" 2>/dev/null || true
@@ -424,9 +439,21 @@ def udp_server(port):
         server.sendto(b"udp-answered", peer)
 
 
+def dhcp_recorder(address):
+    # A DHCP server's port, recording only: a DISCOVER gets no reply anywhere, and what matters here
+    # is whether the request left the machine at all.
+    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((address, 67))
+    while True:
+        data, peer = server.recvfrom(4096)
+        record("dhcp", peer=f"{peer[0]}:{peer[1]}", length=len(data))
+
+
 threading.Thread(target=tcp_server, args=(tcp_port, "tcp"), daemon=True).start()
 threading.Thread(target=http_server, args=(http_port,), daemon=True).start()
 threading.Thread(target=udp_server, args=(udp_port,), daemon=True).start()
+threading.Thread(target=dhcp_recorder, args=(address,), daemon=True).start()
 while True:
     time.sleep(3600)
 PY
@@ -503,12 +530,100 @@ destroy table inet ghobserve
 table inet ghobserve {
   chain input {
     type filter hook input priority -200; policy accept;
-    ip saddr $H_MUT_ADDR counter comment "machine"
+    ip saddr $H_MUT_ADDR log prefix "GHLEAK4 " level warn counter comment "machine"
     ip saddr $H_CONDUIT_ADDR counter comment "conduit"
     $ipv6_rules
   }
 }
 EOF
+}
+
+# A wall-clock mark, so an observation can be placed against a transition rather than against a
+# total. Anything that crosses without a matching mark is a finding, not an average.
+gh_mark() {
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S.%N')" "$1" >>"$H_LOG/timeline"
+}
+
+# Every packet that left by the machine's own address, captured independently on the far side of the
+# veth rather than inferred from a counter. A counter says something crossed; a capture says what,
+# when, and where it was going, which is what classifying it requires. The capture is of the whole
+# subnet rather than one address, so a machine that acquires a different address is still observed.
+gh_capture_start() {
+    ip netns exec "$H_OUT" tcpdump -i veth-out -n -s 96 -w "$H_LOG/crossed.pcap" \
+        "net $H_PREFIX or net $H_PREFIX6" >"$H_LOG/tcpdump.log" 2>&1 &
+    H_CAPTURE_PID=$!
+    sleep 0.5
+    if ! kill -0 "$H_CAPTURE_PID" 2>/dev/null; then
+        echo "  the capture did not start: $(tail -2 "$H_LOG/tcpdump.log" 2>/dev/null)" >&2
+        H_CAPTURE_PID=""
+    fi
+}
+
+gh_capture_stop() {
+    [ -n "$H_CAPTURE_PID" ] && kill "$H_CAPTURE_PID" 2>/dev/null || true
+    sleep 0.3
+    H_CAPTURE_PID=""
+}
+
+# Anything in the capture whose source is one of the machine's addresses: it left the machine rather
+# than arrived at it.
+gh_leaks() {
+    [ -f "$H_LOG/crossed.pcap" ] || { echo "(no capture)"; return; }
+    tcpdump -r "$H_LOG/crossed.pcap" -tttt -n \
+        "(src $H_MUT_ADDR or src $H_MUT_ADDR6 or src $H_MUT_ADDR2)" 2>/dev/null | tail -40 ||
+        echo "(nothing recorded)"
+}
+
+# How many packets from a given source address reached the outside. The counter keys on the address
+# the machine had at setup; a case that changes the address needs this instead.
+gh_crossed_count() {
+    local source="${1:-$H_MUT_ADDR}"
+    [ -f "$H_LOG/crossed.pcap" ] || { echo 0; return; }
+    tcpdump -r "$H_LOG/crossed.pcap" -n "src $source" 2>/dev/null | wc -l
+}
+
+# Sampling the counter against the state, so a crossing can be attributed to what the machine was
+# reporting at that moment. A before/after count cannot tell "traffic crossed while the machine said
+# it was protected" from "traffic crossed after the user was told protection was gone", and those are
+# different findings.
+gh_watch_start() {
+    : >"$H_LOG/watch"
+    (
+        while true; do
+            printf '%s|%s\n' "$(gh_from_machine)" "$(gh_status | head -1)" >>"$H_LOG/watch"
+            sleep 0.2
+        done
+    ) &
+    H_WATCH_PID=$!
+}
+
+gh_watch_stop() {
+    [ -n "$H_WATCH_PID" ] && kill "$H_WATCH_PID" 2>/dev/null || true
+    sleep 0.3
+    H_WATCH_PID=""
+}
+
+# Crossings that happened while the machine was still reporting protection. Empty is the pass.
+gh_watch_violations() {
+    python3 - "$H_LOG/watch" <<'PY'
+import sys
+
+previous = None
+for line in open(sys.argv[1]):
+    count, _, state = line.strip().partition("|")
+    try:
+        count = int(count)
+    except ValueError:
+        continue
+    protected = "protected, but unverified" in state or "and verified" in state
+    if previous is not None and count > previous and protected:
+        print(f"crossed while reporting: {state.strip()}")
+    previous = count
+PY
+}
+
+gh_timeline() {
+    cat "$H_LOG/timeline" 2>/dev/null || echo "(no marks)"
 }
 
 # Packets the outside world received from a given source class.
@@ -694,6 +809,88 @@ gh_panic() { gh_cli panic 2>&1 || true; }
 # A probe as an ordinary, unprivileged identity: never root, never the exempted uid.
 gh_probe() { ip netns exec "$H_MUT" setpriv --reuid=65534 --regid=65534 --clear-groups "$@"; }
 
+# Do something as Tor's own identity, which the policy exempts.
+gh_as_tor() {
+    ip netns exec "$H_MUT" setpriv \
+        --reuid="$(id -u "$H_TOR_USER")" --regid="$(id -g "$H_TOR_USER")" --clear-groups "$@"
+}
+
+# A datagram from the DHCP client's own port to a chosen destination port. Binding the client's port
+# needs the capability the unit file grants a DHCP client, and nothing else here uses it.
+gh_udp_from_68() {
+    local dest="$1" port="$2"
+    ip netns exec "$H_MUT" setpriv \
+        --reuid=65534 --regid=65534 --clear-groups \
+        --inh-caps +net_bind_service --ambient-caps +net_bind_service \
+        python3 -c '
+import socket, sys
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sock.bind(("0.0.0.0", 68))
+sock.settimeout(2)
+sock.sendto(b"probe", (sys.argv[1], int(sys.argv[2])))
+sys.stdout.write("sent")
+' "$dest" "$port" 2>&1 || true
+}
+
+# A datagram from an ordinary ephemeral port to a chosen destination port.
+gh_udp_to_port() {
+    local dest="$1" port="$2"
+    gh_probe python3 -c '
+import socket, sys
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); sock.settimeout(2)
+sock.sendto(b"probe", (sys.argv[1], int(sys.argv[2])))
+sys.stdout.write("sent")
+' "$dest" "$port" 2>&1 || true
+}
+
+# TCP from a chosen local address, for asking whether an identity the policy never saw has the same
+# limits as the one it did.
+gh_tcp_probe_from() {
+    gh_probe python3 -c '
+import socket, sys
+conn = socket.socket(); conn.settimeout(3)
+conn.bind((sys.argv[1], 0))
+conn.connect((sys.argv[2], int(sys.argv[3])))
+conn.sendall(b"probe")
+sys.stdout.write(conn.recv(64).decode(errors="replace"))
+' "$1" "$2" "$3" 2>&1 || true
+}
+
+# A recording TCP endpoint on an address the standing recorder does not cover. Prints its PID.
+gh_listener_start() {
+    local address="$1" port="$2" kind="$3"
+    ip netns exec "$H_OUT" python3 -c '
+import json, socket, sys, threading, time
+
+address, port, kind, log_path = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+log = open(log_path, "a", buffering=1)
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind((address, port))
+server.listen(16)
+
+
+def serve():
+    while True:
+        conn, peer = server.accept()
+        log.write(json.dumps({"kind": kind, "peer": "%s:%d" % peer, "t": time.time()}) + "\n")
+        try:
+            conn.recv(4096)
+            conn.sendall(b"ok")
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+
+threading.Thread(target=serve, daemon=True).start()
+while True:
+    time.sleep(3600)
+' "$address" "$port" "$kind" "$H_EVENTS" >"$H_LOG/listener-$kind.log" 2>&1 &
+    echo $!
+}
+
 gh_tcp_probe() {
     gh_probe python3 -c '
 import socket, sys
@@ -702,6 +899,31 @@ conn.connect((sys.argv[1], int(sys.argv[2])))
 conn.sendall(b"probe")
 sys.stdout.write(conn.recv(64).decode(errors="replace"))
 ' "$H_OUT_ADDR" "$H_TCP_PORT" 2>&1 || true
+}
+
+# A loopback round trip as an ordinary identity, on an address in the loopback range rather than the
+# most obvious one, so what is exercised is the rule and not the interface.
+gh_loopback_probe() {
+    gh_probe python3 -c '
+import socket, sys, threading
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("127.0.0.2", 0))
+server.listen(1)
+port = server.getsockname()[1]
+
+
+def serve():
+    conn, _ = server.accept()
+    conn.sendall(b"loopback-ok")
+    conn.close()
+
+
+threading.Thread(target=serve, daemon=True).start()
+client = socket.socket(); client.settimeout(3)
+client.connect(("127.0.0.2", port))
+sys.stdout.write(client.recv(64).decode(errors="replace"))
+' 2>&1 || true
 }
 
 gh_udp_probe() {
@@ -763,5 +985,37 @@ gh_inject_nat_return() {
     ip netns exec "$H_MUT" nft insert rule inet ghostnector out_nat "$@" return 2>&1 || true
 }
 
+# Whether the live policy still holds a line mentioning this, as evidence that a fix removed it.
+gh_policy_mentions() {
+    ip netns exec "$H_MUT" nft list table inet ghostnector 2>/dev/null | grep -qF -- "$1"
+}
+
 gh_corrupt_journal() { echo "{ this is not json" >"$H_JOURNAL"; }
 gh_remove_journal() { rm -f "$H_JOURNAL"; }
+
+# ---------------------------------------------------------------- network changes
+
+gh_link() { ip -n "$H_MUT" link set veth-mut "$1"; }
+gh_default_route() { ip -n "$H_MUT" route "$1" default via "$H_OUT_ADDR" 2>&1 || true; }
+
+# Give the machine a different address, as a new lease would, keeping the conduit's address so the
+# conduit can still be told apart from the machine.
+gh_machine_address() {
+    local new="$1"
+    ip -n "$H_MUT" addr del "$H_MUT_ADDR/24" dev veth-mut 2>/dev/null || true
+    ip -n "$H_MUT" addr add "$new/24" dev veth-mut
+    ip -n "$H_MUT" route replace default via "$H_OUT_ADDR"
+}
+
+# A second path out of the machine, as a new interface appears.
+gh_second_path_add() {
+    ip link add veth2-out type veth peer name veth2-mut
+    ip link set veth2-out netns "$H_OUT"
+    ip link set veth2-mut netns "$H_MUT"
+    ip -n "$H_OUT" addr add "$H_OUT2_ADDR/24" dev veth2-out
+    ip -n "$H_MUT" addr add "$H_MUT2_ADDR/24" dev veth2-mut
+    ip -n "$H_OUT" link set veth2-out up
+    ip -n "$H_MUT" link set veth2-mut up
+}
+
+gh_second_path_remove() { ip -n "$H_MUT" link del veth2-mut 2>/dev/null || true; }

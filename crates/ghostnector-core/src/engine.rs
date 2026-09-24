@@ -20,6 +20,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use ghostnector_spec::backend::{Params, Ports, ProfileId, Report, Verb};
+use ghostnector_spec::ipc::HelperResponse;
 use ghostnector_spec::{
     Event, Health, Profile, ProfileError, ProtectionState, Reason, Scope, ServiceHealth, Snapshot,
     ValidProfile, Verification,
@@ -284,6 +285,20 @@ impl Engine {
 
     /// Return to the captured baseline, because the user asked for it.
     pub fn disconnect(&self) -> Result<(), EngineError> {
+        // The state says "a transition is in flight" *before* the policy is touched. Without this,
+        // there is a window in which the kernel no longer has a policy and this daemon still reports
+        // protection: another process asking during it would be told something that is already
+        // false. The claim is about what is reported while traffic can leave, so the report changes
+        // first. A machine that is already open has nothing to announce.
+        if self.lock_machine().state() != ProtectionState::Off {
+            self.set_state(
+                ProtectionState::Applying,
+                Cause::UserRequested,
+                vec![Reason::new("removing the policy")],
+            )?;
+            self.publish();
+        }
+
         // Give the resolver back first, then stop the relay, the services, and the policy.
         self.stand_down_dns();
 
@@ -580,7 +595,45 @@ impl Engine {
             };
         }
 
-        let report = self.verification.run_once();
+        let mut report = self.verification.run_once();
+
+        // The probes exercise the paths that exist. This asks the kernel what it actually holds, and
+        // compares it against what was applied: a rule change made by something else is invisible to
+        // any amount of probing that happens not to traverse it, which is exactly how a change can
+        // pass every check while it is in force.
+        if !matches!(report.outcome, Outcome::Failed { .. }) {
+            match self.helper.invoke(Verb::Verify) {
+                Ok(HelperResponse::Verified {
+                    matches: true,
+                    detail,
+                }) => report
+                    .details
+                    .push(format!("the effective policy was compared: {detail}")),
+                Ok(HelperResponse::Verified {
+                    matches: false,
+                    detail,
+                }) => {
+                    let reason = format!(
+                        "the policy in the kernel is not the one that was applied: {detail}"
+                    );
+                    report.details.push(reason.clone());
+                    report.outcome = Outcome::Failed { reason };
+                }
+                Ok(other) => {
+                    let reason = format!("the helper answered a policy comparison with {other:?}");
+                    report.details.push(reason.clone());
+                    report.outcome = Outcome::Failed { reason };
+                }
+                Err(error) => {
+                    report.details.push(format!(
+                        "the effective policy could not be compared: {error}"
+                    ));
+                    report.outcome = Outcome::Inconclusive {
+                        reason: "the effective policy could not be compared".to_string(),
+                    };
+                }
+            }
+        }
 
         {
             let mut state = self.lock_verification();
@@ -1006,6 +1059,22 @@ mod tests {
         engine_and_verification_with(VerificationConfig::default())
     }
 
+    fn engine_and_helper_and_verification(
+    ) -> (Arc<MockHelper>, Arc<MockVerification>, Engine, PathBuf) {
+        let helper = Arc::new(MockHelper::new());
+        let services = Arc::new(MockServices::new());
+        let relay = Arc::new(MockRelay::new());
+        let verification = Arc::new(MockVerification::new());
+        let (engine, directory) = engine_with(
+            Arc::clone(&helper),
+            Arc::clone(&services),
+            Arc::clone(&relay),
+            Arc::clone(&verification),
+            VerificationConfig::default(),
+        );
+        (helper, verification, engine, directory)
+    }
+
     fn engine_and_verification_with(
         verification_config: VerificationConfig,
     ) -> (Arc<MockVerification>, Engine, PathBuf) {
@@ -1348,6 +1417,7 @@ mod tests {
                 Verb::Report => "report".to_string(),
                 Verb::Revert => "revert".to_string(),
                 Verb::FlushConntrack => "flush".to_string(),
+                Verb::Verify => "verify".to_string(),
                 Verb::Hello { .. } => "hello".to_string(),
             })
             .collect();
@@ -1458,6 +1528,38 @@ mod tests {
             relay.started(),
             vec!["127.0.0.1:9054 -> 127.0.0.1:5353".to_string()],
             "DNS-only mode has no Tor to forward to"
+        );
+    }
+
+    #[test]
+    fn a_disconnect_reports_a_transition_before_it_removes_anything() {
+        let (_helper, _services, engine, _dir) = engine_and_services();
+        engine
+            .connect(system_tor_profile(), USER_UID)
+            .expect("connect");
+        assert!(engine.snapshot().state.is_protected());
+
+        // Subscribed before the disconnect, so the events are the order the report actually changed
+        // in. Nothing may report protection after the policy is gone, so the first change must be
+        // the announcement.
+        let receiver = engine.subscribe();
+        engine.disconnect().expect("disconnect");
+
+        let mut states = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            if let ghostnector_spec::Event::StateChanged(snapshot) = event {
+                states.push(snapshot.state);
+            }
+        }
+        assert_eq!(
+            states.first(),
+            Some(&ProtectionState::Applying),
+            "the report must change before the policy does: {states:?}"
+        );
+        assert_eq!(states.last(), Some(&ProtectionState::Off), "{states:?}");
+        assert!(
+            !states.contains(&ProtectionState::Protected),
+            "no event may claim protection during a disconnect: {states:?}"
         );
     }
 
@@ -1689,6 +1791,42 @@ mod tests {
                 .expect("load")
                 .protected,
             "the machine is denied, so the intent must say so"
+        );
+    }
+
+    #[test]
+    fn a_policy_changed_in_the_kernel_is_noticed_and_denied() {
+        let (helper, verification, engine, _dir) = engine_and_helper_and_verification();
+        engine
+            .connect(system_tor_profile(), USER_UID)
+            .expect("connect");
+        verification.passing();
+        engine.verify_once();
+        assert_eq!(engine.snapshot().state, ProtectionState::Protected);
+
+        // Something else adds a rule the probes never traverse. Traffic testing alone would report
+        // protection forever; comparing the effective policy against what was applied does not.
+        helper.tamper_policy();
+        let report = engine.verify_once();
+        assert!(
+            matches!(&report.outcome, Outcome::Failed { reason } if reason.contains("not the one that was applied")),
+            "{:?}",
+            report.outcome
+        );
+
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.state, ProtectionState::Blocked);
+        assert_eq!(snapshot.health.verification, Verification::Failed);
+        assert!(
+            Journal::new(engine.journal_path())
+                .load()
+                .expect("load")
+                .protected,
+            "the machine must be denied after the policy it was relying on changed"
+        );
+        assert!(
+            helper.applied_sequence().contains(&ProfileId::FailClosed),
+            "the alarm must be backed by applying the fail-closed baseline over the change"
         );
     }
 

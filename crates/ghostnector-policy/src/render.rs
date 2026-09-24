@@ -114,11 +114,27 @@ fn render_chain(out: &mut String, chain: &Chain, sets: &[Set]) {
 fn render_rule(out: &mut String, rule: &Rule, sets: &[Set]) {
     let mut parts: Vec<String> = Vec::new();
 
-    // A destination-port match implies its protocol, so the protocol expression is folded into it.
+    // A port match implies its protocol, so the protocol expression is folded into it — unless
+    // there is more than one port match, in which case nftables needs each one qualified
+    // (`udp sport 68 udp dport 67`): it cannot infer the second from the first.
     let port_proto = rule.exprs.iter().find_map(|expr| match expr {
         Expr::L4Proto { proto } => Some(*proto),
         _ => None,
     });
+    let port_matches = rule
+        .exprs
+        .iter()
+        .filter(|expr| matches!(expr, Expr::Dport { .. } | Expr::Sport { .. }))
+        .count();
+    let mut protocol_written = false;
+    let mut port_match = |parts: &mut Vec<String>, keyword: &str, port: u16| {
+        let qualified = port_matches > 1 || !protocol_written;
+        protocol_written = true;
+        match (qualified, port_proto) {
+            (true, Some(proto)) => parts.push(format!("{} {keyword} {port}", proto_name(proto))),
+            _ => parts.push(format!("{keyword} {port}")),
+        }
+    };
 
     for expr in &rule.exprs {
         match expr {
@@ -127,18 +143,17 @@ fn render_rule(out: &mut String, rule: &Rule, sets: &[Set]) {
             Expr::Iifname { name } => parts.push(format!("iifname \"{}\"", sanitise(name))),
             Expr::Oifname { name } => parts.push(format!("oifname \"{}\"", sanitise(name))),
             Expr::L4Proto { proto } => {
-                if rule.exprs.iter().any(|e| matches!(e, Expr::Dport { .. })) {
+                if rule
+                    .exprs
+                    .iter()
+                    .any(|e| matches!(e, Expr::Dport { .. } | Expr::Sport { .. }))
+                {
                     continue; // folded into the port match below
                 }
                 parts.push(format!("meta l4proto {}", proto_name(*proto)));
             }
-            Expr::Dport { port } => {
-                if let Some(proto) = port_proto {
-                    parts.push(format!("{} dport {port}", proto_name(proto)));
-                } else {
-                    parts.push(format!("dport {port}"));
-                }
-            }
+            Expr::Dport { port } => port_match(&mut parts, "dport", *port),
+            Expr::Sport { port } => port_match(&mut parts, "sport", *port),
             Expr::DaddrInSet { set } => {
                 let family = sets
                     .iter()
@@ -316,6 +331,27 @@ mod tests {
     #[test]
     fn revert_touches_only_our_table() {
         assert_eq!(render_revert_script(), "destroy table inet ghostnector\n");
+    }
+
+    #[test]
+    fn a_second_port_match_in_a_rule_is_qualified_by_its_protocol() {
+        // nftables cannot infer the protocol for a second port match, so `udp sport 68 dport 67` is a
+        // syntax error and the policy never reaches the kernel. That is how the inverted DHCP
+        // exemption was found the second time: the first fix rendered a rule nft refused.
+        for (name, profile, params) in cases() {
+            let policy = compile(profile, &params, &env()).unwrap();
+            for line in render_replace_script(&policy.ruleset).lines() {
+                let words: Vec<&str> = line.split_whitespace().collect();
+                for window in words.windows(3) {
+                    let port_keyword = matches!(window[0], "sport" | "dport");
+                    let followed_by_port = matches!(window[2], "sport" | "dport");
+                    assert!(
+                        !(port_keyword && followed_by_port),
+                        "{name} renders two port matches without qualifying the second: {line}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

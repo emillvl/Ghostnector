@@ -20,6 +20,7 @@ pub struct MockHelper {
     fail_apply: Mutex<Option<String>>,
     fail_apply_of: Mutex<Option<ProfileId>>,
     fail_revert: Mutex<Option<String>>,
+    policy_tampered: Mutex<bool>,
     reachable: bool,
 }
 
@@ -60,6 +61,11 @@ impl MockHelper {
     /// Pretend the kernel already has this applied, as after a restart.
     pub fn force_applied(&self, profile: Option<ProfileId>) {
         *self.applied.lock().expect("mock lock") = profile;
+    }
+
+    /// Pretend something else changed the policy in the kernel.
+    pub fn tamper_policy(&self) {
+        *self.policy_tampered.lock().expect("mock lock") = true;
     }
 
     /// The profiles that were applied, in order.
@@ -148,6 +154,19 @@ impl HelperLink for MockHelper {
             Verb::FlushConntrack => Ok(HelperResponse::Applied {
                 report: self.report(),
             }),
+            Verb::Verify => {
+                if *self.policy_tampered.lock().expect("mock lock") {
+                    Ok(HelperResponse::Verified {
+                        matches: false,
+                        detail: "the kernel has lines that were not applied".to_string(),
+                    })
+                } else {
+                    Ok(HelperResponse::Verified {
+                        matches: true,
+                        detail: "the kernel's policy is the one that was applied".to_string(),
+                    })
+                }
+            }
             Verb::Report => Ok(HelperResponse::Report(self.report())),
         }
     }

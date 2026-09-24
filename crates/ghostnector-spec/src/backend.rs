@@ -60,6 +60,12 @@ pub enum Verb {
     },
     /// Remove Ghostnector's policy. The captured baseline is restored by core, not by the helper.
     Revert,
+    /// Compare the policy in the kernel against the one this helper applied.
+    ///
+    /// The comparison is against what the *kernel* reported when it was applied, not against what
+    /// this helper intended: a change made by anything else is therefore visible, whether or not the
+    /// helper knows about it.
+    Verify,
     /// Drop conntrack entries so pre-existing flows cannot survive a transition.
     FlushConntrack,
     /// Report what Ghostnector currently has installed, and which uids it resolved.
