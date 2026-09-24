@@ -347,4 +347,7 @@ be run against the target platform, not the development host.**
   configured checks), G10 (privileged attackers, out of scope), G11 (DHCPv6), G12 (a transient
   outage can leave the machine blocked until a person acts), G13 (one-by-one exemption diff)
 - **Working tree:** clean at the tag. The release-qualification suite was then re-run against a fresh
-  checkout of the tagged commit; its result is appended below.
+  checkout of the tagged commit in a clean environment, with its own build directory: **291 unit
+  tests, four integration scripts, 26 held / 0 contradicted / 1 inconclusive by design, 0
+  demonstrated**, `cargo fmt --check`, `cargo check --all-targets` and `clippy -D warnings` all
+  clean. The rerun's per-case log is identical to the run recorded above.
