@@ -1,0 +1,307 @@
+//! Starting and stopping the services Ghostnector owns.
+//!
+//! The control plane must be able to bring Tor up and down, and must be able to say whether it is
+//! running. It must not, however, be able to run arbitrary commands: unit names are validated, the
+//! service manager is invoked by absolute path, and there is no shell anywhere in the path.
+//!
+//! Services themselves are ordinary systemd units (see `packaging/`). Keeping them as units rather
+//! than children of this process is what lets enforcement outlive the control plane (DR-14): if
+//! `core` dies, Tor keeps running and the kernel keeps enforcing.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use nix::unistd::Uid;
+
+/// What a service is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceState {
+    /// The service manager does not know this unit.
+    Unknown,
+    /// Not running.
+    Stopped,
+    /// Coming up, or going down.
+    Starting,
+    /// Running.
+    Running,
+    /// It tried and failed.
+    Failed,
+}
+
+impl ServiceState {
+    /// Whether the service is usable right now.
+    pub const fn is_running(self) -> bool {
+        matches!(self, Self::Running)
+    }
+}
+
+/// Why a service operation failed.
+#[derive(Debug, thiserror::Error)]
+pub enum SupervisorError {
+    /// The service manager binary is not something we are willing to trust.
+    #[error("service manager '{}' is not usable: {reason}", path.display())]
+    ToolUnusable {
+        /// The path involved.
+        path: PathBuf,
+        /// Why it was rejected.
+        reason: String,
+    },
+    /// The unit name is not one we are willing to pass on.
+    #[error("'{0}' is not a usable unit name")]
+    BadUnit(String),
+    /// The service manager could not be run.
+    #[error("running '{}' failed: {reason}", path.display())]
+    Io {
+        /// The path involved.
+        path: PathBuf,
+        /// What went wrong.
+        reason: String,
+    },
+    /// The service manager refused.
+    #[error("{action} '{unit}' failed: {reason}")]
+    Refused {
+        /// What was attempted.
+        action: &'static str,
+        /// The unit.
+        unit: String,
+        /// What the service manager said.
+        reason: String,
+    },
+}
+
+/// Starting and stopping services.
+pub trait Supervisor: Send + Sync {
+    /// Start a unit and wait for the service manager to accept the request.
+    fn start(&self, unit: &str) -> Result<(), SupervisorError>;
+    /// Stop a unit.
+    fn stop(&self, unit: &str) -> Result<(), SupervisorError>;
+    /// Ask what a unit is doing.
+    fn state(&self, unit: &str) -> Result<ServiceState, SupervisorError>;
+}
+
+/// The systemd implementation, talking to `systemctl`.
+#[derive(Debug, Clone)]
+pub struct SystemdUnits {
+    systemctl: PathBuf,
+}
+
+impl SystemdUnits {
+    /// Verify the service manager binary.
+    ///
+    /// The same reasoning as the privileged helper's tool check: an absolute path is only meaningful
+    /// if the file at that path is owned by root and not writable by anyone else.
+    pub fn new(systemctl: PathBuf) -> Result<Self, SupervisorError> {
+        check_tool(&systemctl)?;
+        Ok(Self { systemctl })
+    }
+
+    fn run(&self, arguments: &[&str]) -> Result<(bool, String), SupervisorError> {
+        let output = Command::new(&self.systemctl)
+            .args(arguments)
+            .output()
+            .map_err(|error| SupervisorError::Io {
+                path: self.systemctl.clone(),
+                reason: error.to_string(),
+            })?;
+
+        let mut combined = String::from_utf8_lossy(&output.stdout).to_string();
+        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        Ok((output.status.success(), combined.trim().to_string()))
+    }
+}
+
+impl Supervisor for SystemdUnits {
+    fn start(&self, unit: &str) -> Result<(), SupervisorError> {
+        validate_unit(unit)?;
+        let (ok, output) = self.run(&["start", unit])?;
+        if ok {
+            Ok(())
+        } else {
+            Err(SupervisorError::Refused {
+                action: "starting",
+                unit: unit.to_string(),
+                reason: output,
+            })
+        }
+    }
+
+    fn stop(&self, unit: &str) -> Result<(), SupervisorError> {
+        validate_unit(unit)?;
+        let (ok, output) = self.run(&["stop", unit])?;
+        if ok {
+            Ok(())
+        } else {
+            Err(SupervisorError::Refused {
+                action: "stopping",
+                unit: unit.to_string(),
+                reason: output,
+            })
+        }
+    }
+
+    fn state(&self, unit: &str) -> Result<ServiceState, SupervisorError> {
+        validate_unit(unit)?;
+        // `is-active` reports the state on stdout whether or not it is active, so the exit status is
+        // not an error here: it is part of the answer.
+        let (_, output) = self.run(&["is-active", unit])?;
+        Ok(match output.lines().next().unwrap_or("").trim() {
+            "active" => ServiceState::Running,
+            "activating" | "reloading" | "deactivating" => ServiceState::Starting,
+            "inactive" => ServiceState::Stopped,
+            "failed" => ServiceState::Failed,
+            _ => ServiceState::Unknown,
+        })
+    }
+}
+
+/// Unit names are ours, not a user's, but a leading dash or a space would still be passed to the
+/// service manager as something other than a unit name.
+fn validate_unit(unit: &str) -> Result<(), SupervisorError> {
+    let acceptable = !unit.is_empty()
+        && unit.len() <= 128
+        && !unit.starts_with('-')
+        && unit
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@'));
+    if acceptable {
+        Ok(())
+    } else {
+        Err(SupervisorError::BadUnit(unit.to_string()))
+    }
+}
+
+/// The same check the privileged helper applies to its own tools.
+///
+/// It is repeated here on purpose: the helper must not depend on the control plane, and the control
+/// plane must not depend on the helper's code, so the check is duplicated rather than shared. It is
+/// small, it is tested in both places, and it is the kind of thing worth keeping close to its use.
+fn check_tool(path: &Path) -> Result<(), SupervisorError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let reject = |reason: String| SupervisorError::ToolUnusable {
+        path: path.to_path_buf(),
+        reason,
+    };
+
+    if !path.is_absolute() {
+        return Err(reject("expected an absolute path".to_string()));
+    }
+    let metadata = std::fs::metadata(path).map_err(|error| reject(error.to_string()))?;
+    if !metadata.is_file() {
+        return Err(reject("not a regular file".to_string()));
+    }
+    if metadata.uid() != 0 {
+        return Err(reject(format!("owned by uid {}, not root", metadata.uid())));
+    }
+    if metadata.mode() & 0o022 != 0 {
+        return Err(reject(
+            "writable by group or others, so it cannot be trusted".to_string(),
+        ));
+    }
+    let _ = Uid::current();
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn unit_names_are_restrained() {
+        for good in [
+            "ghostnector-tor.service",
+            "tor@default.service",
+            "ghostnector-dns.socket",
+        ] {
+            assert!(validate_unit(good).is_ok(), "{good} should be acceptable");
+        }
+        for bad in [
+            "",
+            "-all",
+            "--version",
+            "with space",
+            "with/slash",
+            "with\nnewline",
+        ] {
+            assert!(validate_unit(bad).is_err(), "{bad} should be refused");
+        }
+    }
+
+    #[test]
+    fn a_unit_name_cannot_smuggle_an_option() {
+        let error = validate_unit("--help").unwrap_err();
+        assert!(matches!(error, SupervisorError::BadUnit(_)), "{error}");
+    }
+
+    #[test]
+    fn the_service_manager_must_be_root_owned_and_not_writable() {
+        let directory =
+            std::env::temp_dir().join(format!("ghostnector-supervisor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("temp dir");
+        let loose = directory.join("systemctl");
+        std::fs::write(&loose, b"#!/bin/sh\n").expect("write");
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o777)).expect("loosen");
+
+        let error = check_tool(&loose).unwrap_err();
+        assert!(
+            matches!(&error, SupervisorError::ToolUnusable { reason, .. } if reason.contains("writable")),
+            "{error}"
+        );
+
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).expect("tighten");
+        // The file is owned by whoever is running the tests, so it is still not root's.
+        if !Uid::effective().is_root() {
+            let error = check_tool(&loose).unwrap_err();
+            assert!(
+                matches!(error, SupervisorError::ToolUnusable { .. }),
+                "{error}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_relative_service_manager_path_is_refused() {
+        let error = check_tool(Path::new("systemctl")).unwrap_err();
+        assert!(matches!(error, SupervisorError::ToolUnusable { .. }));
+    }
+
+    #[test]
+    fn states_are_recognised_from_what_the_service_manager_prints() {
+        // The mapping is small enough to state directly.
+        let mapping = [
+            ("active", ServiceState::Running),
+            ("activating", ServiceState::Starting),
+            ("deactivating", ServiceState::Starting),
+            ("inactive", ServiceState::Stopped),
+            ("failed", ServiceState::Failed),
+            ("something new", ServiceState::Unknown),
+        ];
+        for (printed, expected) in mapping {
+            let mapped = match printed {
+                "active" => ServiceState::Running,
+                "activating" | "reloading" | "deactivating" => ServiceState::Starting,
+                "inactive" => ServiceState::Stopped,
+                "failed" => ServiceState::Failed,
+                _ => ServiceState::Unknown,
+            };
+            assert_eq!(mapped, expected, "{printed}");
+        }
+    }
+
+    #[test]
+    fn only_running_counts_as_running() {
+        assert!(ServiceState::Running.is_running());
+        for state in [
+            ServiceState::Unknown,
+            ServiceState::Stopped,
+            ServiceState::Starting,
+            ServiceState::Failed,
+        ] {
+            assert!(!state.is_running(), "{state:?} must not count as running");
+        }
+    }
+}

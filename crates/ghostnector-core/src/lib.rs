@@ -22,6 +22,8 @@ pub mod helper;
 pub mod journal;
 pub mod server;
 pub mod state;
+pub mod supervisor;
+pub mod torrc;
 
 #[cfg(test)]
 pub mod testing;
@@ -31,6 +33,8 @@ pub use helper::{Helper, HelperError, HelperLink};
 pub use journal::{Intent, Journal, JournalError};
 pub use server::{bind_socket, Server, ServerError};
 pub use state::{Cause, Machine, TransitionError};
+pub use supervisor::{ServiceState, Supervisor, SupervisorError, SystemdUnits};
+pub use torrc::TorSettings;
 
 /// The package version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

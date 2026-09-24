@@ -572,10 +572,7 @@ mod tests {
         let hello = read_line(&mut client_reader);
         assert!(hello.contains("\"response\":\"hello\""), "{hello}");
         let accepted = read_line(&mut client_reader);
-        assert!(
-            accepted.contains("\"response\":\"accepted\""),
-            "{accepted}"
-        );
+        assert!(accepted.contains("\"response\":\"accepted\""), "{accepted}");
 
         fixture
             .engine
