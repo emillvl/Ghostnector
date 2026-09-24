@@ -11,8 +11,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use nix::unistd::Uid;
-
 /// What a service is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {
@@ -170,36 +168,13 @@ fn validate_unit(unit: &str) -> Result<(), SupervisorError> {
     }
 }
 
-/// The same check the privileged helper applies to its own tools.
-///
-/// It is repeated here on purpose: the helper must not depend on the control plane, and the control
-/// plane must not depend on the helper's code, so the check is duplicated rather than shared. It is
-/// small, it is tested in both places, and it is the kind of thing worth keeping close to its use.
+/// The same check the privileged helper applies to its own tools, now shared with the resolver
+/// tooling so that there is one definition of "safe to run" in the control plane.
 fn check_tool(path: &Path) -> Result<(), SupervisorError> {
-    use std::os::unix::fs::MetadataExt;
-
-    let reject = |reason: String| SupervisorError::ToolUnusable {
-        path: path.to_path_buf(),
-        reason,
-    };
-
-    if !path.is_absolute() {
-        return Err(reject("expected an absolute path".to_string()));
-    }
-    let metadata = std::fs::metadata(path).map_err(|error| reject(error.to_string()))?;
-    if !metadata.is_file() {
-        return Err(reject("not a regular file".to_string()));
-    }
-    if metadata.uid() != 0 {
-        return Err(reject(format!("owned by uid {}, not root", metadata.uid())));
-    }
-    if metadata.mode() & 0o022 != 0 {
-        return Err(reject(
-            "writable by group or others, so it cannot be trusted".to_string(),
-        ));
-    }
-    let _ = Uid::current();
-    Ok(())
+    crate::tools::check_tool(path).map_err(|error| SupervisorError::ToolUnusable {
+        path: error.path,
+        reason: error.reason,
+    })
 }
 
 #[cfg(test)]
@@ -252,7 +227,7 @@ mod tests {
 
         std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).expect("tighten");
         // The file is owned by whoever is running the tests, so it is still not root's.
-        if !Uid::effective().is_root() {
+        if !nix::unistd::Uid::effective().is_root() {
             let error = check_tool(&loose).unwrap_err();
             assert!(
                 matches!(error, SupervisorError::ToolUnusable { .. }),

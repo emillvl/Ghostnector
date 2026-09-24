@@ -21,10 +21,12 @@ pub mod engine;
 pub mod fsutil;
 pub mod helper;
 pub mod journal;
+pub mod resolver;
 pub mod server;
 pub mod services;
 pub mod state;
 pub mod supervisor;
+pub mod tools;
 pub mod torcontrol;
 pub mod torrc;
 
@@ -34,6 +36,10 @@ pub mod testing;
 pub use engine::{Engine, EngineConfig, EngineError};
 pub use helper::{Helper, HelperError, HelperLink};
 pub use journal::{Intent, Journal, JournalError};
+pub use resolver::{
+    Baseline, CommandError, CommandRunner, Environment, Layout, Resolver, ResolverError,
+    RestoreOutcome, SystemCommands,
+};
 pub use server::{bind_socket, Server, ServerError};
 pub use services::{ExternalServices, ServiceError, Services, SystemdServices};
 pub use state::{Cause, Machine, TransitionError};

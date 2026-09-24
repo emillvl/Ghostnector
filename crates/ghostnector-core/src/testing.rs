@@ -8,6 +8,7 @@ use ghostnector_spec::ipc::{ErrorCode, HelperResponse, PROTOCOL_VERSION};
 use ghostnector_spec::ResolvedIdentity;
 
 use crate::helper::{HelperError, HelperLink};
+use crate::resolver::{CommandError, CommandRunner};
 use crate::services::{ServiceError, Services};
 
 /// A helper that records what it was asked, and can be told to fail in specific ways.
@@ -203,5 +204,48 @@ impl Services for MockServices {
 
     fn notes(&self, _profile: ProfileId) -> Vec<String> {
         self.notes.lock().expect("mock lock").clone()
+    }
+}
+
+/// A command runner that records what it was asked to do.
+#[derive(Debug, Default)]
+pub struct MockRunner {
+    calls: Mutex<Vec<String>>,
+    fail: Mutex<Option<String>>,
+}
+
+impl MockRunner {
+    /// A runner that succeeds and remembers.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Every call, as `"program argument argument"`, in order.
+    pub fn calls(&self) -> Vec<String> {
+        self.calls.lock().expect("mock lock").clone()
+    }
+
+    /// Fail every call with this message.
+    pub fn fail_with(&self, message: &str) {
+        *self.fail.lock().expect("mock lock") = Some(message.to_string());
+    }
+}
+
+impl CommandRunner for MockRunner {
+    fn run(&self, program: &std::path::Path, arguments: &[&str]) -> Result<String, CommandError> {
+        let mut call = program.display().to_string();
+        for argument in arguments {
+            call.push(' ');
+            call.push_str(argument);
+        }
+        self.calls.lock().expect("mock lock").push(call);
+
+        match self.fail.lock().expect("mock lock").clone() {
+            Some(message) => Err(CommandError::Refused {
+                program: program.to_path_buf(),
+                reason: message,
+            }),
+            None => Ok(String::new()),
+        }
     }
 }

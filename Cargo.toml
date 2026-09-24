@@ -6,6 +6,7 @@ members = [
     "crates/ghostnector-netd",
     "crates/ghostnector-core",
     "crates/ghostnector-cli",
+    "crates/ghostnector-dns",
 ]
 
 [workspace.package]

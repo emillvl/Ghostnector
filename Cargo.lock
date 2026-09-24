@@ -47,6 +47,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ghostnector-dns"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "ghostnector-netd"
 version = "0.1.0"
 dependencies = [
