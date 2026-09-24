@@ -1,0 +1,32 @@
+[Unit]
+Description=Tor for Ghostnector (client only, configured by Ghostnector)
+Documentation=man:tor(1)
+# Started and stopped by the control plane, not at boot: Tor has no business running when nothing is
+# being protected, and the control plane writes its configuration before starting it.
+After=ghostnector-netd.service
+
+[Service]
+Type=exec
+User=debian-tor
+Group=debian-tor
+ExecStart=/usr/sbin/tor -f /run/ghostnector/torrc
+# The configuration is written by the control plane, which is why this unit does not own it.
+ReadOnlyPaths=/run/ghostnector/torrc
+# The control port's cookie must be readable by the control plane's group.
+SupplementaryGroups=ghostnector
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+ReadWritePaths=/var/lib/tor /run/ghostnector
+StateDirectory=tor
+Restart=on-failure
+RestartSec=3
+
+[Install]
+# Not enabled: only the control plane starts it.
+WantedBy=multi-user.target

@@ -282,6 +282,17 @@ impl<B: Backend + 'static, I: Identities + 'static> Server<B, I> {
             ));
         }
 
+        // Keep a copy of the fail-closed policy where the boot guard can reach it. This is the one
+        // place a second writer is tolerated, and it is this helper's own rendered output: if this
+        // process is ever unavailable at boot, the machine can still deny everything.
+        if profile == ProfileId::FailClosed {
+            if let Err(reason) = write_fallback(&self.config.fallback_path, &script) {
+                notes.push(format!(
+                    "a copy of the fail-closed policy could not be kept for the boot guard: {reason}"
+                ));
+            }
+        }
+
         {
             let mut applied = self.lock();
             applied.profile = Some(profile);
@@ -348,9 +359,34 @@ impl<B: Backend + 'static, I: Identities + 'static> Server<B, I> {
     }
 }
 
+/// Keep a copy of a rendered policy where only root can read it.
+fn write_fallback(path: &std::path::Path, script: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    file.write_all(script.as_bytes())
+        .map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())
+}
+
 /// Whether a peer with this uid may talk to the helper.
+///
+/// Root is accepted alongside the configured peer. That is not a widening: a process running as root
+/// could write the policy directly and never needed this helper's permission. What the check is for
+/// is refusing *unprivileged* processes that are not the control plane — and the boot guard, which
+/// runs before the control plane exists, is a legitimate root caller.
 pub const fn is_authorized(peer: u32, allowed: u32) -> bool {
-    peer == allowed
+    peer == allowed || peer == 0
 }
 
 /// The uid at the other end of a connection, as reported by the kernel.
@@ -468,11 +504,14 @@ mod tests {
     }
 
     #[test]
-    fn authorization_is_an_exact_match() {
+    fn authorization_is_an_exact_match_except_for_root() {
         assert!(is_authorized(1000, 1000));
         assert!(!is_authorized(1000, 1001));
-        assert!(!is_authorized(0, 1000));
         assert!(!is_authorized(1000, 0));
+        assert!(
+            is_authorized(0, 1000),
+            "root could write the policy directly, so refusing it would protect nothing"
+        );
     }
 
     #[test]

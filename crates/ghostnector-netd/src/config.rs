@@ -17,6 +17,11 @@ pub const DEFAULT_NFT: &str = "/usr/sbin/nft";
 /// (the default-deny policy is what stops pre-existing flows, not the flush).
 pub const DEFAULT_CONNTRACK: &str = "/usr/sbin/conntrack";
 
+/// Where a copy of the fail-closed policy is kept, so the boot guard can apply it when this helper
+/// is not available. It is this helper's own rendered output, written by root and readable only by
+/// root.
+pub const DEFAULT_FALLBACK: &str = "/var/lib/ghostnector/fail-closed.nft";
+
 /// Default system user Tor runs as on Debian and Ubuntu.
 pub const DEFAULT_TOR_USER: &str = "debian-tor";
 
@@ -47,6 +52,8 @@ pub struct Config {
     pub nft: PathBuf,
     /// Absolute path to `conntrack`.
     pub conntrack: PathBuf,
+    /// Where to keep a copy of the fail-closed policy for the boot guard.
+    pub fallback_path: PathBuf,
     /// System user Tor runs as.
     pub tor_user: String,
     /// System user the resolver runs as.
@@ -104,11 +111,16 @@ USAGE:
 
 REQUIRED:
     --socket <PATH>        unix socket to listen on (parent directory must exist)
-    --peer-uid <UID>       the only uid allowed to talk to this helper (not root)
+    one of:
+      --peer-user <NAME>   the user allowed to talk to this helper
+      --peer-uid <UID>     the same, as a number (not root)
 
 OPTIONS:
     --nft <PATH>           policy tool                 [default: /usr/sbin/nft]
     --conntrack <PATH>     conntrack tool              [default: /usr/sbin/conntrack]
+    --fallback-path <PATH> where to keep a copy of the fail-closed policy, for the
+                           boot guard to apply if this helper is unavailable
+                                       [default: /var/lib/ghostnector/fail-closed.nft]
     --tor-user <NAME>      system user Tor runs as     [default: debian-tor]
     --dnscrypt-user <NAME> system user the resolver runs as
                                                       [default: dnscrypt-proxy]
@@ -128,6 +140,7 @@ OPTIONS:
         let mut peer_uid: Option<u32> = None;
         let mut nft = PathBuf::from(DEFAULT_NFT);
         let mut conntrack = PathBuf::from(DEFAULT_CONNTRACK);
+        let mut fallback_path = PathBuf::from(DEFAULT_FALLBACK);
         let mut tor_user = DEFAULT_TOR_USER.to_string();
         let mut dnscrypt_user = DEFAULT_DNSCRYPT_USER.to_string();
         let mut trans_port = DEFAULT_TRANS_PORT;
@@ -153,6 +166,7 @@ OPTIONS:
                 "--socket" => socket = Some(path(&option, &value()?)?),
                 "--nft" => nft = path(&option, &value()?)?,
                 "--conntrack" => conntrack = path(&option, &value()?)?,
+                "--fallback-path" => fallback_path = path(&option, &value()?)?,
                 "--peer-uid" => {
                     let raw = value()?;
                     let uid: u32 = raw.parse().map_err(|_| ConfigError::Invalid {
@@ -168,6 +182,28 @@ OPTIONS:
                     }
                     peer_uid = Some(uid);
                 }
+                "--peer-user" => {
+                    // A unit file cannot resolve a uid, so it names the user and this resolves it
+                    // against the live database: a renamed or renumbered account cannot silently
+                    // widen or break the policy.
+                    let name = user_name(&option, &value()?)?;
+                    let user = nix::unistd::User::from_name(&name)
+                        .map_err(|error| ConfigError::Invalid {
+                            option: option.clone(),
+                            reason: format!("cannot look up '{name}': {error}"),
+                        })?
+                        .ok_or_else(|| ConfigError::Invalid {
+                            option: option.clone(),
+                            reason: format!("there is no user called '{name}'"),
+                        })?;
+                    if user.uid.as_raw() == 0 {
+                        return Err(ConfigError::Invalid {
+                            option: option.clone(),
+                            reason: "the peer must not be root".to_string(),
+                        });
+                    }
+                    peer_uid = Some(user.uid.as_raw());
+                }
                 "--tor-user" => tor_user = user_name(&option, &value()?)?,
                 "--dnscrypt-user" => dnscrypt_user = user_name(&option, &value()?)?,
                 "--trans-port" => trans_port = port(&option, &value()?)?,
@@ -179,7 +215,7 @@ OPTIONS:
         }
 
         let socket = socket.ok_or(ConfigError::Missing("--socket"))?;
-        let peer_uid = peer_uid.ok_or(ConfigError::Missing("--peer-uid"))?;
+        let peer_uid = peer_uid.ok_or(ConfigError::Missing("--peer-uid or --peer-user"))?;
 
         // Redirect targets must be distinct, or one listener would shadow another.
         let mut ports = [
@@ -202,6 +238,7 @@ OPTIONS:
             peer_uid,
             nft,
             conntrack,
+            fallback_path,
             tor_user,
             dnscrypt_user,
             trans_port,
@@ -350,8 +387,27 @@ mod tests {
         );
         assert_eq!(
             Config::parse(args(&["--socket", "/run/x.sock"])).unwrap_err(),
-            ConfigError::Missing("--peer-uid")
+            ConfigError::Missing("--peer-uid or --peer-user")
         );
+    }
+
+    #[test]
+    fn a_peer_can_be_named_by_user() {
+        // A user that must exist on any machine, and one that must not.
+        let config = run(&["--socket", "/run/x.sock", "--peer-user", "nobody"]);
+        let nobody = nix::unistd::User::from_name("nobody")
+            .expect("lookup")
+            .expect("nobody exists");
+        assert_eq!(config.peer_uid, nobody.uid.as_raw());
+
+        let error = Config::parse(args(&[
+            "--socket",
+            "/run/x.sock",
+            "--peer-user",
+            "no-such-user-4f2a",
+        ]))
+        .unwrap_err();
+        assert!(matches!(error, ConfigError::Invalid { .. }), "{error}");
     }
 
     #[test]

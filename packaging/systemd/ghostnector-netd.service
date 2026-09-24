@@ -1,0 +1,48 @@
+[Unit]
+Description=Ghostnector privileged helper (the only writer of the network policy)
+Documentation=man:ghostnector-netd(8)
+# Deliberately early: the boot guard runs before sysinit and needs this helper to exist by then.
+DefaultDependencies=no
+After=local-fs.target systemd-tmpfiles-setup.service
+Before=sysinit.target
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=exec
+ExecStart=/usr/libexec/ghostnector-netd \
+    --socket /run/ghostnector/netd.sock \
+    --peer-user ghostnector \
+    --nft /usr/sbin/nft \
+    --conntrack /usr/sbin/conntrack \
+    --fallback-path /var/lib/ghostnector/fail-closed.nft \
+    --tor-user debian-tor \
+    --dnscrypt-user dnscrypt-proxy
+
+# The whole point of this process is that it holds one capability and nothing else.
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+NoNewPrivileges=yes
+
+# It speaks netlink to the kernel and unix sockets to the control plane. Nothing else.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+ReadWritePaths=/run/ghostnector /var/lib/ghostnector
+
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=sysinit.target

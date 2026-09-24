@@ -21,6 +21,7 @@ NS="gh-netd-test"
 RUNDIR="/run/ghostnector"
 SOCK="$RUNDIR/netd.sock"
 PEER_USER="ghostnector-core"
+OUTSIDER_USER="ghostnector-outsider"
 CLIENT="/tmp/gh-netd-client.py"
 LOG="/tmp/gh-netd.log"
 NETD_PID=""
@@ -41,8 +42,13 @@ ok() { echo "  ok: $*"; }
 if ! id -u "$PEER_USER" >/dev/null 2>&1; then
     useradd --system --user-group --no-create-home --shell /usr/sbin/nologin "$PEER_USER"
 fi
+if ! id -u "$OUTSIDER_USER" >/dev/null 2>&1; then
+    useradd --system --user-group --no-create-home --shell /usr/sbin/nologin "$OUTSIDER_USER"
+fi
 PEER_UID="$(id -u "$PEER_USER")"
 PEER_GID="$(id -g "$PEER_USER")"
+OUTSIDER_UID="$(id -u "$OUTSIDER_USER")"
+OUTSIDER_GID="$(id -g "$OUTSIDER_USER")"
 [ "$PEER_UID" != "0" ] || fail "the peer identity must not be root"
 
 ip netns add "$NS"
@@ -79,7 +85,7 @@ try:
     connection.connect(sock_path)
     send(connection, {"verb": "hello", "protocol": 1})
     first = recv_line(connection)
-except (ConnectionResetError, BrokenPipeError, ConnectionRefusedError):
+except (ConnectionResetError, BrokenPipeError, ConnectionRefusedError, PermissionError):
     # An unauthorised peer is refused without a reply, and because the helper never reads from it
     # the kernel reports the closed connection as a reset rather than an orderly end of stream.
     first = None
@@ -121,11 +127,22 @@ read -r mode owner < <(stat -c '%a %u' "$SOCK")
 [ "$owner" = "$PEER_UID" ] || fail "socket owner is $owner, expected $PEER_UID"
 ok "socket is mode 600, owned by uid $PEER_UID"
 
-# ---------------------------------------------------------------- an unauthorised peer
+# ---------------------------------------------------------------- who may talk to the helper
 ROOT_OUT="$(python3 "$CLIENT" "$SOCK" refused 2>&1 || true)"
 case "$ROOT_OUT" in
-REFUSED*) ok "a connection from uid 0 was refused (SO_PEERCRED)" ;;
-*) fail "root should have been refused, got: $ROOT_OUT" ;;
+HELLO*)
+    ok "root is accepted, which is what the boot guard needs"
+    ;;
+*) fail "root should be accepted, got: $ROOT_OUT" ;;
+esac
+
+OUTSIDER_OUT="$(setpriv --reuid="$OUTSIDER_UID" --regid="$OUTSIDER_GID" --clear-groups \
+    python3 "$CLIENT" "$SOCK" refused 2>&1 || true)"
+case "$OUTSIDER_OUT" in
+REFUSED*)
+    ok "a user who is not the peer cannot reach the helper"
+    ;;
+*) fail "an outsider should not reach the helper, got: $OUTSIDER_OUT" ;;
 esac
 
 # ---------------------------------------------------------------- the peer's session

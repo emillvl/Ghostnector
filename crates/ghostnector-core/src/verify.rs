@@ -344,7 +344,7 @@ impl Probes for NetworkProbes {
         };
 
         match parse_addresses(&response[..length], id) {
-            Ok((rcode, addresses)) if rcode != 0 => ProbeResult::Inconclusive(format!(
+            Ok((rcode, _)) if rcode != 0 => ProbeResult::Inconclusive(format!(
                 "the canary was refused with response code {rcode}, so DNS is not working"
             )),
             Ok((_, addresses)) if addresses.is_empty() => {

@@ -1,0 +1,35 @@
+[Unit]
+Description=Ghostnector boot guard (deny everything if protection was requested)
+Documentation=man:ghostnector-bootguard(8) file:/usr/share/doc/ghostnector/RECOVERY.md
+# Early, and before the network is configured: an application that starts sending during boot must
+# find the machine already denied.
+DefaultDependencies=no
+After=local-fs.target systemd-tmpfiles-setup.service ghostnector-netd.service
+Wants=ghostnector-netd.service
+Before=sysinit.target network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/ghostnector-bootguard \
+    --netd /run/ghostnector/netd.sock \
+    --intent /var/lib/ghostnector/intent.json \
+    --fallback /var/lib/ghostnector/fail-closed.nft
+
+# It may apply the helper's own copy of the policy, so it needs the capability to do that.
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+NoNewPrivileges=yes
+
+# Refusing to run because something looked odd would leave the machine open, which is worse: the
+# program is deliberately allowed to reach the policy tool.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectProc=invisible
+ProcSubset=pid
+ReadWritePaths=/run/ghostnector /var/lib/ghostnector
+
+[Install]
+WantedBy=sysinit.target

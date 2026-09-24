@@ -1,0 +1,19 @@
+[package]
+name = "ghostnector-bootguard"
+description = "Applies the fail-closed policy at boot when protection was requested before the last restart."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "ghostnector-bootguard"
+path = "src/main.rs"
+
+[dependencies]
+ghostnector-spec = { path = "../ghostnector-spec" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+nix = { workspace = true }
