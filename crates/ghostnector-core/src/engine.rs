@@ -1101,9 +1101,10 @@ mod tests {
         };
         engine.connect(profile, USER_UID).expect("connect");
         let user_uid = helper.verbs().into_iter().find_map(|verb| match verb {
-            Verb::ApplyProfile { profile, params } if profile == ProfileId::TorUser => {
-                params.user_uid
-            }
+            Verb::ApplyProfile {
+                profile: ProfileId::TorUser,
+                params,
+            } => params.user_uid,
             _ => None,
         });
         assert_eq!(user_uid, Some(USER_UID));
@@ -1196,7 +1197,7 @@ mod tests {
                     Verb::ApplyProfile { profile, .. } => Some(profile),
                     _ => None,
                 })
-                .last(),
+                .next_back(),
             Some(ProfileId::FailClosed)
         );
     }
@@ -1612,6 +1613,42 @@ mod tests {
                 .any(|reason| reason.as_str().contains("no longer recent")),
             "{:?}",
             snapshot.reasons
+        );
+    }
+
+    #[test]
+    fn a_failed_connect_whose_policy_cannot_be_withdrawn_stays_denied() {
+        let (helper, _services, engine, _dir) = engine_and_services();
+        // The baseline applies, the profile that was asked for fails, and then the policy cannot be
+        // taken back out.
+        helper.fail_apply_of(ProfileId::TorSystem);
+        helper.fail_revert_with("the helper is gone");
+
+        let error = engine
+            .connect(system_tor_profile(), USER_UID)
+            .expect_err("connect must fail");
+        assert!(error.to_string().contains("TorSystem"), "{error}");
+
+        let snapshot = engine.snapshot();
+        assert_eq!(
+            snapshot.state,
+            ProtectionState::Blocked,
+            "a policy that cannot be withdrawn must not be reported as gone"
+        );
+        assert!(
+            snapshot
+                .reasons
+                .iter()
+                .any(|reason| reason.as_str().contains("could not be withdrawn")),
+            "{:?}",
+            snapshot.reasons
+        );
+        assert!(
+            Journal::new(engine.journal_path())
+                .load()
+                .expect("load")
+                .protected,
+            "the machine is denied, so the intent must say so"
         );
     }
 
