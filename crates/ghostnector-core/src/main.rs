@@ -12,9 +12,10 @@ mod inner {
     use std::time::Duration;
 
     use ghostnector_core::{
-        bind_socket, ChildRelay, CommandRunner, DnsRelay, Engine, EngineConfig, ExternalServices,
-        Helper, Server, Services, SystemCommands, SystemdServices, SystemdUnits, TorControl,
-        TorSettings, VERSION,
+        bind_socket, Canary, ChildRelay, CommandRunner, DnsRelay, Engine, EngineConfig,
+        ExternalServices, Helper, HttpEndpoint, NetworkProbes, Server, Services, SystemCommands,
+        SystemdServices, SystemdUnits, TorControl, TorSettings, Verification, VerificationConfig,
+        Verifier, VERSION,
     };
 
     const DEFAULT_HELPER: &str = "/run/ghostnector/netd.sock";
@@ -33,6 +34,9 @@ mod inner {
     const DEFAULT_RESOLVE_CONF_ROOT: &str = "/";
     const DEFAULT_RESOLVECTL: &str = "/usr/bin/resolvectl";
     const DEFAULT_RESOLVER_PORT: u16 = 5353;
+    const DEFAULT_VERIFY_INTERVAL_SECONDS: u64 = 300;
+    const DEFAULT_VERIFY_STALE_SECONDS: u64 = 900;
+    const DEFAULT_VERIFY_TIMEOUT_SECONDS: u64 = 10;
 
     const USAGE: &str = "\
 ghostnector-core - the control plane (no privileges)
@@ -81,6 +85,18 @@ OPTIONS:
     --resolvectl <PATH>     the tool used to configure systemd-resolved
                                                       [default: /usr/bin/resolvectl]
 
+  Verification (a run that proves the policy is working, not just applied):
+    --check-url <URL>       an endpoint that answers 200 to a GET, and reports this
+                            machine's address in its body; traffic reaches it only
+                            through the protected path, so a wrong answer is an alarm
+    --udp-check <ADDR:PORT> an endpoint that answers UDP; a reply means something is
+                            letting UDP out, which is an alarm
+    --canary <NAME@ADDR>    a name that should resolve to one particular address
+    --canary-resolver <ADDR:PORT>  which resolver to ask for the canary
+    --verify-interval <SECONDS>    how often to check        [default: 300]
+    --verify-stale-after <SECONDS> how long a result counts [default: 900]
+    --verify-timeout <SECONDS>     how long one check may take [default: 10]
+
     -h, --help          print this text
     -V, --version       print the version";
 
@@ -109,6 +125,7 @@ OPTIONS:
         resolver_port: u16,
         resolver_root: PathBuf,
         resolvectl: PathBuf,
+        verification: VerificationConfig,
     }
 
     pub fn main() -> ExitCode {
@@ -155,6 +172,9 @@ OPTIONS:
             ChildRelay::new(config.dns_helper.clone()).map_err(|error| error.to_string())?,
         );
         let commands: Arc<dyn CommandRunner> = Arc::new(SystemCommands);
+        let verification: Arc<dyn Verification> = Arc::new(Verifier::new(NetworkProbes::new(
+            config.verification.clone(),
+        )));
         let engine = Arc::new(Engine::new(
             EngineConfig {
                 journal_path: config.journal.clone(),
@@ -163,12 +183,40 @@ OPTIONS:
                 resolver_port: config.resolver_port,
                 resolver_root: config.resolver_root.clone(),
                 resolvectl: config.resolvectl.clone(),
+                verification: config.verification.clone(),
             },
             Arc::new(helper),
             services,
             relay,
             commands,
+            verification,
         ));
+
+        // Verification runs on its own thread, so a slow check can never hold up the interface, and
+        // a check that stops running shows up as stale rather than as a stale claim of protection.
+        {
+            let engine = Arc::clone(&engine);
+            let interval = config.verification.interval;
+            std::thread::spawn(move || {
+                let mut last = std::time::Instant::now();
+                loop {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let requested = engine.take_verification_request();
+                    let due = last.elapsed() >= interval;
+                    if !requested && !due {
+                        continue;
+                    }
+                    if requested {
+                        // Let a fresh transition settle before judging it, so the first check does
+                        // not race the services it is meant to check.
+                        std::thread::sleep(Duration::from_secs(2));
+                    }
+                    engine.expire_verification();
+                    let _ = engine.verify_once();
+                    last = std::time::Instant::now();
+                }
+            });
+        }
 
         // Reconcile before serving: the kernel's answer, not ours, decides what is enforced.
         if let Err(error) = engine.reconcile() {
@@ -242,6 +290,13 @@ OPTIONS:
         let mut resolver_port = DEFAULT_RESOLVER_PORT;
         let mut resolver_root = PathBuf::from(DEFAULT_RESOLVE_CONF_ROOT);
         let mut resolvectl = PathBuf::from(DEFAULT_RESOLVECTL);
+        let mut check_url: Option<HttpEndpoint> = None;
+        let mut udp_check: Option<SocketAddr> = None;
+        let mut canary_name: Option<(String, Ipv4Addr)> = None;
+        let mut canary_resolver: Option<SocketAddr> = None;
+        let mut verify_interval = Duration::from_secs(DEFAULT_VERIFY_INTERVAL_SECONDS);
+        let mut verify_stale = Duration::from_secs(DEFAULT_VERIFY_STALE_SECONDS);
+        let mut verify_timeout = Duration::from_secs(DEFAULT_VERIFY_TIMEOUT_SECONDS);
 
         let mut arguments = arguments.peekable();
         while let Some(option) = arguments.next() {
@@ -298,6 +353,13 @@ OPTIONS:
                 "--resolver-state" => resolver_state = absolute(&option, value()?)?,
                 "--resolv-conf-root" => resolver_root = absolute(&option, value()?)?,
                 "--resolvectl" => resolvectl = absolute(&option, value()?)?,
+                "--check-url" => check_url = Some(http_endpoint(&option, &value()?)?),
+                "--udp-check" => udp_check = Some(address(&option, &value()?)?),
+                "--canary" => canary_name = Some(canary(&option, &value()?)?),
+                "--canary-resolver" => canary_resolver = Some(address(&option, &value()?)?),
+                "--verify-interval" => verify_interval = seconds(&option, &value()?, 1, 86_400)?,
+                "--verify-stale-after" => verify_stale = seconds(&option, &value()?, 1, 604_800)?,
+                "--verify-timeout" => verify_timeout = seconds(&option, &value()?, 1, 120)?,
                 "--tor-bootstrap-seconds" => {
                     let raw = value()?;
                     let seconds: u64 = raw.parse().map_err(|_| {
@@ -333,7 +395,91 @@ OPTIONS:
             resolver_port,
             resolver_root,
             resolvectl,
+            verification: VerificationConfig {
+                interval: verify_interval,
+                stale_after: verify_stale,
+                timeout: verify_timeout,
+                udp_endpoint: udp_check,
+                http_endpoint: check_url,
+                canary: match (canary_name, canary_resolver) {
+                    (Some((name, expected)), Some(resolver)) => Some(Canary {
+                        name,
+                        expected,
+                        resolver,
+                    }),
+                    (None, None) => None,
+                    _ => {
+                        return Err(format!(
+                            "'--canary' and '--canary-resolver' belong together\n\n{USAGE}"
+                        ))
+                    }
+                },
+            },
         })
+    }
+
+    fn address(option: &str, raw: &str) -> Result<SocketAddr, String> {
+        raw.parse()
+            .map_err(|_| format!("value for '{option}' is not usable: expected address:port"))
+    }
+
+    fn seconds(option: &str, raw: &str, least: u64, most: u64) -> Result<Duration, String> {
+        let value: u64 = raw
+            .parse()
+            .map_err(|_| format!("value for '{option}' is not usable: expected a number"))?;
+        if value < least || value > most {
+            return Err(format!(
+                "value for '{option}' is not usable: expected {least} to {most} seconds"
+            ));
+        }
+        Ok(Duration::from_secs(value))
+    }
+
+    /// A plain HTTP endpoint. TLS is deliberately not supported here: a check that needs a
+    /// certificate chain is a check with more ways to be wrong.
+    fn http_endpoint(option: &str, raw: &str) -> Result<HttpEndpoint, String> {
+        let reject = |reason: &str| format!("value for '{option}' is not usable: {reason}");
+        let rest = raw
+            .strip_prefix("http://")
+            .ok_or_else(|| reject("expected a plain http:// URL"))?;
+        let (authority, path) = match rest.find('/') {
+            Some(index) => (&rest[..index], &rest[index..]),
+            None => (rest, "/"),
+        };
+        let address: SocketAddr = match authority.split_once(':') {
+            Some((host, port)) => format!(
+                "{}:{}",
+                host,
+                port.parse::<u16>()
+                    .map_err(|_| reject("expected a port number"))?
+            )
+            .parse()
+            .map_err(|_| reject("expected host:port"))?,
+            None => format!("{authority}:80")
+                .parse()
+                .map_err(|_| reject("expected a host"))?,
+        };
+        Ok(HttpEndpoint {
+            address,
+            host: authority.to_string(),
+            path: path.to_string(),
+        })
+    }
+
+    /// `name@address`, which is the whole canary contract.
+    fn canary(option: &str, raw: &str) -> Result<(String, Ipv4Addr), String> {
+        let (name, address) = raw
+            .split_once('@')
+            .ok_or_else(|| format!("value for '{option}' is not usable: expected name@address"))?;
+        if name.is_empty() || !name.contains('.') {
+            return Err(format!(
+                "value for '{option}' is not usable: expected a dotted name"
+            ));
+        }
+        let address = address
+            .parse()
+            .map_err(|_| format!("value for '{option}' is not usable: expected an address"))?;
+        Ok((name.to_string(), address))
     }
 
     fn absolute(option: &str, raw: String) -> Result<PathBuf, String> {

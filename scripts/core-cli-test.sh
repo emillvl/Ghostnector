@@ -32,21 +32,29 @@ OUTSIDER="ghostnector-outsider"
 CONTROL_PORT="9051"
 DNS_UPSTREAM_PORT="9053"
 CHOKEPOINT_PORT="9054"
+UDP_CHECK_PORT="9999"
+OUTSIDE_NS="gh-outside"
+OUTSIDE_ADDR="10.77.0.1"
+INSIDE_ADDR="10.77.0.2"
 FAKE_TOR="/tmp/gh-fake-tor.py"
 FAKE_DNS="/tmp/gh-fake-dns.py"
+FAKE_UDP="/tmp/gh-fake-udp.py"
 DNS_PROBE="/tmp/gh-dns-probe.py"
 NETD_PID=""
 CORE_PID=""
 TOR_PID=""
 DNS_PID=""
+UDP_PID=""
 
 cleanup() {
     [ -n "$CORE_PID" ] && kill "$CORE_PID" 2>/dev/null || true
     [ -n "$NETD_PID" ] && kill "$NETD_PID" 2>/dev/null || true
     [ -n "$TOR_PID" ] && kill "$TOR_PID" 2>/dev/null || true
     [ -n "$DNS_PID" ] && kill "$DNS_PID" 2>/dev/null || true
+    [ -n "$UDP_PID" ] && kill "$UDP_PID" 2>/dev/null || true
     ip netns del "$NS" 2>/dev/null || true
-    rm -rf "$BINDIR" "$WORKDIR" "$RUNDIR" "$FAKE_TOR" "$FAKE_DNS" "$DNS_PROBE"
+    ip netns del "$OUTSIDE_NS" 2>/dev/null || true
+    rm -rf "$BINDIR" "$WORKDIR" "$RUNDIR" "$FAKE_TOR" "$FAKE_DNS" "$FAKE_UDP" "$DNS_PROBE"
 }
 trap cleanup EXIT
 
@@ -101,6 +109,19 @@ chown "$CORE_UID" "$COOKIE"
 ip netns add "$NS"
 # A fresh namespace has its loopback down, and Tor's control port is on loopback.
 ip -n "$NS" link set lo up
+
+# ---------------------------------------------------------------- a place for traffic to go
+# The verifier's UDP check needs somewhere that answers if a datagram gets out, and it cannot be on
+# loopback: loopback is allowed by design, so a reply from it would say nothing.
+ip netns add "$OUTSIDE_NS"
+ip link add veth-outside type veth peer name veth-inside
+ip link set veth-outside netns "$OUTSIDE_NS"
+ip link set veth-inside netns "$NS"
+ip -n "$OUTSIDE_NS" addr add "$OUTSIDE_ADDR/24" dev veth-outside
+ip -n "$NS" addr add "$INSIDE_ADDR/24" dev veth-inside
+ip -n "$OUTSIDE_NS" link set veth-outside up
+ip -n "$NS" link set veth-inside up
+ip -n "$OUTSIDE_NS" link set lo up
 
 in_ns() { ip netns exec "$NS" "$@"; }
 as_user() {
@@ -200,6 +221,22 @@ in_ns python3 "$FAKE_DNS" "$DNS_UPSTREAM_PORT" >/tmp/gh-fake-dns.log 2>&1 &
 DNS_PID=$!
 sleep 0.3
 
+# ---------------------------------------------------------------- something to answer if UDP escapes
+cat >"$FAKE_UDP" <<'PY'
+import socket, sys
+
+port = int(sys.argv[1])
+server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+server.bind(("0.0.0.0", port))
+while True:
+    _, address = server.recvfrom(4096)
+    server.sendto(b"here", address)
+PY
+
+ip netns exec "$OUTSIDE_NS" python3 "$FAKE_UDP" "$UDP_CHECK_PORT" >/tmp/gh-fake-udp.log 2>&1 &
+UDP_PID=$!
+sleep 0.3
+
 start_stack() {
     in_ns "$BINDIR/ghostnector-netd" --socket "$RUNDIR/netd.sock" --peer-uid "$CORE_UID" \
         >/tmp/gh-netd-stack.log 2>&1 &
@@ -212,6 +249,8 @@ start_stack() {
         --tor-bootstrap-seconds 10 \
         --dns-helper "$BINDIR/ghostnector-dns" --tor-dns-port "$DNS_UPSTREAM_PORT" \
         --resolv-conf-root "$RESOLV_ROOT" --resolver-state "$WORKDIR/resolver.json" \
+        --udp-check "$OUTSIDE_ADDR:$UDP_CHECK_PORT" \
+        --verify-interval 5 --verify-stale-after 120 --verify-timeout 3 \
         >/tmp/gh-core.log 2>&1 &
     CORE_PID=$!
     wait_for_socket "$RUNDIR/core.sock" || fail "the control plane did not start"
@@ -252,7 +291,7 @@ case "$CONNECTED" in
 *) fail "connect did not report a protected state: $CONNECTED" ;;
 esac
 case "$CONNECTED" in
-*"nothing can verify it yet"*) ok "it says plainly that nothing has verified it" ;;
+*"not checked yet"*) ok "it says plainly that nothing has checked it yet" ;;
 *) fail "the verification status was not reported: $CONNECTED" ;;
 esac
 case "$CONNECTED" in
@@ -273,6 +312,48 @@ case "$(cat "$RESOLV_CONF")" in
 *"nameserver 127.0.0.1"*) ok "the machine's own resolver points at the chokepoint" ;;
 *) fail "the resolver was not repointed: $(cat "$RESOLV_CONF")" ;;
 esac
+
+echo "[4d] the checks turn an applied policy into a proven one"
+VERIFIED=""
+for _ in $(seq 1 25); do
+    STATUS="$(cli status)"
+    case "$STATUS" in
+    *"and verified"*)
+        VERIFIED=1
+        break
+        ;;
+    esac
+    sleep 1
+done
+[ -n "$VERIFIED" ] || fail "the state never became verified: $(cli status)"
+ok "the checks passed, and the state now claims protection"
+
+echo "[4e] weakening the policy must be noticed"
+# One hand-edited rule: accept UDP at the top of the output chain, before the rejection rule. The
+# rest of the policy is untouched, so this is exactly the case the review asks about.
+in_ns nft insert rule inet ghostnector out_filter meta l4proto udp counter accept \
+    comment '"hand edited during the test"'
+ALARMED=""
+for _ in $(seq 1 30); do
+    STATUS="$(cli status)"
+    case "$STATUS" in
+    *"no traffic can leave"*)
+        ALARMED=1
+        break
+        ;;
+    esac
+    sleep 1
+done
+[ -n "$ALARMED" ] || fail "a weakened policy was not noticed: $(cli status)"
+ok "a hand-edited rule was noticed, and the machine was denied"
+case "$STATUS" in
+*"verification failed"*) ok "and the reason is stated" ;;
+*) fail "the alarm gave no reason: $STATUS" ;;
+esac
+if in_ns nft list chain inet ghostnector out_filter | grep -q "hand edited"; then
+    fail "the tampered policy survived the alarm"
+fi
+ok "the fail-closed baseline replaced the tampered policy"
 grep -q '"protected": true' "$JOURNAL" || fail "the intent was not recorded"
 ok "the intent was recorded"
 

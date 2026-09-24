@@ -30,6 +30,7 @@ pub mod supervisor;
 pub mod tools;
 pub mod torcontrol;
 pub mod torrc;
+pub mod verify;
 
 #[cfg(test)]
 pub mod testing;
@@ -48,6 +49,10 @@ pub use state::{Cause, Machine, TransitionError};
 pub use supervisor::{ServiceState, Supervisor, SupervisorError, SystemdUnits};
 pub use torcontrol::{Bootstrap, TorControl, TorControlError};
 pub use torrc::TorSettings;
+pub use verify::{
+    Canary, HttpEndpoint, NetworkProbes, Outcome, ProbeResult, Probes,
+    Report as VerificationReport, Verification, VerificationConfig, Verifier,
+};
 
 /// The package version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

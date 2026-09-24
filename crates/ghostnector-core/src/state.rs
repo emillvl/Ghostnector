@@ -15,6 +15,8 @@ pub enum Cause {
     Automatic,
     /// The user asked for it, so the state machine's protections do not apply.
     UserRequested,
+    /// Something verified that the policy is working. The only way into `Protected`.
+    Verified,
 }
 
 /// Why a transition was refused.
@@ -91,16 +93,15 @@ impl Machine {
         reasons: Vec<Reason>,
         now: i64,
     ) -> Result<(), TransitionError> {
-        if next != ProtectionState::Off
-            && cause == Cause::Automatic
-            && next == ProtectionState::Protected
-        {
-            // "Protected" is a claim about verification; nothing may claim it automatically.
+        // "Protected" is a claim about evidence, so the only way in is a verification.
+        if next == ProtectionState::Protected && cause != Cause::Verified {
             return Err(TransitionError::UnverifiedProtection);
         }
 
+        // Leaving protection for the clearnet is a decision, not a consequence: only the user can
+        // make it, and only when protection was never established may it happen automatically.
         if next == ProtectionState::Off
-            && cause == Cause::Automatic
+            && cause != Cause::UserRequested
             && !self.state.may_auto_rollback()
         {
             return Err(TransitionError::RollbackFromProtected { from: self.state });
@@ -129,8 +130,10 @@ mod tests {
 
     fn machine_in(state: ProtectionState) -> Machine {
         let mut machine = Machine::new();
+        // `Verified` is the only cause that can reach every state the tests need, since `Protected`
+        // now requires evidence and `Off` requires the user.
         machine
-            .transition(state, Cause::UserRequested, vec![], 100)
+            .transition(state, Cause::Verified, vec![], 100)
             .expect("setup");
         machine
     }
@@ -207,16 +210,33 @@ mod tests {
 
     #[test]
     fn nothing_may_claim_protection_without_verification() {
-        let mut machine = Machine::new();
+        for cause in [Cause::Automatic, Cause::UserRequested] {
+            let mut machine = Machine::new();
+            let error = machine
+                .transition(ProtectionState::Protected, cause, vec![], 1)
+                .unwrap_err();
+            assert_eq!(error, TransitionError::UnverifiedProtection, "{cause:?}");
+        }
+
+        // Evidence is the only door.
+        let mut machine = machine_in(ProtectionState::Degraded);
+        assert!(machine
+            .transition(ProtectionState::Protected, Cause::Verified, vec![], 2)
+            .is_ok());
+        assert_eq!(machine.state(), ProtectionState::Protected);
+    }
+
+    #[test]
+    fn verification_is_not_a_way_out_of_protection() {
+        let mut machine = machine_in(ProtectionState::Protected);
         let error = machine
-            .transition(ProtectionState::Protected, Cause::Automatic, vec![], 1)
+            .transition(ProtectionState::Off, Cause::Verified, vec![], 3)
             .unwrap_err();
-        assert_eq!(error, TransitionError::UnverifiedProtection);
-        assert!(
-            machine
-                .transition(ProtectionState::Protected, Cause::UserRequested, vec![], 1)
-                .is_err()
-                == false
+        assert_eq!(
+            error,
+            TransitionError::RollbackFromProtected {
+                from: ProtectionState::Protected
+            }
         );
     }
 

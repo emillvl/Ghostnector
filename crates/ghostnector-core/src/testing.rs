@@ -10,6 +10,7 @@ use ghostnector_spec::ResolvedIdentity;
 use crate::helper::{HelperError, HelperLink};
 use crate::resolver::{CommandError, CommandRunner};
 use crate::services::{ServiceError, Services};
+use crate::verify::Outcome;
 
 /// A helper that records what it was asked, and can be told to fail in specific ways.
 #[derive(Debug, Default)]
@@ -204,6 +205,51 @@ impl Services for MockServices {
 
     fn notes(&self, _profile: ProfileId) -> Vec<String> {
         self.notes.lock().expect("mock lock").clone()
+    }
+}
+
+/// A verifier whose answer the test chooses.
+#[derive(Debug, Default)]
+pub struct MockVerification {
+    outcome: Mutex<Option<Outcome>>,
+}
+
+impl MockVerification {
+    /// A verifier that cannot reach a conclusion, which is the honest default.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Make every run pass.
+    pub fn passing(&self) {
+        *self.outcome.lock().expect("mock lock") = Some(Outcome::Passed);
+    }
+
+    /// Make every run report this failure.
+    pub fn failing(&self, reason: &str) {
+        *self.outcome.lock().expect("mock lock") = Some(Outcome::Failed {
+            reason: reason.to_string(),
+        });
+    }
+
+    /// Make every run unable to conclude anything.
+    pub fn inconclusive(&self) {
+        *self.outcome.lock().expect("mock lock") = None;
+    }
+}
+
+impl crate::verify::Verification for MockVerification {
+    fn run_once(&self) -> crate::verify::Report {
+        let outcome =
+            self.outcome
+                .lock()
+                .expect("mock lock")
+                .clone()
+                .unwrap_or(Outcome::Inconclusive {
+                    reason: "no checks are configured".to_string(),
+                });
+        let details = vec![format!("mock: {outcome:?}")];
+        crate::verify::Report { outcome, details }
     }
 }
 

@@ -15,6 +15,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -31,6 +32,9 @@ use crate::now_unix;
 use crate::resolver::{Baseline, BaselineStore, CommandRunner, Layout, Resolver, RestoreOutcome};
 use crate::services::{ServiceError, Services};
 use crate::state::{Cause, Machine, TransitionError};
+use crate::verify::{
+    Outcome, Report as VerificationReport, Verification as VerificationRuns, VerificationConfig,
+};
 
 /// Where the intent file lives on a real system.
 pub const DEFAULT_JOURNAL: &str = "/var/lib/ghostnector/intent.json";
@@ -53,6 +57,8 @@ pub struct EngineConfig {
     pub resolver_root: PathBuf,
     /// Where `resolvectl` lives.
     pub resolvectl: PathBuf,
+    /// How, and whether, to verify that the policy is working.
+    pub verification: VerificationConfig,
 }
 
 impl Default for EngineConfig {
@@ -64,6 +70,7 @@ impl Default for EngineConfig {
             resolver_port: 5353,
             resolver_root: PathBuf::from("/"),
             resolvectl: PathBuf::from("/usr/bin/resolvectl"),
+            verification: VerificationConfig::default(),
         }
     }
 }
@@ -115,16 +122,29 @@ pub struct Engine {
     requested: Mutex<Option<Profile>>,
     notes: Mutex<Vec<Reason>>,
     subscribers: Mutex<Vec<Sender<Event>>>,
+    verification: Arc<dyn VerificationRuns>,
+    last_verification: Mutex<VerificationState>,
+    verify_soon: AtomicBool,
+}
+
+/// What the last verification run said.
+#[derive(Debug, Default, Clone)]
+struct VerificationState {
+    verification: Verification,
+    checked_at: Option<i64>,
+    details: Vec<String>,
 }
 
 impl Engine {
-    /// Build an engine around a helper link, a service supervisor, a DNS relay, and a resolver.
+    /// Build an engine around the pieces it does not own: the helper, the service supervisor, the DNS
+    /// relay, a command runner for the resolver tools, and the verifier.
     pub fn new(
         config: EngineConfig,
         helper: Arc<dyn HelperLink>,
         services: Arc<dyn Services>,
         relay: Arc<dyn DnsRelay>,
         commands: Arc<dyn CommandRunner>,
+        verification: Arc<dyn VerificationRuns>,
     ) -> Self {
         let journal = Journal::new(config.journal_path.clone());
         let resolver = Resolver::new(
@@ -149,7 +169,15 @@ impl Engine {
             requested: Mutex::new(None),
             notes: Mutex::new(Vec::new()),
             subscribers: Mutex::new(Vec::new()),
+            verification,
+            last_verification: Mutex::new(VerificationState::default()),
+            verify_soon: AtomicBool::new(false),
         }
+    }
+
+    /// Ask for a check as soon as the next tick allows, rather than waiting a whole interval.
+    pub fn take_verification_request(&self) -> bool {
+        self.verify_soon.swap(false, Ordering::SeqCst)
     }
 
     /// The intent file in use.
@@ -162,8 +190,13 @@ impl Engine {
         let machine = self.lock_machine();
         let report = self.lock_report().clone();
         let requested = self.lock_requested().clone();
+        let checked = self.lock_verification().clone();
         let mut reasons: Vec<Reason> = machine.reasons().to_vec();
         reasons.extend(self.lock_notes().iter().cloned());
+        // The individual check results are worth showing while they are what the state rests on.
+        if checked.verification == Verification::Fresh {
+            reasons.extend(checked.details.iter().cloned().map(Reason::new));
+        }
 
         Snapshot {
             state: machine.state(),
@@ -177,10 +210,10 @@ impl Engine {
                 dns: ServiceHealth::Unknown,
                 i2p: ServiceHealth::Unknown,
                 policy_applied: report.applied,
-                // Nothing has verified anything yet; saying otherwise would be a lie.
-                verification: Verification::Unavailable,
+                // Only a check that actually ran may say anything here.
+                verification: checked.verification,
             },
-            verified_ago_secs: None,
+            verified_ago_secs: checked.checked_at.map(|at| (now_unix() - at).max(0) as u64),
             blocked_egress_attempts: 0,
             generation: machine.generation(),
         }
@@ -237,6 +270,8 @@ impl Engine {
                     now_unix(),
                     self.generation(),
                 ))?;
+                // A new protection should be checked sooner than the next scheduled interval.
+                self.verify_soon.store(true, Ordering::SeqCst);
                 self.publish();
                 Ok(())
             }
@@ -502,6 +537,140 @@ impl Engine {
         }
     }
 
+    /// Run the verification checks once, and act on what they say.
+    ///
+    /// A pass is the only way the state may call itself protected. A failure is an alarm, and it is
+    /// backed by applying the fail-closed baseline, so "blocked" is a fact rather than a claim. A
+    /// check that could not reach a conclusion downgrades a claim of protection but does not alarm.
+    pub fn verify_once(&self) -> VerificationReport {
+        let now = now_unix();
+        let state = self.lock_machine().state();
+
+        // Nothing is enforced while the machine is open, so a probe that reaches the outside world
+        // is not evidence of anything. Alarming here would block a machine that was never protected.
+        if !matches!(
+            state,
+            ProtectionState::Degraded | ProtectionState::Protected
+        ) {
+            let details = vec!["nothing is applied, so there is nothing to verify".to_string()];
+            {
+                let mut verification = self.lock_verification();
+                verification.checked_at = Some(now);
+                verification.verification = Verification::Unavailable;
+                verification.details = details.clone();
+            }
+            self.publish();
+            return VerificationReport {
+                outcome: Outcome::Inconclusive {
+                    reason: "nothing is applied".to_string(),
+                },
+                details,
+            };
+        }
+
+        let report = self.verification.run_once();
+
+        {
+            let mut state = self.lock_verification();
+            state.checked_at = Some(now);
+            state.details = report.details.clone();
+            state.verification = match &report.outcome {
+                Outcome::Passed => Verification::Fresh,
+                Outcome::Failed { .. } => Verification::Failed,
+                Outcome::Inconclusive { .. } => Verification::Unavailable,
+            };
+        }
+
+        match &report.outcome {
+            Outcome::Passed => {
+                if self.lock_machine().state() == ProtectionState::Degraded {
+                    let _ = self.set_state(
+                        ProtectionState::Protected,
+                        Cause::Verified,
+                        vec![Reason::new(
+                            "the policy has been verified: traffic left only through the protected \
+                             path",
+                        )],
+                    );
+                }
+            }
+            Outcome::Failed { reason } => {
+                self.add_note(format!("verification failed: {reason}"));
+                if let Err(error) = self.apply(ProfileId::FailClosed, &Params::default()) {
+                    self.add_note(format!(
+                        "the fail-closed baseline could not be applied after a failed \
+                         verification: {error}"
+                    ));
+                }
+                let _ = self.set_state(
+                    ProtectionState::Blocked,
+                    Cause::Automatic,
+                    vec![Reason::new(format!(
+                        "verification failed, so the fail-closed baseline was applied: {reason}"
+                    ))],
+                );
+                let _ = self.record_intent(Intent::requested(
+                    ProfileId::FailClosed,
+                    Params::default(),
+                    now,
+                    self.generation(),
+                ));
+            }
+            Outcome::Inconclusive { reason } => {
+                if self.lock_machine().state() == ProtectionState::Protected {
+                    let _ = self.set_state(
+                        ProtectionState::Degraded,
+                        Cause::Automatic,
+                        vec![Reason::new(format!(
+                            "protection is no longer verified: {reason}"
+                        ))],
+                    );
+                }
+            }
+        }
+
+        self.publish();
+        report
+    }
+
+    /// Stop calling a result fresh once it is older than the configured window.
+    ///
+    /// A policy that was verified an hour ago is not verified now, and saying so is the difference
+    /// between a check and a ritual.
+    pub fn expire_verification(&self) {
+        let Some(checked_at) = self.lock_verification().checked_at else {
+            return;
+        };
+        let window = self.config.verification.stale_after.as_secs() as i64;
+        if now_unix() - checked_at < window {
+            return;
+        }
+
+        {
+            let mut state = self.lock_verification();
+            if state.verification == Verification::Fresh {
+                state.verification = Verification::Stale;
+            }
+        }
+
+        if self.lock_machine().state() == ProtectionState::Protected {
+            let _ = self.set_state(
+                ProtectionState::Degraded,
+                Cause::Automatic,
+                vec![Reason::new(
+                    "verification is no longer recent enough to claim protection",
+                )],
+            );
+            self.publish();
+        }
+    }
+
+    fn lock_verification(&self) -> MutexGuard<'_, VerificationState> {
+        self.last_verification
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn lock_resolver_baseline(&self) -> MutexGuard<'_, Option<Baseline>> {
         self.resolver_baseline
             .lock()
@@ -733,7 +902,8 @@ fn profile_of(id: ProfileId) -> Option<Profile> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{MockHelper, MockRelay, MockServices};
+    use crate::testing::{MockHelper, MockRelay, MockServices, MockVerification};
+    use std::time::Duration;
 
     const USER_UID: u32 = 1000;
 
@@ -741,6 +911,8 @@ mod tests {
         helper: Arc<MockHelper>,
         services: Arc<MockServices>,
         relay: Arc<MockRelay>,
+        verification: Arc<MockVerification>,
+        verification_config: VerificationConfig,
     ) -> (Engine, PathBuf) {
         let directory = std::env::temp_dir().join(format!(
             "ghostnector-engine-{}-{:?}",
@@ -761,12 +933,14 @@ mod tests {
                 journal_path: directory.join("intent.json"),
                 resolver_state_path: directory.join("resolver.json"),
                 resolver_root: directory.clone(),
+                verification: verification_config,
                 ..EngineConfig::default()
             },
             helper as Arc<dyn HelperLink>,
             services as Arc<dyn Services>,
             relay as Arc<dyn DnsRelay>,
             Arc::new(crate::testing::MockRunner::new()) as Arc<dyn CommandRunner>,
+            verification as Arc<dyn VerificationRuns>,
         );
         (engine, directory)
     }
@@ -775,10 +949,13 @@ mod tests {
         let helper = Arc::new(MockHelper::new());
         let services = Arc::new(MockServices::new());
         let relay = Arc::new(MockRelay::new());
+        let verification = Arc::new(MockVerification::new());
         let (engine, directory) = engine_with(
             Arc::clone(&helper),
             Arc::clone(&services),
             Arc::clone(&relay),
+            Arc::clone(&verification),
+            VerificationConfig::default(),
         );
         (helper, engine, directory)
     }
@@ -787,10 +964,13 @@ mod tests {
         let helper = Arc::new(MockHelper::new());
         let services = Arc::new(MockServices::new());
         let relay = Arc::new(MockRelay::new());
+        let verification = Arc::new(MockVerification::new());
         let (engine, directory) = engine_with(
             Arc::clone(&helper),
             Arc::clone(&services),
             Arc::clone(&relay),
+            Arc::clone(&verification),
+            VerificationConfig::default(),
         );
         (helper, services, engine, directory)
     }
@@ -799,12 +979,36 @@ mod tests {
         let helper = Arc::new(MockHelper::new());
         let services = Arc::new(MockServices::new());
         let relay = Arc::new(MockRelay::new());
+        let verification = Arc::new(MockVerification::new());
         let (engine, directory) = engine_with(
             Arc::clone(&helper),
             Arc::clone(&services),
             Arc::clone(&relay),
+            Arc::clone(&verification),
+            VerificationConfig::default(),
         );
         (helper, relay, engine, directory)
+    }
+
+    fn engine_and_verification() -> (Arc<MockVerification>, Engine, PathBuf) {
+        engine_and_verification_with(VerificationConfig::default())
+    }
+
+    fn engine_and_verification_with(
+        verification_config: VerificationConfig,
+    ) -> (Arc<MockVerification>, Engine, PathBuf) {
+        let helper = Arc::new(MockHelper::new());
+        let services = Arc::new(MockServices::new());
+        let relay = Arc::new(MockRelay::new());
+        let verification = Arc::new(MockVerification::new());
+        let (engine, directory) = engine_with(
+            Arc::clone(&helper),
+            Arc::clone(&services),
+            Arc::clone(&relay),
+            Arc::clone(&verification),
+            verification_config,
+        );
+        (verification, engine, directory)
     }
 
     fn system_tor_profile() -> Profile {
@@ -845,7 +1049,11 @@ mod tests {
             .expect("connect");
         let snapshot = engine.snapshot();
         assert_eq!(snapshot.state, ProtectionState::Degraded);
-        assert_eq!(snapshot.health.verification, Verification::Unavailable);
+        assert_eq!(
+            snapshot.health.verification,
+            Verification::Unknown,
+            "before any check has run, the honest answer is that nothing is known"
+        );
         assert!(snapshot.health.policy_applied);
         assert!(snapshot
             .reasons
@@ -1008,6 +1216,8 @@ mod tests {
             Arc::clone(&helper),
             Arc::new(MockServices::new()),
             Arc::new(MockRelay::new()),
+            Arc::new(MockVerification::new()),
+            VerificationConfig::default(),
         );
         assert!(
             engine.reconcile().is_err(),
@@ -1294,6 +1504,126 @@ mod tests {
             std::fs::read_to_string(&resolv_conf).expect("read"),
             original,
             "the file must come back byte for byte"
+        );
+    }
+
+    #[test]
+    fn a_passing_verification_is_the_only_way_to_claim_protection() {
+        let (verification, engine, _dir) = engine_and_verification();
+        engine
+            .connect(system_tor_profile(), USER_UID)
+            .expect("connect");
+        assert_eq!(
+            engine.snapshot().state,
+            ProtectionState::Degraded,
+            "applying a policy is not evidence that it works"
+        );
+
+        verification.passing();
+        engine.verify_once();
+
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.state, ProtectionState::Protected);
+        assert_eq!(snapshot.health.verification, Verification::Fresh);
+        assert!(
+            snapshot.verified_ago_secs.is_some(),
+            "a claim of protection must come with an age"
+        );
+    }
+
+    #[test]
+    fn a_failed_verification_blocks_and_backs_the_alarm_with_a_policy() {
+        let (verification, engine, _dir) = engine_and_verification();
+        engine
+            .connect(system_tor_profile(), USER_UID)
+            .expect("connect");
+        verification.passing();
+        engine.verify_once();
+        assert_eq!(engine.snapshot().state, ProtectionState::Protected);
+
+        verification.failing("a UDP datagram reached 203.0.113.1");
+        let report = engine.verify_once();
+        assert!(matches!(report.outcome, Outcome::Failed { .. }));
+
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.state, ProtectionState::Blocked);
+        assert_eq!(snapshot.health.verification, Verification::Failed);
+        assert!(
+            snapshot
+                .reasons
+                .iter()
+                .any(|reason| reason.as_str().contains("verification failed")),
+            "{:?}",
+            snapshot.reasons
+        );
+        assert!(
+            Journal::new(engine.journal_path())
+                .load()
+                .expect("load")
+                .protected,
+            "an alarm must leave the machine protected, not open"
+        );
+    }
+
+    #[test]
+    fn verification_that_cannot_conclude_downgrades_without_alarming() {
+        let (verification, engine, _dir) = engine_and_verification();
+        engine
+            .connect(system_tor_profile(), USER_UID)
+            .expect("connect");
+        verification.passing();
+        engine.verify_once();
+        assert_eq!(engine.snapshot().state, ProtectionState::Protected);
+
+        verification.inconclusive();
+        engine.verify_once();
+
+        let snapshot = engine.snapshot();
+        assert_eq!(
+            snapshot.state,
+            ProtectionState::Degraded,
+            "a check that could not run is not a failure, but it is not a pass either"
+        );
+        assert_eq!(snapshot.health.verification, Verification::Unavailable);
+    }
+
+    #[test]
+    fn a_result_that_is_no_longer_recent_stops_counting_as_verified() {
+        let (verification, engine, _dir) = engine_and_verification_with(VerificationConfig {
+            stale_after: Duration::ZERO,
+            ..VerificationConfig::default()
+        });
+        engine
+            .connect(system_tor_profile(), USER_UID)
+            .expect("connect");
+        verification.passing();
+        engine.verify_once();
+        assert_eq!(engine.snapshot().state, ProtectionState::Protected);
+
+        engine.expire_verification();
+
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.state, ProtectionState::Degraded);
+        assert_eq!(snapshot.health.verification, Verification::Stale);
+        assert!(
+            snapshot
+                .reasons
+                .iter()
+                .any(|reason| reason.as_str().contains("no longer recent")),
+            "{:?}",
+            snapshot.reasons
+        );
+    }
+
+    #[test]
+    fn verification_does_not_protect_a_machine_that_is_off() {
+        let (verification, engine, _dir) = engine_and_verification();
+        verification.passing();
+        engine.verify_once();
+        assert_eq!(
+            engine.snapshot().state,
+            ProtectionState::Off,
+            "a passing check cannot conjure protection that was never applied"
         );
     }
 }

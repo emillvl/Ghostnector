@@ -425,6 +425,8 @@ mod tests {
             Arc::new(MockServices::new()) as Arc<dyn crate::services::Services>,
             Arc::new(crate::testing::MockRelay::new()) as Arc<dyn crate::chokepoint::DnsRelay>,
             Arc::new(crate::testing::MockRunner::new()) as Arc<dyn crate::resolver::CommandRunner>,
+            Arc::new(crate::testing::MockVerification::new())
+                as Arc<dyn crate::verify::Verification>,
         ));
         let server = Arc::new(Server::new(Arc::clone(&engine)));
         Fixture {
