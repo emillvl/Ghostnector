@@ -12,8 +12,9 @@ mod inner {
     use std::time::Duration;
 
     use ghostnector_core::{
-        bind_socket, Engine, EngineConfig, ExternalServices, Helper, Server, Services,
-        SystemdServices, SystemdUnits, TorControl, TorSettings, VERSION,
+        bind_socket, ChildRelay, CommandRunner, DnsRelay, Engine, EngineConfig, ExternalServices,
+        Helper, Server, Services, SystemCommands, SystemdServices, SystemdUnits, TorControl,
+        TorSettings, VERSION,
     };
 
     const DEFAULT_HELPER: &str = "/run/ghostnector/netd.sock";
@@ -27,17 +28,21 @@ mod inner {
     const DEFAULT_TOR_CONTROL_PORT: u16 = 9051;
     const DEFAULT_TOR_DNS_PORT: u16 = 9053;
     const DEFAULT_TOR_BUDGET_SECONDS: u64 = 120;
+    const DEFAULT_DNS_HELPER: &str = "/usr/libexec/ghostnector-dns";
+    const DEFAULT_RESOLVER_STATE: &str = "/var/lib/ghostnector/resolver.json";
+    const DEFAULT_RESOLVE_CONF_ROOT: &str = "/";
+    const DEFAULT_RESOLVECTL: &str = "/usr/bin/resolvectl";
+    const DEFAULT_RESOLVER_PORT: u16 = 5353;
 
     const USAGE: &str = "\
 ghostnector-core - the control plane (no privileges)
 
 USAGE:
-    ghostnector-core --socket <PATH> [OPTIONS]
-
-REQUIRED:
-    --socket <PATH>     unix socket for clients (parent directory must exist)
+    ghostnector-core [OPTIONS]
 
 OPTIONS:
+    --socket <PATH>     unix socket for clients
+                                          [default: /run/ghostnector/core.sock]
     --helper <PATH>     the privileged helper's socket
                                               [default: /run/ghostnector/netd.sock]
     --journal <PATH>    where the user's intent is recorded
@@ -60,6 +65,21 @@ OPTIONS:
     --tor-dns-port <PORT>       Tor's DNS listener, which the DNS chokepoint
                                 forwards to                      [default: 9053]
     --tor-bootstrap-seconds <SECONDS>   how long to wait for Tor [default: 120]
+
+  DNS:
+    --dns-helper <PATH>     the DNS relay that every query passes through
+                                        [default: /usr/libexec/ghostnector-dns]
+    --resolver-state <PATH>  where the resolver's original configuration is recorded
+                                    [default: /var/lib/ghostnector/resolver.json]
+    --tor-dns-port <PORT>   Tor's DNS listener, which the relay forwards to
+                                                              [default: 9053]
+    --resolver-port <PORT>  the encrypted resolver's listener, used in DNS-only
+                            mode                                  [default: 5353]
+    --resolv-conf-root <PATH>  filesystem root used to find and change the
+                               resolver configuration; for containers, not for
+                               hiding                        [default: /]
+    --resolvectl <PATH>     the tool used to configure systemd-resolved
+                                                      [default: /usr/bin/resolvectl]
 
     -h, --help          print this text
     -V, --version       print the version";
@@ -84,6 +104,11 @@ OPTIONS:
         tor_control_port: u16,
         tor_dns_port: u16,
         tor_budget: Duration,
+        dns_helper: PathBuf,
+        resolver_state: PathBuf,
+        resolver_port: u16,
+        resolver_root: PathBuf,
+        resolvectl: PathBuf,
     }
 
     pub fn main() -> ExitCode {
@@ -126,12 +151,23 @@ OPTIONS:
 
         let helper = Helper::new(config.helper.clone());
         let services = build_services(&config)?;
+        let relay: Arc<dyn DnsRelay> = Arc::new(
+            ChildRelay::new(config.dns_helper.clone()).map_err(|error| error.to_string())?,
+        );
+        let commands: Arc<dyn CommandRunner> = Arc::new(SystemCommands);
         let engine = Arc::new(Engine::new(
             EngineConfig {
                 journal_path: config.journal.clone(),
+                resolver_state_path: config.resolver_state.clone(),
+                tor_dns_port: config.tor_dns_port,
+                resolver_port: config.resolver_port,
+                resolver_root: config.resolver_root.clone(),
+                resolvectl: config.resolvectl.clone(),
             },
             Arc::new(helper),
             services,
+            relay,
+            commands,
         ));
 
         // Reconcile before serving: the kernel's answer, not ours, decides what is enforced.
@@ -188,7 +224,7 @@ OPTIONS:
     where
         I: Iterator<Item = String>,
     {
-        let mut socket: Option<PathBuf> = None;
+        let mut socket = PathBuf::from(DEFAULT_SOCKET);
         let mut helper = PathBuf::from(DEFAULT_HELPER);
         let mut journal = PathBuf::from(DEFAULT_JOURNAL);
         let mut group: Option<String> = None;
@@ -201,6 +237,11 @@ OPTIONS:
         let mut tor_control_port = DEFAULT_TOR_CONTROL_PORT;
         let mut tor_dns_port = DEFAULT_TOR_DNS_PORT;
         let mut tor_budget = Duration::from_secs(DEFAULT_TOR_BUDGET_SECONDS);
+        let mut dns_helper = PathBuf::from(DEFAULT_DNS_HELPER);
+        let mut resolver_state = PathBuf::from(DEFAULT_RESOLVER_STATE);
+        let mut resolver_port = DEFAULT_RESOLVER_PORT;
+        let mut resolver_root = PathBuf::from(DEFAULT_RESOLVE_CONF_ROOT);
+        let mut resolvectl = PathBuf::from(DEFAULT_RESOLVECTL);
 
         let mut arguments = arguments.peekable();
         while let Some(option) = arguments.next() {
@@ -210,7 +251,7 @@ OPTIONS:
                     .ok_or_else(|| format!("option '{option}' needs a value"))
             };
             match option.as_str() {
-                "--socket" => socket = Some(absolute(&option, value()?)?),
+                "--socket" => socket = absolute(&option, value()?)?,
                 "--helper" => helper = absolute(&option, value()?)?,
                 "--journal" => journal = absolute(&option, value()?)?,
                 "--systemctl" => systemctl = absolute(&option, value()?)?,
@@ -252,6 +293,11 @@ OPTIONS:
                 }
                 "--tor-control-port" => tor_control_port = port(&option, &value()?)?,
                 "--tor-dns-port" => tor_dns_port = port(&option, &value()?)?,
+                "--resolver-port" => resolver_port = port(&option, &value()?)?,
+                "--dns-helper" => dns_helper = absolute(&option, value()?)?,
+                "--resolver-state" => resolver_state = absolute(&option, value()?)?,
+                "--resolv-conf-root" => resolver_root = absolute(&option, value()?)?,
+                "--resolvectl" => resolvectl = absolute(&option, value()?)?,
                 "--tor-bootstrap-seconds" => {
                     let raw = value()?;
                     let seconds: u64 = raw.parse().map_err(|_| {
@@ -269,7 +315,7 @@ OPTIONS:
         }
 
         Ok(Config {
-            socket: socket.ok_or_else(|| format!("option '--socket' is required\n\n{USAGE}"))?,
+            socket,
             helper,
             journal,
             group,
@@ -282,6 +328,11 @@ OPTIONS:
             tor_control_port,
             tor_dns_port,
             tor_budget,
+            dns_helper,
+            resolver_state,
+            resolver_port,
+            resolver_root,
+            resolvectl,
         })
     }
 

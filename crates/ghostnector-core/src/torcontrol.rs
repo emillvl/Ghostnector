@@ -157,20 +157,16 @@ impl TorControl {
     /// Poll until Tor is ready, Tor fails, or the budget runs out.
     pub fn wait_until_ready(&self, budget: Duration) -> Result<Bootstrap, TorControlError> {
         let deadline = Instant::now() + budget;
-        let mut last = Bootstrap::NotStarted;
-        let mut last_error: Option<String> = None;
 
         loop {
-            match self.bootstrap() {
+            // Every arm either answers the question or explains why nothing is listening yet, so
+            // there is no state to carry between attempts.
+            let note = match self.bootstrap() {
                 Ok(Bootstrap::Done) => return Ok(Bootstrap::Done),
                 Ok(Bootstrap::Failed { summary }) => {
                     return Err(TorControlError::BootstrapFailed(summary))
                 }
-                Ok(other) => {
-                    last = other;
-                    last_error = None;
-                }
-                // Anything else is Tor telling us something we should not ignore.
+                Ok(other) => other.describe(),
                 Err(error) => {
                     let reason = error.to_string();
                     let merely_not_ready = matches!(
@@ -182,17 +178,16 @@ impl TorControl {
                     if !merely_not_ready {
                         return Err(error);
                     }
-                    last_error = Some(reason);
+                    // An operator needs to know *why* Tor never came up, and "not ready" is not a
+                    // why.
+                    format!("no answer from Tor's control port: {reason}")
                 }
-            }
+            };
 
             if Instant::now() >= deadline {
                 return Err(TorControlError::Timeout {
                     after_secs: budget.as_secs(),
-                    last: match &last_error {
-                        Some(reason) => format!("{} ({reason})", last.describe()),
-                        None => last.describe(),
-                    },
+                    last: note,
                 });
             }
             std::thread::sleep(POLL_INTERVAL);

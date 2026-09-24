@@ -122,16 +122,6 @@ impl Server {
         self.serve_stream_with(&mut reader, &mut writer, peer, &alive)
     }
 
-    /// Serve a connection that is assumed to stay open.
-    fn serve_stream<R: BufRead, W: Write>(
-        &self,
-        reader: &mut R,
-        writer: &mut W,
-        peer: u32,
-    ) -> Result<(), ServerError> {
-        self.serve_stream_with(reader, writer, peer, &|| true)
-    }
-
     /// Read requests and write frames. Separated from the socket so it can be tested from buffers.
     ///
     /// `alive` is consulted while streaming, so a client that disappears without closing cleanly
@@ -297,6 +287,7 @@ fn error_body(error: &EngineError) -> ErrorBody {
         EngineError::Helper(_) | EngineError::NotApplied | EngineError::Services(_) => {
             ErrorCode::BackendFailure
         }
+        EngineError::Dns(_) => ErrorCode::BackendFailure,
         EngineError::Transition(_) => ErrorCode::UnsafeState,
         EngineError::Protocol(_) | EngineError::Journal(_) => ErrorCode::Internal,
     };
@@ -428,9 +419,12 @@ mod tests {
         let engine = Arc::new(Engine::new(
             EngineConfig {
                 journal_path: directory.join("intent.json"),
+                ..EngineConfig::default()
             },
             Arc::clone(&helper) as Arc<dyn crate::helper::HelperLink>,
             Arc::new(MockServices::new()) as Arc<dyn crate::services::Services>,
+            Arc::new(crate::testing::MockRelay::new()) as Arc<dyn crate::chokepoint::DnsRelay>,
+            Arc::new(crate::testing::MockRunner::new()) as Arc<dyn crate::resolver::CommandRunner>,
         ));
         let server = Arc::new(Server::new(Arc::clone(&engine)));
         Fixture {
@@ -445,7 +439,7 @@ mod tests {
         let mut reader = std::io::BufReader::new(requests.as_bytes());
         let mut out = Vec::new();
         server
-            .serve_stream(&mut reader, &mut out, 1000)
+            .serve_stream_with(&mut reader, &mut out, 1000, &|| true)
             .expect("serve_stream");
         String::from_utf8(out).expect("utf8")
     }

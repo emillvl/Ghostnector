@@ -17,6 +17,7 @@
 //! * **It reports what it does not know.** Until the verifier exists, a successfully applied policy
 //!   is reported as `Degraded` with verification `Unavailable` — never as `Protected`.
 
+pub mod chokepoint;
 pub mod engine;
 pub mod fsutil;
 pub mod helper;
@@ -33,12 +34,13 @@ pub mod torrc;
 #[cfg(test)]
 pub mod testing;
 
+pub use chokepoint::{ChildRelay, ChokepointError, DnsRelay};
 pub use engine::{Engine, EngineConfig, EngineError};
 pub use helper::{Helper, HelperError, HelperLink};
 pub use journal::{Intent, Journal, JournalError};
 pub use resolver::{
-    Baseline, CommandError, CommandRunner, Environment, Layout, Resolver, ResolverError,
-    RestoreOutcome, SystemCommands,
+    Baseline, BaselineStore, CommandError, CommandRunner, Environment, Layout, Resolver,
+    ResolverError, RestoreOutcome, SystemCommands,
 };
 pub use server::{bind_socket, Server, ServerError};
 pub use services::{ExternalServices, ServiceError, Services, SystemdServices};

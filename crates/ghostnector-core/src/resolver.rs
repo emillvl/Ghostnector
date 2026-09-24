@@ -382,6 +382,65 @@ fn render(original: &str, chokepoint: IpAddr) -> String {
     out
 }
 
+/// Where the recorded resolver state lives between runs.
+///
+/// It is on disk rather than in memory because the state outlives any single run of the control
+/// plane: a machine that was pointed at the chokepoint and then rebooted must still be able to find
+/// out whose configuration it is holding.
+pub struct BaselineStore {
+    path: PathBuf,
+}
+
+impl BaselineStore {
+    /// A store at this path.
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// The recorded state, if any.
+    pub fn load(&self) -> Result<Option<Baseline>, ResolverError> {
+        match std::fs::read_to_string(&self.path) {
+            Ok(text) => {
+                serde_json::from_str(&text)
+                    .map(Some)
+                    .map_err(|error| ResolverError::File {
+                        path: self.path.clone(),
+                        reason: error.to_string(),
+                    })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(ResolverError::File {
+                path: self.path.clone(),
+                reason: error.to_string(),
+            }),
+        }
+    }
+
+    /// Record the state.
+    pub fn save(&self, baseline: &Baseline) -> Result<(), ResolverError> {
+        let encoded = serde_json::to_vec_pretty(baseline).map_err(|error| ResolverError::File {
+            path: self.path.clone(),
+            reason: error.to_string(),
+        })?;
+        write_atomic(&self.path, &encoded).map_err(|error| ResolverError::File {
+            path: self.path.clone(),
+            reason: error.to_string(),
+        })
+    }
+
+    /// Forget the state, once it has been put back.
+    pub fn clear(&self) -> Result<(), ResolverError> {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(ResolverError::File {
+                path: self.path.clone(),
+                reason: error.to_string(),
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,7 +620,7 @@ mod tests {
     #[test]
     fn a_file_that_did_not_exist_is_removed_again() {
         let fixture = Fixture::new();
-        let mut baseline = fixture.resolver.capture().expect("capture");
+        let baseline = fixture.resolver.capture().expect("capture");
         assert_eq!(baseline.environment, Environment::Unknown);
 
         // With a plain file present but empty, capture records "exists and is empty".
@@ -681,5 +740,36 @@ mod tests {
             fixture.resolver.restore(&baseline).expect("restore"),
             RestoreOutcome::NothingToDo
         );
+    }
+
+    #[test]
+    fn the_recorded_state_survives_a_round_trip_through_disk() {
+        let fixture = Fixture::new();
+        let store = BaselineStore::new(fixture.root.join("state/resolver.json"));
+        assert_eq!(store.load().expect("empty"), None);
+
+        fixture.write_resolv_conf("nameserver 192.0.2.53\nsearch example.test\n");
+        let mut baseline = fixture.resolver.capture().expect("capture");
+        fixture
+            .resolver
+            .point_at(&mut baseline, CHOKEPOINT)
+            .expect("point");
+        store.save(&baseline).expect("save");
+
+        assert_eq!(store.load().expect("load"), Some(baseline.clone()));
+
+        store.clear().expect("clear");
+        assert_eq!(store.load().expect("cleared"), None);
+        // Clearing twice is not an error: the second call has nothing to do.
+        store.clear().expect("clear again");
+    }
+
+    #[test]
+    fn a_corrupt_store_is_an_error_rather_than_a_default() {
+        let fixture = Fixture::new();
+        let store = BaselineStore::new(fixture.root.join("state/resolver.json"));
+        std::fs::create_dir_all(fixture.root.join("state")).expect("state dir");
+        std::fs::write(fixture.root.join("state/resolver.json"), b"{ not json").expect("write");
+        assert!(store.load().is_err());
     }
 }

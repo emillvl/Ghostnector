@@ -207,6 +207,58 @@ impl Services for MockServices {
     }
 }
 
+/// A DNS relay that records what it was asked to do.
+#[derive(Debug, Default)]
+pub struct MockRelay {
+    started: Mutex<Vec<String>>,
+    running: Mutex<bool>,
+    fail_start: Mutex<Option<String>>,
+}
+
+impl MockRelay {
+    /// A relay that starts and stops successfully.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Every `start`, as `"listen -> upstream"`, in order.
+    pub fn started(&self) -> Vec<String> {
+        self.started.lock().expect("mock lock").clone()
+    }
+
+    /// Fail the next start with this message.
+    pub fn fail_start_with(&self, message: &str) {
+        *self.fail_start.lock().expect("mock lock") = Some(message.to_string());
+    }
+}
+
+impl crate::chokepoint::DnsRelay for MockRelay {
+    fn start(
+        &self,
+        listen: std::net::SocketAddr,
+        upstream: std::net::SocketAddr,
+    ) -> Result<(), crate::chokepoint::ChokepointError> {
+        if let Some(message) = self.fail_start.lock().expect("mock lock").clone() {
+            return Err(crate::chokepoint::ChokepointError::Start(message));
+        }
+        self.started
+            .lock()
+            .expect("mock lock")
+            .push(format!("{listen} -> {upstream}"));
+        *self.running.lock().expect("mock lock") = true;
+        Ok(())
+    }
+
+    fn stop(&self) -> Result<(), crate::chokepoint::ChokepointError> {
+        *self.running.lock().expect("mock lock") = false;
+        Ok(())
+    }
+
+    fn is_running(&self) -> bool {
+        *self.running.lock().expect("mock lock")
+    }
+}
+
 /// A command runner that records what it was asked to do.
 #[derive(Debug, Default)]
 pub struct MockRunner {

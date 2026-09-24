@@ -13,6 +13,7 @@
 //! * **It never claims more than it knows.** A successfully applied policy becomes `Degraded` with
 //!   verification `Unavailable`, not `Protected`, until something has actually verified it.
 
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -23,26 +24,46 @@ use ghostnector_spec::{
     ValidProfile, Verification,
 };
 
+use crate::chokepoint::DnsRelay;
 use crate::helper::{HelperError, HelperLink};
 use crate::journal::{Intent, Journal, JournalError};
 use crate::now_unix;
+use crate::resolver::{Baseline, BaselineStore, CommandRunner, Layout, Resolver, RestoreOutcome};
 use crate::services::{ServiceError, Services};
 use crate::state::{Cause, Machine, TransitionError};
 
 /// Where the intent file lives on a real system.
 pub const DEFAULT_JOURNAL: &str = "/var/lib/ghostnector/intent.json";
 
+/// Where the resolver's original configuration is recorded.
+pub const DEFAULT_RESOLVER_STATE: &str = "/var/lib/ghostnector/resolver.json";
+
 /// What the engine needs to know about its environment.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     /// Where to record what the user asked for.
     pub journal_path: PathBuf,
+    /// Where to record what the resolver looked like before it was pointed at the chokepoint.
+    pub resolver_state_path: PathBuf,
+    /// Where Tor's DNS listener can be reached, which the chokepoint forwards to in Tor modes.
+    pub tor_dns_port: u16,
+    /// Where the encrypted resolver listens, which the chokepoint forwards to in DNS-only mode.
+    pub resolver_port: u16,
+    /// The filesystem root for resolver management, so a container or a test can point elsewhere.
+    pub resolver_root: PathBuf,
+    /// Where `resolvectl` lives.
+    pub resolvectl: PathBuf,
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             journal_path: PathBuf::from(DEFAULT_JOURNAL),
+            resolver_state_path: PathBuf::from(DEFAULT_RESOLVER_STATE),
+            tor_dns_port: 9053,
+            resolver_port: 5353,
+            resolver_root: PathBuf::from("/"),
+            resolvectl: PathBuf::from("/usr/bin/resolvectl"),
         }
     }
 }
@@ -74,6 +95,9 @@ pub enum EngineError {
     /// A service the profile needs could not be brought up.
     #[error("{0}")]
     Services(#[from] ServiceError),
+    /// The DNS relay could not be started.
+    #[error("{0}")]
+    Dns(#[from] crate::chokepoint::ChokepointError),
 }
 
 /// The control plane.
@@ -81,6 +105,11 @@ pub struct Engine {
     machine: Mutex<Machine>,
     helper: Arc<dyn HelperLink>,
     services: Arc<dyn Services>,
+    relay: Arc<dyn DnsRelay>,
+    resolver: Resolver,
+    resolver_store: BaselineStore,
+    resolver_baseline: Mutex<Option<Baseline>>,
+    config: EngineConfig,
     journal: Journal,
     last_report: Mutex<Report>,
     requested: Mutex<Option<Profile>>,
@@ -89,17 +118,33 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Build an engine around a helper link.
+    /// Build an engine around a helper link, a service supervisor, a DNS relay, and a resolver.
     pub fn new(
         config: EngineConfig,
         helper: Arc<dyn HelperLink>,
         services: Arc<dyn Services>,
+        relay: Arc<dyn DnsRelay>,
+        commands: Arc<dyn CommandRunner>,
     ) -> Self {
+        let journal = Journal::new(config.journal_path.clone());
+        let resolver = Resolver::new(
+            Layout {
+                root: config.resolver_root.clone(),
+                resolvectl: config.resolvectl.clone(),
+            },
+            commands,
+        );
+        let resolver_store = BaselineStore::new(config.resolver_state_path.clone());
         Self {
             machine: Mutex::new(Machine::new()),
             helper,
             services,
-            journal: Journal::new(config.journal_path),
+            relay,
+            resolver,
+            resolver_store,
+            resolver_baseline: Mutex::new(None),
+            config,
+            journal,
             last_report: Mutex::new(Report::default()),
             requested: Mutex::new(None),
             notes: Mutex::new(Vec::new()),
@@ -204,7 +249,10 @@ impl Engine {
 
     /// Return to the captured baseline, because the user asked for it.
     pub fn disconnect(&self) -> Result<(), EngineError> {
-        // Stop what we started first. With the policy gone the service would have no exemption and
+        // Give the resolver back first, then stop the relay, the services, and the policy.
+        self.stand_down_dns();
+
+        // Stop what we started. With the policy gone the service would have no exemption and
         // would be blocked anyway, which looks like a failure rather than a shutdown.
         let profile = self.lock_report().profile;
         if let Some(profile) = profile {
@@ -259,6 +307,14 @@ impl Engine {
         let profile = report.profile;
         self.remember_report(report);
 
+        // Whatever the resolver looked like before protection started, if anything was recorded.
+        match self.resolver_store.load() {
+            Ok(baseline) => *self.lock_resolver_baseline() = baseline,
+            Err(error) => self.add_note(format!(
+                "the resolver's recorded state could not be read: {error}"
+            )),
+        }
+
         let (next, reasons) = if applied {
             match profile {
                 Some(ProfileId::FailClosed) => (
@@ -306,6 +362,11 @@ impl Engine {
                 vec![Reason::new("no policy is applied")],
             )
         };
+
+        if !applied {
+            // Nothing is enforced, so nothing should be holding the resolver's configuration.
+            self.stand_down_dns();
+        }
 
         // A refusal here means the machine was already protected and is not willing to leave that
         // state on its own. That is the correct outcome; record it rather than fighting it.
@@ -355,12 +416,96 @@ impl Engine {
         let ports = self.helper_ports()?;
         self.services.bring_up(target, ports)?;
 
-        self.apply(target, params)
+        let report = self.apply(target, params)?;
+
+        // DNS last: the policy is already redirecting port 53 at this point, so a relay started any
+        // earlier would have been serving queries under the previous rules.
+        self.bring_up_dns(target, ports)?;
+        Ok(report)
     }
 
     /// Ask the helper which ports its policy redirects into.
     fn helper_ports(&self) -> Result<Ports, EngineError> {
         Ok(report_from(self.helper.invoke(Verb::Report)?)?.ports)
+    }
+
+    /// Start the DNS chokepoint on the port the policy redirects into, and point the machine's own
+    /// resolver at it.
+    ///
+    /// The relay failing is a failed connect: a Tor mode that cannot resolve names is not a
+    /// protection worth claiming. The resolver, by contrast, is best effort — the firewall sends
+    /// every query at port 53 into the chokepoint whatever the file says, so a machine whose
+    /// resolver configuration could not be changed is still not leaking.
+    fn bring_up_dns(&self, profile: ProfileId, ports: Ports) -> Result<(), EngineError> {
+        let listen = SocketAddr::from((Ipv4Addr::LOCALHOST, ports.chokepoint));
+        let upstream = self.dns_upstream(profile);
+        self.relay.start(listen, upstream)?;
+
+        let mut baseline = match self.resolver.capture() {
+            Ok(baseline) => baseline,
+            Err(error) => {
+                self.add_note(format!(
+                    "the resolver configuration could not be read: {error}"
+                ));
+                return Ok(());
+            }
+        };
+
+        match self.resolver.point_at(&mut baseline, listen.ip()) {
+            Ok(()) => {
+                if let Err(error) = self.resolver_store.save(&baseline) {
+                    self.add_note(format!(
+                        "the resolver's original configuration could not be recorded: {error}"
+                    ));
+                }
+                *self.lock_resolver_baseline() = Some(baseline);
+            }
+            Err(error) => {
+                // Not a failure: the firewall is what stops leaks, and it is already in place.
+                self.add_note(format!(
+                    "the system's own resolver was not repointed at the chokepoint: {error}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Where the chokepoint should send queries for this profile.
+    fn dns_upstream(&self, profile: ProfileId) -> SocketAddr {
+        let port = match profile {
+            ProfileId::DnsLockdown => self.config.resolver_port,
+            // Tor modes, and the fail-closed baseline if it ever gets here.
+            _ => self.config.tor_dns_port,
+        };
+        SocketAddr::from((Ipv4Addr::LOCALHOST, port))
+    }
+
+    /// Put the resolver back and stop the relay.
+    fn stand_down_dns(&self) {
+        let baseline = self.lock_resolver_baseline().take();
+        if let Some(baseline) = baseline {
+            match self.resolver.restore(&baseline) {
+                Ok(RestoreOutcome::Restored | RestoreOutcome::NothingToDo) => {
+                    let _ = self.resolver_store.clear();
+                }
+                Ok(RestoreOutcome::LeftAlone(reason)) => {
+                    self.add_note(format!("the resolver configuration was {reason}"));
+                    let _ = self.resolver_store.clear();
+                }
+                Err(error) => self.add_note(format!(
+                    "the resolver configuration could not be restored: {error}"
+                )),
+            }
+        }
+        if let Err(error) = self.relay.stop() {
+            self.add_note(format!("the DNS relay did not stop cleanly: {error}"));
+        }
+    }
+
+    fn lock_resolver_baseline(&self) -> MutexGuard<'_, Option<Baseline>> {
+        self.resolver_baseline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn apply(&self, profile: ProfileId, params: &Params) -> Result<Report, EngineError> {
@@ -383,7 +528,9 @@ impl Engine {
     /// still denied, not that it is open.
     fn roll_back_failed_connect(&self, target: ProfileId, error: &EngineError) {
         // Whatever was started for an attempt that failed should not be left running for a
-        // protection that never happened.
+        // protection that never happened. The DNS relay and the resolver come first, because they
+        // are what the machine's own lookups depend on.
+        self.stand_down_dns();
         if let Err(stop_error) = self.services.stand_down(target) {
             self.add_note(format!(
                 "stopping the services did not finish cleanly: {stop_error}"
@@ -586,21 +733,40 @@ fn profile_of(id: ProfileId) -> Option<Profile> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{MockHelper, MockServices};
+    use crate::testing::{MockHelper, MockRelay, MockServices};
 
     const USER_UID: u32 = 1000;
 
-    fn engine_with(helper: Arc<MockHelper>, services: Arc<MockServices>) -> (Engine, PathBuf) {
+    fn engine_with(
+        helper: Arc<MockHelper>,
+        services: Arc<MockServices>,
+        relay: Arc<MockRelay>,
+    ) -> (Engine, PathBuf) {
         let directory = std::env::temp_dir().join(format!(
             "ghostnector-engine-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
-        let path = directory.join("intent.json");
+        let _ = std::fs::remove_dir_all(&directory);
+
+        // The resolver works on a temporary root, so a test never touches the machine's own
+        // configuration. It is a real file with real contents, so the code path is real too.
+        let etc = directory.join("etc");
+        std::fs::create_dir_all(&etc).expect("temp etc");
+        std::fs::write(etc.join("resolv.conf"), b"nameserver 192.0.2.53\n")
+            .expect("temp resolv.conf");
+
         let engine = Engine::new(
-            EngineConfig { journal_path: path },
+            EngineConfig {
+                journal_path: directory.join("intent.json"),
+                resolver_state_path: directory.join("resolver.json"),
+                resolver_root: directory.clone(),
+                ..EngineConfig::default()
+            },
             helper as Arc<dyn HelperLink>,
             services as Arc<dyn Services>,
+            relay as Arc<dyn DnsRelay>,
+            Arc::new(crate::testing::MockRunner::new()) as Arc<dyn CommandRunner>,
         );
         (engine, directory)
     }
@@ -608,15 +774,37 @@ mod tests {
     fn engine() -> (Arc<MockHelper>, Engine, PathBuf) {
         let helper = Arc::new(MockHelper::new());
         let services = Arc::new(MockServices::new());
-        let (engine, directory) = engine_with(Arc::clone(&helper), Arc::clone(&services));
+        let relay = Arc::new(MockRelay::new());
+        let (engine, directory) = engine_with(
+            Arc::clone(&helper),
+            Arc::clone(&services),
+            Arc::clone(&relay),
+        );
         (helper, engine, directory)
     }
 
     fn engine_and_services() -> (Arc<MockHelper>, Arc<MockServices>, Engine, PathBuf) {
         let helper = Arc::new(MockHelper::new());
         let services = Arc::new(MockServices::new());
-        let (engine, directory) = engine_with(Arc::clone(&helper), Arc::clone(&services));
+        let relay = Arc::new(MockRelay::new());
+        let (engine, directory) = engine_with(
+            Arc::clone(&helper),
+            Arc::clone(&services),
+            Arc::clone(&relay),
+        );
         (helper, services, engine, directory)
+    }
+
+    fn engine_and_relay() -> (Arc<MockHelper>, Arc<MockRelay>, Engine, PathBuf) {
+        let helper = Arc::new(MockHelper::new());
+        let services = Arc::new(MockServices::new());
+        let relay = Arc::new(MockRelay::new());
+        let (engine, directory) = engine_with(
+            Arc::clone(&helper),
+            Arc::clone(&services),
+            Arc::clone(&relay),
+        );
+        (helper, relay, engine, directory)
     }
 
     fn system_tor_profile() -> Profile {
@@ -816,7 +1004,11 @@ mod tests {
     #[test]
     fn a_restart_when_the_helper_is_unreachable_does_not_invent_a_state() {
         let helper = Arc::new(MockHelper::unreachable());
-        let (engine, _dir) = engine_with(Arc::clone(&helper), Arc::new(MockServices::new()));
+        let (engine, _dir) = engine_with(
+            Arc::clone(&helper),
+            Arc::new(MockServices::new()),
+            Arc::new(MockRelay::new()),
+        );
         assert!(
             engine.reconcile().is_err(),
             "an unreachable helper is an error"
@@ -1011,5 +1203,97 @@ mod tests {
         engine.disconnect().expect("disconnect");
         assert_eq!(services.stood_down(), vec![ProfileId::TorSystem]);
         assert_eq!(engine.snapshot().state, ProtectionState::Off);
+    }
+
+    #[test]
+    fn connecting_starts_the_relay_on_the_port_the_policy_redirects_into() {
+        let (_helper, relay, engine, _dir) = engine_and_relay();
+        engine
+            .connect(system_tor_profile(), USER_UID)
+            .expect("connect");
+        assert_eq!(
+            relay.started(),
+            vec!["127.0.0.1:9054 -> 127.0.0.1:9053".to_string()],
+            "the relay listens where the policy sends DNS and forwards to Tor's own DNS port"
+        );
+        assert!(relay.is_running());
+    }
+
+    #[test]
+    fn dns_only_mode_points_the_relay_at_the_resolver_rather_than_at_tor() {
+        let (_helper, relay, engine, _dir) = engine_and_relay();
+        engine
+            .connect(
+                Profile {
+                    scope: Scope::Dns,
+                    ..Profile::default()
+                },
+                USER_UID,
+            )
+            .expect("connect");
+        assert_eq!(
+            relay.started(),
+            vec!["127.0.0.1:9054 -> 127.0.0.1:5353".to_string()],
+            "DNS-only mode has no Tor to forward to"
+        );
+    }
+
+    #[test]
+    fn disconnecting_stops_the_relay() {
+        let (_helper, relay, engine, _dir) = engine_and_relay();
+        engine
+            .connect(system_tor_profile(), USER_UID)
+            .expect("connect");
+        assert!(relay.is_running());
+        engine.disconnect().expect("disconnect");
+        assert!(!relay.is_running());
+    }
+
+    #[test]
+    fn a_relay_that_will_not_start_fails_the_connect_rather_than_claiming_protection() {
+        let (helper, relay, engine, _dir) = engine_and_relay();
+        relay.fail_start_with("port 53 is already in use");
+
+        let error = engine
+            .connect(system_tor_profile(), USER_UID)
+            .expect_err("connect must fail");
+        assert!(error.to_string().contains("already in use"), "{error}");
+        assert_eq!(engine.snapshot().state, ProtectionState::Off);
+        assert!(
+            !Journal::new(engine.journal_path())
+                .load()
+                .expect("load")
+                .protected
+        );
+        assert!(
+            helper
+                .verbs()
+                .iter()
+                .any(|verb| matches!(verb, Verb::Revert)),
+            "the baseline applied on the way in must be withdrawn"
+        );
+    }
+
+    #[test]
+    fn the_systems_own_resolver_is_pointed_at_the_chokepoint_and_put_back() {
+        let (_helper, _relay, engine, directory) = engine_and_relay();
+        let resolv_conf = directory.join("etc/resolv.conf");
+        let original = std::fs::read_to_string(&resolv_conf).expect("read");
+
+        engine
+            .connect(system_tor_profile(), USER_UID)
+            .expect("connect");
+        let pointed = std::fs::read_to_string(&resolv_conf).expect("read");
+        assert!(
+            pointed.contains("nameserver 127.0.0.1"),
+            "the machine's own lookups should go through the chokepoint: {pointed}"
+        );
+
+        engine.disconnect().expect("disconnect");
+        assert_eq!(
+            std::fs::read_to_string(&resolv_conf).expect("read"),
+            original,
+            "the file must come back byte for byte"
+        );
     }
 }

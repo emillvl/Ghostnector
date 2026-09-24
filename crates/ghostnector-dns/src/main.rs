@@ -21,6 +21,8 @@ REQUIRED:
 
 OPTIONS:
     --timeout-seconds <SECONDS>  how long to wait for an answer [default: 10]
+    --exit-when-stdin-closes     stop when standard input reaches end of file, so a
+                                 supervisor that dies does not leave this relay behind
     -h, --help                   print this text
     -V, --version                print the version
 
@@ -56,6 +58,7 @@ fn run() -> Result<(), String> {
     let mut listen: Option<SocketAddr> = None;
     let mut upstream: Option<SocketAddr> = None;
     let mut timeout = Duration::from_secs(DEFAULT_TIMEOUT_SECONDS);
+    let mut exit_when_stdin_closes = false;
 
     while let Some(option) = arguments.next() {
         let mut value = || {
@@ -66,6 +69,7 @@ fn run() -> Result<(), String> {
         match option.as_str() {
             "--listen" => listen = Some(address(&option, &value()?)?),
             "--upstream" => upstream = Some(address(&option, &value()?)?),
+            "--exit-when-stdin-closes" => exit_when_stdin_closes = true,
             "--timeout-seconds" => {
                 let raw = value()?;
                 let seconds: u64 = raw.parse().map_err(|_| {
@@ -95,6 +99,22 @@ fn run() -> Result<(), String> {
 
     let relay = Chokepoint::new(listen, upstream, timeout);
     eprintln!("ghostnector-dns {VERSION} relaying {listen} to {upstream}");
+
+    if exit_when_stdin_closes {
+        // A tether to the supervisor: when it goes away, its end of the pipe closes and this relay
+        // stops rather than lingering with the port bound.
+        std::thread::spawn(|| {
+            use std::io::Read;
+            let mut byte = [0u8; 1];
+            loop {
+                match std::io::stdin().read(&mut byte) {
+                    Ok(0) | Err(_) => std::process::exit(0),
+                    Ok(_) => continue, // the pipe carries nothing; only its closure matters
+                }
+            }
+        });
+    }
+
     relay.run().map_err(|error| error.to_string())
 }
 
