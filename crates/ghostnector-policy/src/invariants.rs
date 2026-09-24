@@ -125,6 +125,8 @@ pub enum ViolationCode {
     ForwardChainPolicyNotDeny,
     /// A nat chain's default verdict is not `accept`, which nftables does not permit.
     NatChainPolicyNotAccept,
+    /// The nat chain does not run before the filter chains on the same hook.
+    NatChainDoesNotPrecedeFilter,
     /// An unconditional `accept` rule exists, which accepts every packet including clearnet ones.
     UnconditionalAccept,
     /// An `accept` rule in the output chain is neither loopback nor an enumerated exemption.
@@ -168,6 +170,7 @@ impl ViolationCode {
             ViolationCode::OutputChainPolicyNotDeny => "output_chain_policy_not_deny",
             ViolationCode::ForwardChainPolicyNotDeny => "forward_chain_policy_not_deny",
             ViolationCode::NatChainPolicyNotAccept => "nat_chain_policy_not_accept",
+            ViolationCode::NatChainDoesNotPrecedeFilter => "nat_chain_does_not_precede_filter",
             ViolationCode::UnconditionalAccept => "unconditional_accept",
             ViolationCode::UnenumeratedAccept => "unenumerated_accept",
             ViolationCode::MechanismAcceptInEgress => "mechanism_accept_in_egress",
@@ -247,6 +250,25 @@ pub fn check(ruleset: &Ruleset, ctx: &CheckContext<'_>) -> Result<(), Vec<Invari
                 "nftables only permits an accept default verdict on a nat chain, so this ruleset \
                  could not be applied at all",
             ));
+        }
+
+        // The redirect has to happen before the filter verdict, or the traffic the profile is meant
+        // to carry is rejected instead. Same hook, same priority means no defined order.
+        for filter in table.chains.iter().filter(|filter| {
+            filter.hook == chain.hook && filter.kind == crate::ir::ChainKind::Filter
+        }) {
+            if chain.priority >= filter.priority {
+                violations.push(InvariantViolation::at(
+                    chain,
+                    ViolationCode::NatChainDoesNotPrecedeFilter,
+                    format!(
+                        "this nat chain has priority {} and the filter chain '{}' on the same hook \
+                         has {}; the redirect would race the filter verdict, and traffic meant to be \
+                         carried would be dropped instead",
+                        chain.priority, filter.name, filter.priority
+                    ),
+                ));
+            }
         }
     }
 
@@ -344,7 +366,11 @@ fn check_egress(
                 if allows_destination
                     && !matches!(
                         rule.origin,
-                        RuleOrigin::Exemption { .. } | RuleOrigin::OutOfScope
+                        RuleOrigin::Exemption { .. }
+                            | RuleOrigin::OutOfScope
+                            // A rule that accepts traffic *to a loopback address* is loopback
+                            // traffic, not a destination allow: it cannot leave the machine.
+                            | RuleOrigin::Loopback
                     )
                 {
                     out.push(InvariantViolation::in_rule(
@@ -596,7 +622,8 @@ mod tests {
                         name: "out_nat".to_string(),
                         kind: ChainKind::Nat,
                         hook: Hook::Output,
-                        priority: -150,
+                        // The nat chain must precede the filter chain on the same hook.
+                        priority: -100,
                         policy: Verdict::Accept,
                         rules: vec![
                             rule(
@@ -630,7 +657,7 @@ mod tests {
                         name: "out_filter".to_string(),
                         kind: ChainKind::Filter,
                         hook: Hook::Output,
-                        priority: -150,
+                        priority: 0,
                         policy: Verdict::Drop,
                         rules: vec![
                             rule(
@@ -673,7 +700,7 @@ mod tests {
                         name: "fwd_filter".to_string(),
                         kind: ChainKind::Filter,
                         hook: Hook::Forward,
-                        priority: -150,
+                        priority: 0,
                         policy: Verdict::Drop,
                         rules: vec![],
                     },
@@ -982,6 +1009,25 @@ mod tests {
         assert!(violations
             .iter()
             .any(|v| v.code == ViolationCode::ExemptionAfterRedirect));
+    }
+
+    #[test]
+    fn a_nat_chain_that_does_not_precede_the_filter_chain_is_caught() {
+        let exemptions = tor_baseline();
+        let ports = [TRANS_PORT, DNS_PORT];
+        let mut ruleset = good_ruleset();
+        // Equal priorities on the same hook is the arrangement that produced the observed failure:
+        // the redirect raced the filter verdict, and the traffic the profile was meant to carry was
+        // dropped instead.
+        ruleset.chain_mut("out_nat").unwrap().priority = 0;
+
+        let violations = check(&ruleset, &context(&exemptions, &ports, Scope::System)).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.code == ViolationCode::NatChainDoesNotPrecedeFilter),
+            "expected the ordering violation, got {violations:?}"
+        );
     }
 
     #[test]

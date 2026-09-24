@@ -21,6 +21,9 @@ pub enum ChokepointError {
     /// It could not be started.
     #[error("the DNS relay could not be started: {0}")]
     Start(String),
+    /// It started and immediately stopped.
+    #[error("the DNS relay stopped as soon as it started: {0}")]
+    Stopped(String),
 }
 
 /// Starting and stopping the DNS relay.

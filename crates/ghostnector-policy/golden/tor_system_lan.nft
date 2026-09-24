@@ -1,5 +1,15 @@
 destroy table inet ghostnector
 table inet ghostnector {
+    set loopback4 {
+        type ipv4_addr
+        flags interval
+        elements = { 127.0.0.0/8 }
+    }
+    set loopback6 {
+        type ipv6_addr
+        flags interval
+        elements = { ::1/128 }
+    }
     set lan4 {
         type ipv4_addr
         flags interval
@@ -11,7 +21,9 @@ table inet ghostnector {
         elements = { fc00::/7, fe80::/10, ff00::/8 }
     }
     chain out_nat {
-        type nat hook output priority -150; policy accept;
+        type nat hook output priority -100; policy accept;
+        ip daddr @loopback4 counter return comment "traffic to a loopback address cannot leave the machine"
+        ip6 daddr @loopback6 counter return comment "traffic to a loopback address cannot leave the machine"
         oifname "lo" counter return comment "loopback cannot reach the clearnet"
         meta skuid 987 counter return comment "Tor's own egress must not be captured"
         ip daddr @lan4 counter return comment "the local network is opted in"
@@ -21,7 +33,9 @@ table inet ghostnector {
         meta l4proto tcp counter redirect to :9040 comment "transparent Tor for TCP"
     }
     chain out_filter {
-        type filter hook output priority -150; policy drop;
+        type filter hook output priority 0; policy drop;
+        ip daddr @loopback4 counter accept comment "traffic to a loopback address cannot leave the machine"
+        ip6 daddr @loopback6 counter accept comment "traffic to a loopback address cannot leave the machine"
         oifname "lo" counter accept comment "loopback cannot reach the clearnet"
         meta skuid 987 counter accept comment "Tor's own egress"
         udp dport 68 counter accept comment "keep the link alive"
@@ -33,11 +47,11 @@ table inet ghostnector {
         counter drop comment "deny by default"
     }
     chain fwd_filter {
-        type filter hook forward priority -150; policy drop;
+        type filter hook forward priority 0; policy drop;
         counter drop comment "containers and virtual machines must not leak around the output chain"
     }
     chain in_filter {
-        type filter hook input priority -150; policy accept;
+        type filter hook input priority 0; policy accept;
         iifname "lo" counter accept comment "loopback delivery of redirected traffic"
         tcp dport 9040 counter drop comment "the transparent proxies are not for the network"
         tcp dport 9054 counter drop comment "the transparent proxies are not for the network"

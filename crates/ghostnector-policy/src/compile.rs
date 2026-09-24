@@ -37,6 +37,33 @@ const LAN4: [&str; 4] = [
 ];
 const LAN6: [&str; 3] = ["fc00::/7", "fe80::/10", "ff00::/8"];
 
+/// The `nat` chain must run *before* the filter chains, or the redirect never happens and the
+/// filter's default deny rejects the traffic instead.
+///
+/// This is not a style preference. Two chains on the same hook with the same priority are evaluated
+/// in an order the kernel does not define, and an observed run showed exactly the failure that
+/// follows: the filter rejected DNS and TCP before the `nat` chain could redirect them, so the
+/// redirect rules' counters stayed at zero while everything the profile was supposed to carry was
+/// dropped. The invariant checker enforces the relationship, not these particular numbers.
+const NAT_PRIORITY: i32 = -100;
+/// Filter chains run after `nat`. `accept` here is not final across tables, so a third-party
+/// firewall still gets its say.
+const FILTER_PRIORITY: i32 = 0;
+
+/// Loopback destinations, by address rather than by interface.
+///
+/// An observed run showed why those are not the same thing: a packet that `redirect` has just
+/// rewritten to a loopback port still reports its *original* output interface while the filter chain
+/// runs, because the kernel recomputes the route after the filter verdict for locally generated
+/// packets. A rule that accepted "the loopback interface" therefore did not accept the traffic the
+/// redirect had produced: it was rejected, and everything the profile was supposed to carry was
+/// dropped instead.
+///
+/// A packet whose destination is a loopback address cannot leave the machine, so accepting it is
+/// safe, and unlike an interface match it does not depend on when the route was last computed.
+const LOOPBACK4: [&str; 1] = ["127.0.0.0/8"];
+const LOOPBACK6: [&str; 1] = ["::1/128"];
+
 /// Resolved identities and ports the policy needs to name.
 ///
 /// Identities are optional because a machine need not have every service installed: Tor mode works
@@ -109,17 +136,22 @@ pub fn compile(
     env: &Environment,
 ) -> Result<CompiledPolicy, PolicyError> {
     let (scope, chains, sets, require_dns_redirect) = match profile {
-        ProfileId::FailClosed => (Scope::System, fail_closed_chains(env)?, Vec::new(), false),
+        ProfileId::FailClosed => (
+            Scope::System,
+            fail_closed_chains(env)?,
+            table_sets(params.allow_lan),
+            false,
+        ),
         ProfileId::DnsLockdown => (
             Scope::System,
             dns_lockdown_chains(env, params.allow_lan)?,
-            lan_sets(params.allow_lan),
+            table_sets(params.allow_lan),
             true,
         ),
         ProfileId::TorSystem => (
             Scope::System,
             tor_chains(env, Scope::System, None, params.allow_lan)?,
-            lan_sets(params.allow_lan),
+            table_sets(params.allow_lan),
             true,
         ),
         ProfileId::TorUser => {
@@ -130,7 +162,7 @@ pub fn compile(
             (
                 Scope::User,
                 tor_chains(env, Scope::User, Some(uid), params.allow_lan)?,
-                lan_sets(params.allow_lan),
+                table_sets(params.allow_lan),
                 true,
             )
         }
@@ -268,6 +300,41 @@ fn loopback_rule(verdict: Verdict) -> Rule {
     )
 }
 
+/// The rules that recognise traffic destined for a loopback address.
+fn loopback_address_rules(verdict: Verdict) -> Vec<Rule> {
+    ["loopback4", "loopback6"]
+        .into_iter()
+        .map(|set| {
+            rule(
+                vec![Expr::DaddrInSet {
+                    set: set.to_string(),
+                }],
+                verdict,
+                RuleOrigin::Loopback,
+                "traffic to a loopback address cannot leave the machine",
+            )
+        })
+        .collect()
+}
+
+/// The sets every table declares: the loopback addresses, and the local network when it is opted in.
+fn table_sets(allow_lan: bool) -> Vec<Set> {
+    let mut sets = vec![
+        Set {
+            name: "loopback4".to_string(),
+            kind: SetKind::Ipv4Addr,
+            elements: LOOPBACK4.iter().map(|cidr| cidr.to_string()).collect(),
+        },
+        Set {
+            name: "loopback6".to_string(),
+            kind: SetKind::Ipv6Addr,
+            elements: LOOPBACK6.iter().map(|cidr| cidr.to_string()).collect(),
+        },
+    ];
+    sets.extend(lan_sets(allow_lan));
+    sets
+}
+
 fn dhcp_rule(env: &Environment) -> Rule {
     rule(
         vec![
@@ -327,7 +394,7 @@ fn forward_chain() -> Chain {
         name: "fwd_filter".to_string(),
         kind: ChainKind::Filter,
         hook: Hook::Forward,
-        priority: -150,
+        priority: FILTER_PRIORITY,
         policy: Verdict::Drop,
         rules: vec![rule(
             vec![],
@@ -355,7 +422,7 @@ fn listener_guard_chain(env: &Environment) -> Chain {
         name: "in_filter".to_string(),
         kind: ChainKind::Filter,
         hook: Hook::Input,
-        priority: -150,
+        priority: FILTER_PRIORITY,
         policy: Verdict::Accept,
         rules: vec![
             rule(
@@ -374,24 +441,28 @@ fn listener_guard_chain(env: &Environment) -> Chain {
 }
 
 fn nat_chain(rules: Vec<Rule>) -> Chain {
+    let mut all = loopback_address_rules(Verdict::Return);
+    all.extend(rules);
     Chain {
         name: "out_nat".to_string(),
         kind: ChainKind::Nat,
         hook: Hook::Output,
-        priority: -150,
+        priority: NAT_PRIORITY,
         policy: Verdict::Accept,
-        rules,
+        rules: all,
     }
 }
 
 fn filter_chain(rules: Vec<Rule>) -> Chain {
+    let mut all = loopback_address_rules(Verdict::Accept);
+    all.extend(rules);
     Chain {
         name: "out_filter".to_string(),
         kind: ChainKind::Filter,
         hook: Hook::Output,
-        priority: -150,
+        priority: FILTER_PRIORITY,
         policy: Verdict::Drop,
-        rules,
+        rules: all,
     }
 }
 
@@ -614,8 +685,15 @@ mod tests {
             .filter(|rule| matches!(rule.verdict, Verdict::Accept))
             .map(|rule| rule.comment.clone())
             .collect();
-        assert_eq!(accepts.len(), 3, "loopback, tor, dhcp: {accepts:?}");
-        assert!(chain(&policy, "out_nat").rules.is_empty());
+        assert_eq!(
+            accepts.len(),
+            5,
+            "two loopback addresses, loopback, tor, dhcp: {accepts:?}"
+        );
+        assert!(
+            !chain(&policy, "out_nat").rules.is_empty(),
+            "the nat chain still has its loopback rules, even for this profile"
+        );
     }
 
     #[test]
@@ -659,7 +737,11 @@ mod tests {
             subjects(&policy),
             vec![SUBJECT_TOR, SUBJECT_LAN, SUBJECT_DHCP]
         );
-        assert_eq!(policy.ruleset.tables[0].sets.len(), 2);
+        assert_eq!(
+            policy.ruleset.tables[0].sets.len(),
+            4,
+            "loopback addresses plus the LAN"
+        );
     }
 
     #[test]
@@ -680,13 +762,23 @@ mod tests {
         };
         let policy = compile(ProfileId::TorUser, &params, &env()).unwrap();
 
+        // The carve-out must exist in both chains, and must come before anything that treats the
+        // scoped identity's traffic differently, or it protects nothing.
         for chain_name in ["out_filter", "out_nat"] {
-            let first = &chain(&policy, chain_name).rules[0];
-            assert_eq!(
-                first.exprs,
-                vec![Expr::SkuidNot { uid: 1000 }],
-                "the first rule of {chain_name} must step aside for other identities"
-            );
+            let rules = &chain(&policy, chain_name).rules;
+            let carve_out = rules
+                .iter()
+                .position(|rule| matches!(rule.origin, RuleOrigin::OutOfScope))
+                .unwrap_or_else(|| panic!("{chain_name} has no scope carve-out"));
+            if let Some(exemption) = rules
+                .iter()
+                .position(|rule| matches!(rule.origin, RuleOrigin::Exemption { .. }))
+            {
+                assert!(
+                    carve_out < exemption,
+                    "in {chain_name} the carve-out must precede every exemption"
+                );
+            }
         }
         assert_eq!(
             subjects(&policy),

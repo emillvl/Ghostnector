@@ -259,6 +259,7 @@ pub struct MockRelay {
     started: Mutex<Vec<String>>,
     running: Mutex<bool>,
     fail_start: Mutex<Option<String>>,
+    dies: Mutex<bool>,
 }
 
 impl MockRelay {
@@ -270,6 +271,11 @@ impl MockRelay {
     /// Every `start`, as `"listen -> upstream"`, in order.
     pub fn started(&self) -> Vec<String> {
         self.started.lock().expect("mock lock").clone()
+    }
+
+    /// Pretend the relay starts and immediately exits, as it does when its port is taken.
+    pub fn die_on_start(&self) {
+        *self.dies.lock().expect("mock lock") = true;
     }
 
     /// Fail the next start with this message.
@@ -291,7 +297,7 @@ impl crate::chokepoint::DnsRelay for MockRelay {
             .lock()
             .expect("mock lock")
             .push(format!("{listen} -> {upstream}"));
-        *self.running.lock().expect("mock lock") = true;
+        *self.running.lock().expect("mock lock") = !*self.dies.lock().expect("mock lock");
         Ok(())
     }
 

@@ -1,10 +1,24 @@
 destroy table inet ghostnector
 table inet ghostnector {
+    set loopback4 {
+        type ipv4_addr
+        flags interval
+        elements = { 127.0.0.0/8 }
+    }
+    set loopback6 {
+        type ipv6_addr
+        flags interval
+        elements = { ::1/128 }
+    }
     chain out_nat {
-        type nat hook output priority -150; policy accept;
+        type nat hook output priority -100; policy accept;
+        ip daddr @loopback4 counter return comment "traffic to a loopback address cannot leave the machine"
+        ip6 daddr @loopback6 counter return comment "traffic to a loopback address cannot leave the machine"
     }
     chain out_filter {
-        type filter hook output priority -150; policy drop;
+        type filter hook output priority 0; policy drop;
+        ip daddr @loopback4 counter accept comment "traffic to a loopback address cannot leave the machine"
+        ip6 daddr @loopback6 counter accept comment "traffic to a loopback address cannot leave the machine"
         oifname "lo" counter accept comment "loopback cannot reach the clearnet"
         meta skuid 987 counter accept comment "Tor must reach the network to bootstrap"
         udp dport 68 counter accept comment "keep the link alive"
@@ -14,7 +28,7 @@ table inet ghostnector {
         counter drop comment "deny by default"
     }
     chain fwd_filter {
-        type filter hook forward priority -150; policy drop;
+        type filter hook forward priority 0; policy drop;
         counter drop comment "containers and virtual machines must not leak around the output chain"
     }
 }

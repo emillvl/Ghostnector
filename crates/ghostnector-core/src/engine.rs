@@ -476,6 +476,18 @@ impl Engine {
         let upstream = self.dns_upstream(profile);
         self.relay.start(listen, upstream)?;
 
+        // A relay that starts and immediately stops has not been started. Without this, a policy that
+        // redirects DNS into a port where nothing listens would be reported as protection: the
+        // redirect would be in place, every query would be dropped, and nothing would say why.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        if !self.relay.is_running() {
+            return Err(EngineError::Dns(
+                crate::chokepoint::ChokepointError::Stopped(format!(
+                    "nothing would answer on {listen}"
+                )),
+            ));
+        }
+
         let mut baseline = match self.resolver.capture() {
             Ok(baseline) => baseline,
             Err(error) => {
@@ -1613,6 +1625,34 @@ mod tests {
                 .any(|reason| reason.as_str().contains("no longer recent")),
             "{:?}",
             snapshot.reasons
+        );
+    }
+
+    #[test]
+    fn a_relay_that_starts_and_then_dies_fails_the_connect() {
+        let (helper, relay, engine, _dir) = engine_and_relay();
+        relay.die_on_start();
+
+        let error = engine
+            .connect(system_tor_profile(), USER_UID)
+            .expect_err("connect must fail when nothing would answer on the chokepoint");
+        assert!(
+            error.to_string().contains("stopped as soon as it started"),
+            "{error}"
+        );
+        assert_eq!(engine.snapshot().state, ProtectionState::Off);
+        assert!(
+            !Journal::new(engine.journal_path())
+                .load()
+                .expect("load")
+                .protected
+        );
+        assert!(
+            helper
+                .verbs()
+                .iter()
+                .any(|verb| matches!(verb, Verb::Revert)),
+            "the baseline applied on the way in must be withdrawn"
         );
     }
 
