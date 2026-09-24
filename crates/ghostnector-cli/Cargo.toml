@@ -1,0 +1,16 @@
+[package]
+name = "ghostnector-cli"
+description = "The ghostnector command: asks the control plane what is happening, and asks it to change."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "ghostnector"
+path = "src/main.rs"
+
+[dependencies]
+ghostnector-spec = { path = "../ghostnector-spec" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,820 @@
+//! The compiler: a named profile becomes a ruleset, or nothing at all.
+//!
+//! Three properties make this safe to put in front of the kernel:
+//!
+//! 1. **It cannot be called with an incoherent request.** The input is a [`ProfileId`] plus typed
+//!    [`Params`] — the same closed vocabulary the privileged helper accepts over IPC (invariant
+//!    I9) — so there is no way to ask for a policy the design does not have.
+//! 2. **It checks its own output.** Every compiled ruleset is run through
+//!    [`crate::invariants::check`] before it is returned. A compiler bug therefore surfaces as a
+//!    rejected policy, not as a hole in the firewall.
+//! 3. **The exemption list is derived, not asserted.** The effective exemptions are the subjects
+//!    the rules actually cite, resolved against the catalogue. The interface can therefore never
+//!    display a hole that does not exist, nor hide one that does.
+
+use ghostnector_spec::backend::{Params, ProfileId};
+use ghostnector_spec::exemption::{
+    catalogue, Exemption, SUBJECT_DHCP, SUBJECT_DNSCRYPT, SUBJECT_LAN, SUBJECT_TOR,
+};
+use ghostnector_spec::profile::Scope;
+use serde::{Deserialize, Serialize};
+
+use crate::invariants::{check, CheckContext, InvariantViolation, TABLE_NAME};
+use crate::ir::{
+    Chain, ChainKind, Expr, Family, Hook, Mechanism, Proto, RejectKind, Rule, RuleOrigin, Ruleset,
+    Set, SetKind, Table, Verdict,
+};
+
+/// Address ranges considered "the local network" when the LAN exception is enabled.
+///
+/// Loopback is deliberately absent: it is handled by a rule that applies in every profile, so
+/// including it here would be redundant noise in the policy.
+const LAN4: [&str; 4] = [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+];
+const LAN6: [&str; 3] = ["fc00::/7", "fe80::/10", "ff00::/8"];
+
+/// Resolved identities and ports the policy needs to name.
+///
+/// Identities are optional because a machine need not have every service installed: Tor mode works
+/// on a host without a resolver installed, and vice versa. A profile fails only when it needs an
+/// identity that is absent, and says which one.
+///
+/// There is deliberately no `Default` implementation, because a policy compiled from guessed uids
+/// would silently protect the wrong processes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Environment {
+    /// The uid Tor runs as, if Tor is installed. Its egress must be direct or the design is
+    /// circular.
+    pub tor_uid: Option<u32>,
+    /// The uid the encrypted-DNS resolver runs as, if one is installed.
+    pub dnscrypt_uid: Option<u32>,
+    /// Port Tor's transparent proxy listens on (loopback only).
+    pub trans_port: u16,
+    /// Port the DNS chokepoint listens on (loopback only).
+    pub chokepoint_port: u16,
+    /// Port Tor's SOCKS proxy listens on (loopback only).
+    pub socks_port: u16,
+    /// Port the DHCP client uses as a source, allowed so the link survives.
+    pub dhcp_client_port: u16,
+}
+
+/// A ruleset that has been compiled and verified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompiledPolicy {
+    /// The profile this ruleset realises.
+    pub profile: ProfileId,
+    /// The policy, ready to be applied atomically.
+    pub ruleset: Ruleset,
+    /// The complete list of holes, for display (invariant I8).
+    pub exemptions: Vec<Exemption>,
+}
+
+/// Reasons a policy could not be compiled.
+#[derive(Debug, thiserror::Error)]
+pub enum PolicyError {
+    /// The compiler produced something that violates the design's own invariants.
+    #[error("compiled policy violates its own invariants: {} occurrence(s)", .0.len())]
+    InvariantViolations(Vec<InvariantViolation>),
+    /// A profile was requested without the parameter it needs.
+    #[error("profile {0:?} requires the parameter '{1}'")]
+    MissingParameter(ProfileId, &'static str),
+    /// A parameter is present but cannot be used.
+    #[error("parameter '{0}' is not usable: {1}")]
+    InvalidParameter(&'static str, &'static str),
+    /// The profile is part of the design but not implemented in this milestone.
+    #[error("profile {0:?} is not implemented yet")]
+    Unsupported(ProfileId),
+    /// A rule cited an exemption subject that is not in the catalogue. Compiler bug.
+    #[error("the compiler cited exemption '{0}', which is not in the catalogue")]
+    UnknownExemption(String),
+    /// The profile needs a service that is not installed on this machine.
+    #[error("this profile needs the {0} service, which is not installed")]
+    MissingIdentity(&'static str),
+}
+
+impl From<Vec<InvariantViolation>> for PolicyError {
+    fn from(violations: Vec<InvariantViolation>) -> Self {
+        PolicyError::InvariantViolations(violations)
+    }
+}
+
+/// Compile a named profile into a verified ruleset.
+pub fn compile(
+    profile: ProfileId,
+    params: &Params,
+    env: &Environment,
+) -> Result<CompiledPolicy, PolicyError> {
+    let (scope, chains, sets, require_dns_redirect) = match profile {
+        ProfileId::FailClosed => (Scope::System, fail_closed_chains(env)?, Vec::new(), false),
+        ProfileId::DnsLockdown => (
+            Scope::System,
+            dns_lockdown_chains(env, params.allow_lan)?,
+            lan_sets(params.allow_lan),
+            true,
+        ),
+        ProfileId::TorSystem => (
+            Scope::System,
+            tor_chains(env, Scope::System, None, params.allow_lan)?,
+            lan_sets(params.allow_lan),
+            true,
+        ),
+        ProfileId::TorUser => {
+            let uid = params
+                .user_uid
+                .ok_or(PolicyError::MissingParameter(profile, "user_uid"))?;
+            validate_user_uid(uid, env)?;
+            (
+                Scope::User,
+                tor_chains(env, Scope::User, Some(uid), params.allow_lan)?,
+                lan_sets(params.allow_lan),
+                true,
+            )
+        }
+        ProfileId::TorApp | ProfileId::I2pIsolated => {
+            return Err(PolicyError::Unsupported(profile));
+        }
+    };
+
+    let ruleset = Ruleset {
+        tables: vec![Table {
+            family: Family::Inet,
+            name: TABLE_NAME.to_string(),
+            sets,
+            chains,
+        }],
+    };
+
+    let exemptions = effective_exemptions(&ruleset)?;
+    let allowed_ports = [env.trans_port, env.chokepoint_port];
+    let ctx = CheckContext {
+        scope,
+        exemptions: &exemptions,
+        allowed_redirect_ports: &allowed_ports,
+        require_dns_redirect,
+        require_udp_fast_fail: true,
+        require_exemption_before_redirect: true,
+    };
+    check(&ruleset, &ctx)?;
+
+    Ok(CompiledPolicy {
+        profile,
+        ruleset,
+        exemptions,
+    })
+}
+
+fn require_tor(env: &Environment) -> Result<u32, PolicyError> {
+    env.tor_uid.ok_or(PolicyError::MissingIdentity("tor"))
+}
+
+fn require_dnscrypt(env: &Environment) -> Result<u32, PolicyError> {
+    env.dnscrypt_uid
+        .ok_or(PolicyError::MissingIdentity("dnscrypt-proxy"))
+}
+
+/// A user scope must name a real, non-system identity.
+fn validate_user_uid(uid: u32, env: &Environment) -> Result<(), PolicyError> {
+    if uid == 0 {
+        return Err(PolicyError::InvalidParameter(
+            "user_uid",
+            "root is not a user scope; use the system scope instead",
+        ));
+    }
+    if Some(uid) == env.tor_uid || Some(uid) == env.dnscrypt_uid {
+        return Err(PolicyError::InvalidParameter(
+            "user_uid",
+            "the uid belongs to a Ghostnector service, not to a user",
+        ));
+    }
+    Ok(())
+}
+
+fn lan_sets(allow_lan: bool) -> Vec<Set> {
+    if !allow_lan {
+        return Vec::new();
+    }
+    vec![
+        Set {
+            name: "lan4".to_string(),
+            kind: SetKind::Ipv4Addr,
+            elements: LAN4.iter().map(|cidr| cidr.to_string()).collect(),
+        },
+        Set {
+            name: "lan6".to_string(),
+            kind: SetKind::Ipv6Addr,
+            elements: LAN6.iter().map(|cidr| cidr.to_string()).collect(),
+        },
+    ]
+}
+
+/// The subjects the rules cite, resolved against the catalogue, in order of first appearance.
+fn effective_exemptions(ruleset: &Ruleset) -> Result<Vec<Exemption>, PolicyError> {
+    let mut subjects: Vec<&str> = Vec::new();
+    for table in &ruleset.tables {
+        for chain in &table.chains {
+            for rule in &chain.rules {
+                if let RuleOrigin::Exemption { subject } = &rule.origin {
+                    if !subjects.contains(&subject.as_str()) {
+                        subjects.push(subject);
+                    }
+                }
+            }
+        }
+    }
+
+    let all = catalogue();
+    let mut effective = Vec::with_capacity(subjects.len());
+    for subject in subjects {
+        match all.iter().find(|exemption| exemption.subject == subject) {
+            Some(exemption) => effective.push(exemption.clone()),
+            None => return Err(PolicyError::UnknownExemption(subject.to_string())),
+        }
+    }
+    Ok(effective)
+}
+
+fn rule(exprs: Vec<Expr>, verdict: Verdict, origin: RuleOrigin, comment: &str) -> Rule {
+    Rule {
+        exprs,
+        verdict,
+        counter: true,
+        origin,
+        comment: comment.to_string(),
+    }
+}
+
+fn exemption(subject: &str) -> RuleOrigin {
+    RuleOrigin::Exemption {
+        subject: subject.to_string(),
+    }
+}
+
+fn mechanism(mechanism: Mechanism) -> RuleOrigin {
+    RuleOrigin::Mechanism { mechanism }
+}
+
+fn loopback_rule(verdict: Verdict) -> Rule {
+    rule(
+        vec![Expr::Oifname {
+            name: "lo".to_string(),
+        }],
+        verdict,
+        RuleOrigin::Loopback,
+        "loopback cannot reach the clearnet",
+    )
+}
+
+fn dhcp_rule(env: &Environment) -> Rule {
+    rule(
+        vec![
+            Expr::L4Proto { proto: Proto::Udp },
+            Expr::Dport {
+                port: env.dhcp_client_port,
+            },
+        ],
+        Verdict::Accept,
+        exemption(SUBJECT_DHCP),
+        "keep the link alive",
+    )
+}
+
+fn fast_fail_rules() -> Vec<Rule> {
+    vec![
+        rule(
+            vec![Expr::L4Proto { proto: Proto::Udp }],
+            Verdict::Reject {
+                kind: RejectKind::PortUnreachable,
+            },
+            mechanism(Mechanism::FastFailUdp),
+            "QUIC and real-time clients must fail in milliseconds, not hang",
+        ),
+        rule(
+            vec![Expr::L4Proto { proto: Proto::Icmp }],
+            Verdict::Reject {
+                kind: RejectKind::AdminProhibited,
+            },
+            mechanism(Mechanism::FastFailUdp),
+            "ICMP is not carried by Tor",
+        ),
+        rule(
+            vec![Expr::L4Proto {
+                proto: Proto::Icmpv6,
+            }],
+            Verdict::Reject {
+                kind: RejectKind::AdminProhibited,
+            },
+            mechanism(Mechanism::FastFailUdp),
+            "IPv6 is denied in every profile",
+        ),
+    ]
+}
+
+fn default_deny_rule() -> Rule {
+    rule(
+        vec![],
+        Verdict::Drop,
+        mechanism(Mechanism::DefaultDeny),
+        "deny by default",
+    )
+}
+
+fn forward_chain() -> Chain {
+    Chain {
+        name: "fwd_filter".to_string(),
+        kind: ChainKind::Filter,
+        hook: Hook::Forward,
+        priority: -150,
+        policy: Verdict::Drop,
+        rules: vec![rule(
+            vec![],
+            Verdict::Drop,
+            mechanism(Mechanism::ForwardDeny),
+            "containers and virtual machines must not leak around the output chain",
+        )],
+    }
+}
+
+/// Keep the transparent-proxy listeners off the network.
+///
+/// The proxies bind to loopback, so this is a second line of defence: if a future change binds a
+/// listener to a wildcard address, the machine does not become an open proxy for its network.
+fn listener_guard_chain(env: &Environment) -> Chain {
+    let guard = |port: u16| {
+        rule(
+            vec![Expr::L4Proto { proto: Proto::Tcp }, Expr::Dport { port }],
+            Verdict::Drop,
+            mechanism(Mechanism::ListenerGuard),
+            "the transparent proxies are not for the network",
+        )
+    };
+    Chain {
+        name: "in_filter".to_string(),
+        kind: ChainKind::Filter,
+        hook: Hook::Input,
+        priority: -150,
+        policy: Verdict::Accept,
+        rules: vec![
+            rule(
+                vec![Expr::Iifname {
+                    name: "lo".to_string(),
+                }],
+                Verdict::Accept,
+                RuleOrigin::Loopback,
+                "loopback delivery of redirected traffic",
+            ),
+            guard(env.trans_port),
+            guard(env.chokepoint_port),
+            guard(env.socks_port),
+        ],
+    }
+}
+
+fn nat_chain(rules: Vec<Rule>) -> Chain {
+    Chain {
+        name: "out_nat".to_string(),
+        kind: ChainKind::Nat,
+        hook: Hook::Output,
+        priority: -150,
+        policy: Verdict::Accept,
+        rules,
+    }
+}
+
+fn filter_chain(rules: Vec<Rule>) -> Chain {
+    Chain {
+        name: "out_filter".to_string(),
+        kind: ChainKind::Filter,
+        hook: Hook::Output,
+        priority: -150,
+        policy: Verdict::Drop,
+        rules,
+    }
+}
+
+/// Deny everything except loopback, Tor's own egress, and DHCP.
+///
+/// This is the state the machine sits in *before* services start, so there is no window during a
+/// transition where traffic can escape (DR-4).
+fn fail_closed_chains(env: &Environment) -> Result<Vec<Chain>, PolicyError> {
+    let tor_uid = require_tor(env)?;
+    let mut rules = vec![
+        loopback_rule(Verdict::Accept),
+        rule(
+            vec![Expr::Skuid { uid: tor_uid }],
+            Verdict::Accept,
+            exemption(SUBJECT_TOR),
+            "Tor must reach the network to bootstrap",
+        ),
+        dhcp_rule(env),
+    ];
+    rules.extend(fast_fail_rules());
+    rules.push(default_deny_rule());
+
+    Ok(vec![
+        nat_chain(Vec::new()),
+        filter_chain(rules),
+        forward_chain(),
+    ])
+}
+
+/// Encrypted DNS with a locked-down port 53. No overlay network.
+fn dns_lockdown_chains(env: &Environment, allow_lan: bool) -> Result<Vec<Chain>, PolicyError> {
+    let dnscrypt_uid = require_dnscrypt(env)?;
+    let mut nat_rules = vec![
+        loopback_rule(Verdict::Return),
+        rule(
+            vec![Expr::Skuid { uid: dnscrypt_uid }],
+            Verdict::Return,
+            exemption(SUBJECT_DNSCRYPT),
+            "the resolver speaks to resolvers directly",
+        ),
+    ];
+    let mut rules = vec![
+        loopback_rule(Verdict::Accept),
+        rule(
+            vec![Expr::Skuid { uid: dnscrypt_uid }],
+            Verdict::Accept,
+            exemption(SUBJECT_DNSCRYPT),
+            "the resolver's egress is not port-restricted; identity is the boundary",
+        ),
+    ];
+
+    if allow_lan {
+        for set in ["lan4", "lan6"] {
+            nat_rules.push(lan_return_rule(set));
+            rules.push(lan_accept_rule(set));
+        }
+    }
+
+    // Plaintext DNS is impossible: everything aimed at port 53 goes to the chokepoint. Encrypted
+    // DNS from applications (DoH on 443, DoT on 853) is not blocked, because it does not leak
+    // plaintext; the interface states that it bypasses the resolver policy.
+    nat_rules.push(dns_redirect_rule(Proto::Udp, env.chokepoint_port));
+    nat_rules.push(dns_redirect_rule(Proto::Tcp, env.chokepoint_port));
+
+    rules.push(dhcp_rule(env));
+    rules.extend(fast_fail_rules());
+    rules.push(default_deny_rule());
+
+    Ok(vec![
+        nat_chain(nat_rules),
+        filter_chain(rules),
+        forward_chain(),
+        listener_guard_chain(env),
+    ])
+}
+
+/// Transparent Tor for a whole-machine or single-identity scope.
+fn tor_chains(
+    env: &Environment,
+    scope: Scope,
+    user_uid: Option<u32>,
+    allow_lan: bool,
+) -> Result<Vec<Chain>, PolicyError> {
+    let tor_uid = require_tor(env)?;
+    let mut nat_rules = Vec::new();
+    let mut rules = Vec::new();
+
+    if scope == Scope::User {
+        let uid = user_uid.expect("the caller validates that a user scope has a uid");
+        nat_rules.push(rule(
+            vec![Expr::SkuidNot { uid }],
+            Verdict::Return,
+            RuleOrigin::OutOfScope,
+            "outside the scope, leave the machine alone",
+        ));
+        rules.push(rule(
+            vec![Expr::SkuidNot { uid }],
+            Verdict::Accept,
+            RuleOrigin::OutOfScope,
+            "outside the scope, leave the machine alone",
+        ));
+    }
+
+    nat_rules.push(loopback_rule(Verdict::Return));
+    nat_rules.push(rule(
+        vec![Expr::Skuid { uid: tor_uid }],
+        Verdict::Return,
+        exemption(SUBJECT_TOR),
+        "Tor's own egress must not be captured",
+    ));
+
+    rules.push(loopback_rule(Verdict::Accept));
+    rules.push(rule(
+        vec![Expr::Skuid { uid: tor_uid }],
+        Verdict::Accept,
+        exemption(SUBJECT_TOR),
+        "Tor's own egress",
+    ));
+    rules.push(dhcp_rule(env));
+
+    if allow_lan {
+        for set in ["lan4", "lan6"] {
+            nat_rules.push(lan_return_rule(set));
+            rules.push(lan_accept_rule(set));
+        }
+    }
+
+    // DNS first: a port-53 connection must reach the chokepoint, not the transparent proxy.
+    nat_rules.push(dns_redirect_rule(Proto::Udp, env.chokepoint_port));
+    nat_rules.push(dns_redirect_rule(Proto::Tcp, env.chokepoint_port));
+    nat_rules.push(rule(
+        vec![Expr::L4Proto { proto: Proto::Tcp }],
+        Verdict::Redirect {
+            port: env.trans_port,
+        },
+        mechanism(Mechanism::TorRedirect),
+        "transparent Tor for TCP",
+    ));
+
+    rules.extend(fast_fail_rules());
+    rules.push(default_deny_rule());
+
+    Ok(vec![
+        nat_chain(nat_rules),
+        filter_chain(rules),
+        forward_chain(),
+        listener_guard_chain(env),
+    ])
+}
+
+fn lan_return_rule(set: &str) -> Rule {
+    rule(
+        vec![Expr::DaddrInSet {
+            set: set.to_string(),
+        }],
+        Verdict::Return,
+        exemption(SUBJECT_LAN),
+        "the local network is opted in",
+    )
+}
+
+fn lan_accept_rule(set: &str) -> Rule {
+    rule(
+        vec![Expr::DaddrInSet {
+            set: set.to_string(),
+        }],
+        Verdict::Accept,
+        exemption(SUBJECT_LAN),
+        "the local network is opted in",
+    )
+}
+
+fn dns_redirect_rule(proto: Proto, port: u16) -> Rule {
+    rule(
+        vec![Expr::L4Proto { proto }, Expr::Dport { port: 53 }],
+        Verdict::Redirect { port },
+        mechanism(Mechanism::DnsRedirect),
+        "DNS goes to the chokepoint",
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env() -> Environment {
+        Environment {
+            tor_uid: Some(987),
+            dnscrypt_uid: Some(988),
+            trans_port: 9040,
+            chokepoint_port: 9054,
+            socks_port: 9050,
+            dhcp_client_port: 68,
+        }
+    }
+
+    fn subjects(policy: &CompiledPolicy) -> Vec<String> {
+        policy
+            .exemptions
+            .iter()
+            .map(|exemption| exemption.subject.clone())
+            .collect()
+    }
+
+    fn chain<'a>(policy: &'a CompiledPolicy, name: &str) -> &'a Chain {
+        policy
+            .ruleset
+            .chain(name)
+            .unwrap_or_else(|| panic!("chain {name} missing"))
+    }
+
+    #[test]
+    fn fail_closed_opens_only_tor_and_dhcp() {
+        let policy = compile(ProfileId::FailClosed, &Params::default(), &env()).unwrap();
+        assert_eq!(subjects(&policy), vec![SUBJECT_TOR, SUBJECT_DHCP]);
+
+        let accepts: Vec<_> = chain(&policy, "out_filter")
+            .rules
+            .iter()
+            .filter(|rule| matches!(rule.verdict, Verdict::Accept))
+            .map(|rule| rule.comment.clone())
+            .collect();
+        assert_eq!(accepts.len(), 3, "loopback, tor, dhcp: {accepts:?}");
+        assert!(chain(&policy, "out_nat").rules.is_empty());
+    }
+
+    #[test]
+    fn tor_system_redirects_dns_before_tcp() {
+        let policy = compile(ProfileId::TorSystem, &Params::default(), &env()).unwrap();
+        let rules = &chain(&policy, "out_nat").rules;
+
+        let dns_index = rules
+            .iter()
+            .position(|rule| {
+                matches!(rule.verdict, Verdict::Redirect { port } if port == env().chokepoint_port)
+            })
+            .expect("a DNS redirect must exist");
+        let tcp_index = rules
+            .iter()
+            .position(|rule| {
+                matches!(rule.verdict, Verdict::Redirect { port } if port == env().trans_port)
+            })
+            .expect("a Tor redirect must exist");
+
+        assert!(
+            dns_index < tcp_index,
+            "port 53 must be claimed by the chokepoint before the catch-all Tor redirect"
+        );
+    }
+
+    #[test]
+    fn tor_system_has_exactly_the_documented_exemptions() {
+        let policy = compile(ProfileId::TorSystem, &Params::default(), &env()).unwrap();
+        assert_eq!(subjects(&policy), vec![SUBJECT_TOR, SUBJECT_DHCP]);
+    }
+
+    #[test]
+    fn enabling_lan_adds_exactly_one_exemption() {
+        let params = Params {
+            allow_lan: true,
+            ..Params::default()
+        };
+        let policy = compile(ProfileId::TorSystem, &params, &env()).unwrap();
+        assert_eq!(
+            subjects(&policy),
+            vec![SUBJECT_TOR, SUBJECT_LAN, SUBJECT_DHCP]
+        );
+        assert_eq!(policy.ruleset.tables[0].sets.len(), 2);
+    }
+
+    #[test]
+    fn dns_lockdown_trusts_only_the_resolver() {
+        let policy = compile(ProfileId::DnsLockdown, &Params::default(), &env()).unwrap();
+        assert_eq!(subjects(&policy), vec![SUBJECT_DNSCRYPT, SUBJECT_DHCP]);
+
+        assert!(chain(&policy, "out_nat").rules.iter().all(
+            |rule| !matches!(rule.verdict, Verdict::Redirect { port } if port == env().trans_port)
+        ));
+    }
+
+    #[test]
+    fn user_scope_carves_out_the_rest_of_the_machine_and_nowhere_else() {
+        let params = Params {
+            user_uid: Some(1000),
+            ..Params::default()
+        };
+        let policy = compile(ProfileId::TorUser, &params, &env()).unwrap();
+
+        for chain_name in ["out_filter", "out_nat"] {
+            let first = &chain(&policy, chain_name).rules[0];
+            assert_eq!(
+                first.exprs,
+                vec![Expr::SkuidNot { uid: 1000 }],
+                "the first rule of {chain_name} must step aside for other identities"
+            );
+        }
+        assert_eq!(
+            subjects(&policy),
+            vec![SUBJECT_TOR, SUBJECT_DHCP],
+            "a user scope still only exempts Tor and DHCP"
+        );
+    }
+
+    #[test]
+    fn user_scope_requires_a_uid() {
+        let error = compile(ProfileId::TorUser, &Params::default(), &env()).unwrap_err();
+        assert!(matches!(
+            error,
+            PolicyError::MissingParameter(ProfileId::TorUser, "user_uid")
+        ));
+    }
+
+    #[test]
+    fn user_scope_refuses_root_and_service_uids() {
+        for uid in [0, 987, 988] {
+            let params = Params {
+                user_uid: Some(uid),
+                ..Params::default()
+            };
+            let error = compile(ProfileId::TorUser, &params, &env()).unwrap_err();
+            assert!(
+                matches!(error, PolicyError::InvalidParameter("user_uid", _)),
+                "uid {uid} must be refused, got {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_machine_without_a_resolver_can_still_run_tor_mode() {
+        // This is the case that matters in the field: Tor is installed, DNSCrypt is not.
+        let mut without_resolver = env();
+        without_resolver.dnscrypt_uid = None;
+
+        for profile in [ProfileId::FailClosed, ProfileId::TorSystem] {
+            compile(profile, &Params::default(), &without_resolver).unwrap_or_else(|error| {
+                panic!("{profile:?} must compile without a resolver: {error}")
+            });
+        }
+        let error = compile(
+            ProfileId::DnsLockdown,
+            &Params::default(),
+            &without_resolver,
+        )
+        .expect_err("encrypted DNS cannot work without a resolver");
+        assert!(matches!(
+            error,
+            PolicyError::MissingIdentity("dnscrypt-proxy")
+        ));
+    }
+
+    #[test]
+    fn profiles_that_need_tor_say_so_when_it_is_missing() {
+        let mut without_tor = env();
+        without_tor.tor_uid = None;
+        for profile in [ProfileId::FailClosed, ProfileId::TorSystem] {
+            let error = compile(profile, &Params::default(), &without_tor).unwrap_err();
+            assert!(
+                matches!(error, PolicyError::MissingIdentity("tor")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn profiles_without_an_implementation_are_rejected_rather_than_approximated() {
+        for profile in [ProfileId::TorApp, ProfileId::I2pIsolated] {
+            let error = compile(profile, &Params::default(), &env()).unwrap_err();
+            assert!(matches!(error, PolicyError::Unsupported(_)));
+        }
+    }
+
+    #[test]
+    fn every_compiled_profile_cites_only_catalogue_subjects() {
+        let all = catalogue();
+        for (profile, params) in [
+            (ProfileId::FailClosed, Params::default()),
+            (ProfileId::DnsLockdown, Params::default()),
+            (ProfileId::TorSystem, Params::default()),
+            (
+                ProfileId::TorSystem,
+                Params {
+                    allow_lan: true,
+                    ..Params::default()
+                },
+            ),
+            (
+                ProfileId::TorUser,
+                Params {
+                    user_uid: Some(1000),
+                    ..Params::default()
+                },
+            ),
+        ] {
+            let policy = compile(profile, &params, &env()).unwrap();
+            for exemption in &policy.exemptions {
+                assert!(
+                    all.iter().any(|e| e.subject == exemption.subject),
+                    "{profile:?} cited '{}', which is not in the catalogue",
+                    exemption.subject
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compiled_policies_serialise_stably() {
+        // The privileged helper reports what it applied; this shape is part of that contract.
+        let policy = compile(ProfileId::TorSystem, &Params::default(), &env()).unwrap();
+        let json = serde_json::to_string(&policy).unwrap();
+        let decoded: CompiledPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, policy);
+    }
+
+    #[test]
+    fn the_lan_exemption_object_matches_the_catalogue_entry() {
+        let params = Params {
+            allow_lan: true,
+            ..Params::default()
+        };
+        let policy = compile(ProfileId::TorSystem, &params, &env()).unwrap();
+        assert!(policy
+            .exemptions
+            .iter()
+            .any(|exemption| *exemption == ghostnector_spec::exemption::lan_exemption()));
+    }
+}

@@ -1,0 +1,31 @@
+destroy table inet ghostnector
+table inet ghostnector {
+    chain out_nat {
+        type nat hook output priority -150; policy accept;
+        oifname "lo" counter return comment "loopback cannot reach the clearnet"
+        meta skuid 988 counter return comment "the resolver speaks to resolvers directly"
+        udp dport 53 counter redirect to :9054 comment "DNS goes to the chokepoint"
+        tcp dport 53 counter redirect to :9054 comment "DNS goes to the chokepoint"
+    }
+    chain out_filter {
+        type filter hook output priority -150; policy drop;
+        oifname "lo" counter accept comment "loopback cannot reach the clearnet"
+        meta skuid 988 counter accept comment "the resolver's egress is not port-restricted; identity is the boundary"
+        udp dport 68 counter accept comment "keep the link alive"
+        meta l4proto udp counter reject with icmpx type port-unreachable comment "QUIC and real-time clients must fail in milliseconds, not hang"
+        meta l4proto icmp counter reject with icmpx type admin-prohibited comment "ICMP is not carried by Tor"
+        meta l4proto ipv6-icmp counter reject with icmpx type admin-prohibited comment "IPv6 is denied in every profile"
+        counter drop comment "deny by default"
+    }
+    chain fwd_filter {
+        type filter hook forward priority -150; policy drop;
+        counter drop comment "containers and virtual machines must not leak around the output chain"
+    }
+    chain in_filter {
+        type filter hook input priority -150; policy accept;
+        iifname "lo" counter accept comment "loopback delivery of redirected traffic"
+        tcp dport 9040 counter drop comment "the transparent proxies are not for the network"
+        tcp dport 9054 counter drop comment "the transparent proxies are not for the network"
+        tcp dport 9050 counter drop comment "the transparent proxies are not for the network"
+    }
+}

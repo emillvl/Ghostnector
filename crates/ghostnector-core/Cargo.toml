@@ -1,0 +1,22 @@
+[package]
+name = "ghostnector-core"
+description = "Ghostnector's control plane: state machine, intent journal, and the client-facing socket. Holds no privileges."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "ghostnector_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ghostnector-core"
+path = "src/main.rs"
+
+[dependencies]
+ghostnector-spec = { path = "../ghostnector-spec" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+nix = { workspace = true }

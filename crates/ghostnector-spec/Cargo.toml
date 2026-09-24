@@ -1,0 +1,14 @@
+[package]
+name = "ghostnector-spec"
+description = "Shared, OS-independent vocabulary for Ghostnector: profiles, states, exemptions, IPC, and the privileged helper's verb set."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

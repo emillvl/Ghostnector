@@ -1,0 +1,15 @@
+[package]
+name = "ghostnector-policy"
+description = "Turns a validated profile into a ruleset, and proves the ruleset enforces the policy before anything is applied."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+ghostnector-spec = { path = "../ghostnector-spec" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

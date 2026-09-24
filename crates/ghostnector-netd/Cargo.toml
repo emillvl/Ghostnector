@@ -1,0 +1,22 @@
+[package]
+name = "ghostnector-netd"
+description = "The privileged helper. Renders Ghostnector's policy and applies it atomically; it does nothing else."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "ghostnector_netd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ghostnector-netd"
+path = "src/main.rs"
+
+[dependencies]
+ghostnector-spec = { path = "../ghostnector-spec" }
+ghostnector-policy = { path = "../ghostnector-policy" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+nix = { workspace = true }

@@ -1,0 +1,6 @@
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+# Declared so that `cargo check --target x86_64-unknown-linux-gnu` works from
+# Windows: we can type-check the entire Linux backend without a Linux host.
+targets = ["x86_64-unknown-linux-gnu"]

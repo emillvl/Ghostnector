@@ -1,0 +1,18 @@
+# Rust
+target/
+**/*.rs.bk
+
+# Local runtime/state artefacts (never commit; may contain protection intent)
+*.log
+/run/
+state/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local test fixtures that may contain captured environment data
+/testdata/local/

@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ghostnector-spec",
+    "crates/ghostnector-policy",
+    "crates/ghostnector-netd",
+    "crates/ghostnector-core",
+    "crates/ghostnector-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+publish = false
+
+[workspace.dependencies]
+# Portable vocabulary and policy layers
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+proptest = "1"
+
+# Linux backend (M1+)
+netlink-sys = "0.9"
+netlink-packet-core = "0.9"
+netlink-packet-netfilter = "0.4"
+netlink-packet-route = "0.24"
+rtnetlink = "0.23"
+nix = { version = "0.31", features = ["socket", "sched", "fs", "user", "net", "process", "poll"] }
+caps = "0.5"
+
+# Daemons (M2+)
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "signal", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+zbus = "5"
+
+# Release profile: a privileged daemon should fail fast rather than unwind into
+# an unknown state; systemd restarts it and core reconciles from the kernel.
+[profile.release]
+panic = "abort"
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
