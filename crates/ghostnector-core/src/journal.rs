@@ -11,7 +11,6 @@
 //! never a truncated file.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use ghostnector_spec::backend::{Params, ProfileId};
@@ -155,49 +154,17 @@ impl Journal {
 
     /// Write the intent atomically.
     pub fn save(&self, intent: &Intent) -> Result<(), JournalError> {
-        let directory = self.path.parent().ok_or_else(|| JournalError::Io {
-            path: self.path.clone(),
-            reason: "the journal needs a directory".to_string(),
-        })?;
-        fs::create_dir_all(directory).map_err(|error| JournalError::Io {
-            path: directory.to_path_buf(),
-            reason: error.to_string(),
-        })?;
-
-        let encoded = serde_json::to_vec_pretty(intent).map_err(|error| JournalError::Corrupt {
-            path: self.path.clone(),
-            reason: error.to_string(),
-        })?;
-
-        let temporary = self.path.with_extension("tmp");
-        {
-            let mut file = fs::File::create(&temporary).map_err(|error| JournalError::Io {
-                path: temporary.clone(),
+        let mut encoded =
+            serde_json::to_vec_pretty(intent).map_err(|error| JournalError::Corrupt {
+                path: self.path.clone(),
                 reason: error.to_string(),
             })?;
-            file.write_all(&encoded).map_err(|error| JournalError::Io {
-                path: temporary.clone(),
-                reason: error.to_string(),
-            })?;
-            file.write_all(b"\n").ok();
-            // The rename below is only atomic with respect to the file's contents if the contents
-            // have actually reached the disk.
-            file.sync_all().map_err(|error| JournalError::Io {
-                path: temporary.clone(),
-                reason: error.to_string(),
-            })?;
-        }
+        encoded.push(b'\n');
 
-        fs::rename(&temporary, &self.path).map_err(|error| JournalError::Io {
+        crate::fsutil::write_atomic(&self.path, &encoded).map_err(|error| JournalError::Io {
             path: self.path.clone(),
             reason: error.to_string(),
-        })?;
-
-        // Durably record the rename itself, so the file cannot vanish with a power loss.
-        if let Ok(handle) = fs::File::open(directory) {
-            let _ = handle.sync_all();
-        }
-        Ok(())
+        })
     }
 }
 

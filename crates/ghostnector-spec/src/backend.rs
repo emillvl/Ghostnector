@@ -75,6 +75,31 @@ pub struct ResolvedIdentity {
     pub uid: Option<u32>,
 }
 
+/// The ports the policy redirects into.
+///
+/// Reported by the helper so that the control plane can configure the services it supervises with
+/// the *same* numbers the firewall uses. Two sources for one port is how DNS silently stops working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Ports {
+    /// Tor's transparent proxy port.
+    pub trans: u16,
+    /// The DNS chokepoint port.
+    pub chokepoint: u16,
+    /// Tor's SOCKS port.
+    pub socks: u16,
+}
+
+impl Default for Ports {
+    fn default() -> Self {
+        Self {
+            trans: 9040,
+            chokepoint: 9054,
+            socks: 9050,
+        }
+    }
+}
+
 /// What the privileged helper currently has installed.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -87,6 +112,8 @@ pub struct Report {
     pub exemptions: Vec<crate::exemption::Exemption>,
     /// Identities the helper resolved, so the interface can show whose traffic is exempt.
     pub resolved: Vec<ResolvedIdentity>,
+    /// The ports the policy redirects into, so services can be configured to match.
+    pub ports: Ports,
     /// Operational notes that are not failures, for example a skipped conntrack flush.
     pub notes: Vec<String>,
 }

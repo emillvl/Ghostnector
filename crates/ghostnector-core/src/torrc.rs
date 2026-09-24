@@ -15,6 +15,8 @@
 
 use std::path::PathBuf;
 
+use ghostnector_spec::backend::Ports;
+
 /// The settings Ghostnector puts into Tor's configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TorSettings {
@@ -39,13 +41,28 @@ impl Default for TorSettings {
     fn default() -> Self {
         Self {
             trans_port: 9040,
-            dns_port: 9054,
+            // Tor's DNS listener, which is where the DNS chokepoint forwards. It is deliberately
+            // not the chokepoint's own port: see `with_ports`.
+            dns_port: 9053,
             socks_port: 9050,
             control_port: 9051,
             data_directory: PathBuf::from("/var/lib/tor"),
             cookie_path: PathBuf::from("/run/ghostnector/tor-control.cookie"),
             sandbox: true,
         }
+    }
+}
+
+impl TorSettings {
+    /// Adopt the ports the firewall actually redirects into.
+    ///
+    /// Note what is *not* adopted: Tor's `DNSPort` is where the DNS chokepoint forwards to, which is
+    /// a different port from the chokepoint's own listener. Conflating the two would point Tor's
+    /// resolver at the process that was supposed to be pointing at Tor.
+    pub fn with_ports(mut self, ports: Ports) -> Self {
+        self.trans_port = ports.trans;
+        self.socks_port = ports.socks;
+        self
     }
 }
 
@@ -138,7 +155,7 @@ mod tests {
         let text = rendered();
         assert!(text.contains("SocksPort 127.0.0.1:9050"), "{text}");
         assert!(text.contains("TransPort 127.0.0.1:9040"), "{text}");
-        assert!(text.contains("DNSPort 127.0.0.1:9054"), "{text}");
+        assert!(text.contains("DNSPort 127.0.0.1:9053"), "{text}");
         assert!(text.contains("ControlPort 127.0.0.1:9051"), "{text}");
         for line in text.lines().filter(|line| line.contains("Port ")) {
             assert!(
@@ -251,5 +268,25 @@ mod tests {
         let text = rendered();
         assert!(text.contains("IsolateSOCKSAuth"), "{text}");
         assert!(text.contains("KeepAliveIsolateSOCKSAuth"), "{text}");
+    }
+
+    #[test]
+    fn the_firewall_ports_are_adopted_and_tors_dns_port_is_not() {
+        let settings = TorSettings::default().with_ports(Ports {
+            trans: 19040,
+            chokepoint: 19054,
+            socks: 19050,
+        });
+        assert_eq!(settings.trans_port, 19040);
+        assert_eq!(settings.socks_port, 19050);
+        assert_eq!(
+            settings.dns_port,
+            TorSettings::default().dns_port,
+            "Tor's DNS port is where the chokepoint forwards, not the chokepoint's own port"
+        );
+        assert_ne!(
+            settings.dns_port, 19054,
+            "reusing the chokepoint's port would point Tor at the process that points at Tor"
+        );
     }
 }

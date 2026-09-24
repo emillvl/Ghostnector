@@ -18,11 +18,14 @@
 //!   is reported as `Degraded` with verification `Unavailable` — never as `Protected`.
 
 pub mod engine;
+pub mod fsutil;
 pub mod helper;
 pub mod journal;
 pub mod server;
+pub mod services;
 pub mod state;
 pub mod supervisor;
+pub mod torcontrol;
 pub mod torrc;
 
 #[cfg(test)]
@@ -32,8 +35,10 @@ pub use engine::{Engine, EngineConfig, EngineError};
 pub use helper::{Helper, HelperError, HelperLink};
 pub use journal::{Intent, Journal, JournalError};
 pub use server::{bind_socket, Server, ServerError};
+pub use services::{ExternalServices, ServiceError, Services, SystemdServices};
 pub use state::{Cause, Machine, TransitionError};
 pub use supervisor::{ServiceState, Supervisor, SupervisorError, SystemdUnits};
+pub use torcontrol::{Bootstrap, TorControl, TorControlError};
 pub use torrc::TorSettings;
 
 /// The package version.

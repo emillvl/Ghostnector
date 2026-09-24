@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use ghostnector_spec::backend::{Params, ProfileId, Report, Verb};
+use ghostnector_spec::backend::{Params, Ports, ProfileId, Report, Verb};
 use ghostnector_spec::{
     Event, Health, Profile, ProfileError, ProtectionState, Reason, Scope, ServiceHealth, Snapshot,
     ValidProfile, Verification,
@@ -26,6 +26,7 @@ use ghostnector_spec::{
 use crate::helper::{HelperError, HelperLink};
 use crate::journal::{Intent, Journal, JournalError};
 use crate::now_unix;
+use crate::services::{ServiceError, Services};
 use crate::state::{Cause, Machine, TransitionError};
 
 /// Where the intent file lives on a real system.
@@ -70,12 +71,16 @@ pub enum EngineError {
     /// The journal could not be read or written.
     #[error("{0}")]
     Journal(#[from] JournalError),
+    /// A service the profile needs could not be brought up.
+    #[error("{0}")]
+    Services(#[from] ServiceError),
 }
 
 /// The control plane.
 pub struct Engine {
     machine: Mutex<Machine>,
     helper: Arc<dyn HelperLink>,
+    services: Arc<dyn Services>,
     journal: Journal,
     last_report: Mutex<Report>,
     requested: Mutex<Option<Profile>>,
@@ -85,10 +90,15 @@ pub struct Engine {
 
 impl Engine {
     /// Build an engine around a helper link.
-    pub fn new(config: EngineConfig, helper: Arc<dyn HelperLink>) -> Self {
+    pub fn new(
+        config: EngineConfig,
+        helper: Arc<dyn HelperLink>,
+        services: Arc<dyn Services>,
+    ) -> Self {
         Self {
             machine: Mutex::new(Machine::new()),
             helper,
+            services,
             journal: Journal::new(config.journal_path),
             last_report: Mutex::new(Report::default()),
             requested: Mutex::new(None),
@@ -161,21 +171,21 @@ impl Engine {
         )?;
         self.publish();
 
-        match self.apply_deny_first(target, &params) {
+        match self.bring_up_then_open(target, &params) {
             Ok(report) => {
                 self.remember_report(report);
                 *self.lock_requested() = Some(requested);
-                self.set_state(
-                    ProtectionState::Degraded,
-                    Cause::Automatic,
-                    vec![
-                        Reason::new(format!("{target:?} is applied")),
-                        Reason::new(
-                            "nothing has verified this yet, so it is reported as degraded rather \
-                             than protected",
-                        ),
-                    ],
-                )?;
+                let mut reasons = vec![
+                    Reason::new(format!("{target:?} is applied")),
+                    Reason::new(
+                        "nothing has verified this yet, so it is reported as degraded rather \
+                         than protected",
+                    ),
+                ];
+                // Anything the services want the user to know belongs in the state, not in a log
+                // line nobody reads.
+                reasons.extend(self.services.notes(target).into_iter().map(Reason::new));
+                self.set_state(ProtectionState::Degraded, Cause::Automatic, reasons)?;
                 self.record_intent(Intent::requested(
                     target,
                     params,
@@ -186,7 +196,7 @@ impl Engine {
                 Ok(())
             }
             Err(error) => {
-                self.roll_back_failed_connect(&error);
+                self.roll_back_failed_connect(target, &error);
                 Err(error)
             }
         }
@@ -194,12 +204,19 @@ impl Engine {
 
     /// Return to the captured baseline, because the user asked for it.
     pub fn disconnect(&self) -> Result<(), EngineError> {
-        match self.helper.invoke(Verb::Revert)? {
-            answer => {
-                let report = report_from(answer)?;
-                self.remember_report(report);
+        // Stop what we started first. With the policy gone the service would have no exemption and
+        // would be blocked anyway, which looks like a failure rather than a shutdown.
+        let profile = self.lock_report().profile;
+        if let Some(profile) = profile {
+            if let Err(error) = self.services.stand_down(profile) {
+                self.add_note(format!(
+                    "stopping the services did not finish cleanly: {error}"
+                ));
             }
         }
+
+        let report = report_from(self.helper.invoke(Verb::Revert)?)?;
+        self.remember_report(report);
         self.set_state(
             ProtectionState::Off,
             Cause::UserRequested,
@@ -318,12 +335,32 @@ impl Engine {
 
     // ---------------------------------------------------------------- internals
 
-    /// Deny before opening anything, then open exactly what was asked for.
-    fn apply_deny_first(&self, target: ProfileId, params: &Params) -> Result<Report, EngineError> {
+    /// Deny before opening anything, bring up what the profile needs, then open exactly what was
+    /// asked for.
+    ///
+    /// The order is the security property (DR-4): the machine is denied while Tor bootstraps, and
+    /// Tor can bootstrap because the baseline exempts its uid. Nothing is opened until the service
+    /// says it is ready.
+    fn bring_up_then_open(
+        &self,
+        target: ProfileId,
+        params: &Params,
+    ) -> Result<Report, EngineError> {
         if target != ProfileId::FailClosed {
             self.apply(ProfileId::FailClosed, &Params::default())?;
         }
+
+        // The ports come from the helper, so Tor is configured with the same numbers the firewall
+        // redirects into. Two sources for one port is how DNS silently stops working.
+        let ports = self.helper_ports()?;
+        self.services.bring_up(target, ports)?;
+
         self.apply(target, params)
+    }
+
+    /// Ask the helper which ports its policy redirects into.
+    fn helper_ports(&self) -> Result<Ports, EngineError> {
+        Ok(report_from(self.helper.invoke(Verb::Report)?)?.ports)
     }
 
     fn apply(&self, profile: ProfileId, params: &Params) -> Result<Report, EngineError> {
@@ -344,7 +381,15 @@ impl Engine {
     /// enforces that. But withdrawal has to *succeed* before the machine may claim to be
     /// unprotected: if the policy cannot be withdrawn, the honest report is that the machine is
     /// still denied, not that it is open.
-    fn roll_back_failed_connect(&self, error: &EngineError) {
+    fn roll_back_failed_connect(&self, target: ProfileId, error: &EngineError) {
+        // Whatever was started for an attempt that failed should not be left running for a
+        // protection that never happened.
+        if let Err(stop_error) = self.services.stand_down(target) {
+            self.add_note(format!(
+                "stopping the services did not finish cleanly: {stop_error}"
+            ));
+        }
+
         let withdrawn = match self.helper.invoke(Verb::Revert) {
             Ok(answer) => report_from(answer)
                 .map(|report| !report.applied)
@@ -541,11 +586,11 @@ fn profile_of(id: ProfileId) -> Option<Profile> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::MockHelper;
+    use crate::testing::{MockHelper, MockServices};
 
     const USER_UID: u32 = 1000;
 
-    fn engine_with(helper: Arc<MockHelper>) -> (Engine, PathBuf) {
+    fn engine_with(helper: Arc<MockHelper>, services: Arc<MockServices>) -> (Engine, PathBuf) {
         let directory = std::env::temp_dir().join(format!(
             "ghostnector-engine-{}-{:?}",
             std::process::id(),
@@ -555,14 +600,23 @@ mod tests {
         let engine = Engine::new(
             EngineConfig { journal_path: path },
             helper as Arc<dyn HelperLink>,
+            services as Arc<dyn Services>,
         );
         (engine, directory)
     }
 
     fn engine() -> (Arc<MockHelper>, Engine, PathBuf) {
         let helper = Arc::new(MockHelper::new());
-        let (engine, directory) = engine_with(Arc::clone(&helper));
+        let services = Arc::new(MockServices::new());
+        let (engine, directory) = engine_with(Arc::clone(&helper), Arc::clone(&services));
         (helper, engine, directory)
+    }
+
+    fn engine_and_services() -> (Arc<MockHelper>, Arc<MockServices>, Engine, PathBuf) {
+        let helper = Arc::new(MockHelper::new());
+        let services = Arc::new(MockServices::new());
+        let (engine, directory) = engine_with(Arc::clone(&helper), Arc::clone(&services));
+        (helper, services, engine, directory)
     }
 
     fn system_tor_profile() -> Profile {
@@ -762,7 +816,7 @@ mod tests {
     #[test]
     fn a_restart_when_the_helper_is_unreachable_does_not_invent_a_state() {
         let helper = Arc::new(MockHelper::unreachable());
-        let (engine, _dir) = engine_with(Arc::clone(&helper));
+        let (engine, _dir) = engine_with(Arc::clone(&helper), Arc::new(MockServices::new()));
         assert!(
             engine.reconcile().is_err(),
             "an unreachable helper is an error"
@@ -862,5 +916,100 @@ mod tests {
             verb,
             Verb::ApplyProfile { profile, .. } if *profile == ProfileId::DnsLockdown
         )));
+    }
+
+    #[test]
+    fn connecting_denies_before_it_starts_anything_or_opens_anything() {
+        let (helper, services, engine, _dir) = engine_and_services();
+        engine
+            .connect(system_tor_profile(), USER_UID)
+            .expect("connect");
+
+        let sequence: Vec<String> = helper
+            .verbs()
+            .iter()
+            .map(|verb| match verb {
+                Verb::ApplyProfile { profile, .. } => format!("apply:{profile:?}"),
+                Verb::Report => "report".to_string(),
+                Verb::Revert => "revert".to_string(),
+                Verb::FlushConntrack => "flush".to_string(),
+                Verb::Hello { .. } => "hello".to_string(),
+            })
+            .collect();
+        assert_eq!(
+            sequence,
+            vec![
+                "apply:FailClosed".to_string(),
+                // The ports come from the helper, so Tor is configured to match the firewall.
+                "report".to_string(),
+                "apply:TorSystem".to_string(),
+            ],
+            "the baseline must be applied before the services start, and before anything is opened"
+        );
+        assert_eq!(services.brought_up(), vec![ProfileId::TorSystem]);
+    }
+
+    #[test]
+    fn a_service_that_will_not_come_up_leaves_the_machine_unprotected_and_says_so() {
+        let (helper, services, engine, _dir) = engine_and_services();
+        services.fail_bring_up_with("Tor did not become usable");
+
+        let error = engine
+            .connect(system_tor_profile(), USER_UID)
+            .expect_err("connect must fail");
+        assert!(
+            error.to_string().contains("did not become usable"),
+            "{error}"
+        );
+
+        assert_eq!(engine.snapshot().state, ProtectionState::Off);
+        assert!(
+            !Journal::new(engine.journal_path())
+                .load()
+                .expect("load")
+                .protected,
+            "a failed connect must not claim protection"
+        );
+        assert_eq!(
+            services.stood_down(),
+            vec![ProfileId::TorSystem],
+            "services must not be left running for a protection that never happened"
+        );
+        assert!(
+            helper
+                .verbs()
+                .iter()
+                .any(|verb| matches!(verb, Verb::Revert)),
+            "the baseline applied on the way in must be withdrawn"
+        );
+    }
+
+    #[test]
+    fn service_notes_reach_the_reported_state() {
+        let (_helper, services, engine, _dir) = engine_and_services();
+        services.add_note("the resolver's health cannot be checked yet");
+        engine
+            .connect(system_tor_profile(), USER_UID)
+            .expect("connect");
+        assert!(
+            engine
+                .snapshot()
+                .reasons
+                .iter()
+                .any(|reason| reason.as_str().contains("cannot be checked yet")),
+            "{:?}",
+            engine.snapshot().reasons
+        );
+    }
+
+    #[test]
+    fn disconnecting_stops_what_was_started() {
+        let (_helper, services, engine, _dir) = engine_and_services();
+        engine
+            .connect(system_tor_profile(), USER_UID)
+            .expect("connect");
+        engine.disconnect().expect("disconnect");
+        assert_eq!(services.stood_down(), vec![ProfileId::TorSystem]);
+        assert_eq!(engine.snapshot().state, ProtectionState::Off);
     }
 }

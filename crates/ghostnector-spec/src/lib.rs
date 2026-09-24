@@ -22,7 +22,7 @@ pub mod ipc;
 pub mod profile;
 pub mod state;
 
-pub use backend::{Params, ProfileId, Report, ResolvedIdentity, Verb};
+pub use backend::{Params, Ports, ProfileId, Report, ResolvedIdentity, Verb};
 pub use exemption::{Exemption, ExemptionKind};
 pub use ipc::{
     ErrorBody, ErrorCode, Event, Frame, HelperResponse, Request, Response, PROTOCOL_VERSION,

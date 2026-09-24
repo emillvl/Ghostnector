@@ -2,12 +2,13 @@
 
 use std::sync::Mutex;
 
-use ghostnector_spec::backend::{ProfileId, Report, Verb};
+use ghostnector_spec::backend::{Ports, ProfileId, Report, Verb};
 use ghostnector_spec::exemption::tor_baseline;
 use ghostnector_spec::ipc::{ErrorCode, HelperResponse, PROTOCOL_VERSION};
 use ghostnector_spec::ResolvedIdentity;
 
 use crate::helper::{HelperError, HelperLink};
+use crate::services::{ServiceError, Services};
 
 /// A helper that records what it was asked, and can be told to fail in specific ways.
 #[derive(Debug, Default)]
@@ -88,6 +89,7 @@ impl MockHelper {
                 name: "debian-tor".to_string(),
                 uid: Some(987),
             }],
+            ports: Ports::default(),
             notes: Vec::new(),
         }
     }
@@ -146,5 +148,60 @@ impl HelperLink for MockHelper {
             }),
             Verb::Report => Ok(HelperResponse::Report(self.report())),
         }
+    }
+}
+
+/// Services that record what they were asked to do.
+#[derive(Debug, Default)]
+pub struct MockServices {
+    brought_up: Mutex<Vec<ProfileId>>,
+    stood_down: Mutex<Vec<ProfileId>>,
+    fail_bring_up: Mutex<Option<String>>,
+    notes: Mutex<Vec<String>>,
+}
+
+impl MockServices {
+    /// Services that work.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Every profile whose services were brought up, in order.
+    pub fn brought_up(&self) -> Vec<ProfileId> {
+        self.brought_up.lock().expect("mock lock").clone()
+    }
+
+    /// Every profile whose services were stood down, in order.
+    pub fn stood_down(&self) -> Vec<ProfileId> {
+        self.stood_down.lock().expect("mock lock").clone()
+    }
+
+    /// Fail the next bring-up with this message.
+    pub fn fail_bring_up_with(&self, message: &str) {
+        *self.fail_bring_up.lock().expect("mock lock") = Some(message.to_string());
+    }
+
+    /// Attach a note, as a real implementation does when something cannot be checked.
+    pub fn add_note(&self, note: &str) {
+        self.notes.lock().expect("mock lock").push(note.to_string());
+    }
+}
+
+impl Services for MockServices {
+    fn bring_up(&self, profile: ProfileId, _ports: Ports) -> Result<(), ServiceError> {
+        if let Some(message) = self.fail_bring_up.lock().expect("mock lock").clone() {
+            return Err(ServiceError::Config(message));
+        }
+        self.brought_up.lock().expect("mock lock").push(profile);
+        Ok(())
+    }
+
+    fn stand_down(&self, profile: ProfileId) -> Result<(), ServiceError> {
+        self.stood_down.lock().expect("mock lock").push(profile);
+        Ok(())
+    }
+
+    fn notes(&self, _profile: ProfileId) -> Vec<String> {
+        self.notes.lock().expect("mock lock").clone()
     }
 }

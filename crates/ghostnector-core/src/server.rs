@@ -294,7 +294,9 @@ fn error(code: ErrorCode, message: impl Into<String>) -> Response {
 fn error_body(error: &EngineError) -> ErrorBody {
     let code = match error {
         EngineError::InvalidProfile(_) | EngineError::NotSupported(_) => ErrorCode::InvalidProfile,
-        EngineError::Helper(_) | EngineError::NotApplied => ErrorCode::BackendFailure,
+        EngineError::Helper(_) | EngineError::NotApplied | EngineError::Services(_) => {
+            ErrorCode::BackendFailure
+        }
         EngineError::Transition(_) => ErrorCode::UnsafeState,
         EngineError::Protocol(_) | EngineError::Journal(_) => ErrorCode::Internal,
     };
@@ -401,7 +403,7 @@ pub fn bind_socket(path: &Path, group: Option<u32>) -> Result<UnixListener, Serv
 mod tests {
     use super::*;
     use crate::engine::EngineConfig;
-    use crate::testing::MockHelper;
+    use crate::testing::{MockHelper, MockServices};
     use ghostnector_spec::{Networks, Profile, Scope};
     use std::sync::Arc;
 
@@ -428,6 +430,7 @@ mod tests {
                 journal_path: directory.join("intent.json"),
             },
             Arc::clone(&helper) as Arc<dyn crate::helper::HelperLink>,
+            Arc::new(MockServices::new()) as Arc<dyn crate::services::Services>,
         ));
         let server = Arc::new(Server::new(Arc::clone(&engine)));
         Fixture {

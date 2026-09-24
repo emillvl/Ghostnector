@@ -23,7 +23,7 @@ use std::thread;
 use std::time::Duration;
 
 use ghostnector_policy::{compile, render_replace_script, render_revert_script, Environment};
-use ghostnector_spec::backend::{Params, ProfileId, Report, ResolvedIdentity, Verb};
+use ghostnector_spec::backend::{Params, Ports, ProfileId, Report, ResolvedIdentity, Verb};
 use ghostnector_spec::exemption::Exemption;
 use ghostnector_spec::ipc::{ErrorBody, ErrorCode, HelperResponse, PROTOCOL_VERSION};
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
@@ -107,6 +107,13 @@ impl<B: Backend + 'static, I: Identities + 'static> Server<B, I> {
             profile: guard.profile,
             exemptions: guard.exemptions.clone(),
             resolved: self.resolved_identities(),
+            // Reported so the control plane can configure Tor with the same numbers the policy
+            // redirects into.
+            ports: Ports {
+                trans: self.config.trans_port,
+                chokepoint: self.config.chokepoint_port,
+                socks: self.config.socks_port,
+            },
             notes: guard.notes.clone(),
         }
     }
@@ -526,6 +533,16 @@ mod tests {
         assert!(body.contains("\"result\":\"applied\""), "{body}");
         assert!(body.contains("system-user:tor"), "{body}");
         assert!(body.contains("\"applied\":true"), "{body}");
+    }
+
+    #[test]
+    fn the_report_carries_the_ports_the_policy_uses() {
+        // Core configures the services it supervises from these, so they must be the live values.
+        let (_backend, server) = server();
+        let report = server.report();
+        assert_eq!(report.ports.trans, server.config().trans_port);
+        assert_eq!(report.ports.chokepoint, server.config().chokepoint_port);
+        assert_eq!(report.ports.socks, server.config().socks_port);
     }
 
     #[test]

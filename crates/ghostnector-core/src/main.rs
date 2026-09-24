@@ -5,15 +5,28 @@
 
 #[cfg(unix)]
 mod inner {
+    use std::net::{Ipv4Addr, SocketAddr};
     use std::path::PathBuf;
     use std::process::ExitCode;
     use std::sync::Arc;
+    use std::time::Duration;
 
-    use ghostnector_core::{bind_socket, Engine, EngineConfig, Helper, Server, VERSION};
+    use ghostnector_core::{
+        bind_socket, Engine, EngineConfig, ExternalServices, Helper, Server, Services,
+        SystemdServices, SystemdUnits, TorControl, TorSettings, VERSION,
+    };
 
     const DEFAULT_HELPER: &str = "/run/ghostnector/netd.sock";
     const DEFAULT_SOCKET: &str = "/run/ghostnector/core.sock";
     const DEFAULT_JOURNAL: &str = "/var/lib/ghostnector/intent.json";
+    const DEFAULT_SYSTEMCTL: &str = "/usr/bin/systemctl";
+    const DEFAULT_TOR_UNIT: &str = "ghostnector-tor.service";
+    const DEFAULT_TORRC: &str = "/run/ghostnector/torrc";
+    const DEFAULT_TOR_DATA: &str = "/var/lib/tor";
+    const DEFAULT_TOR_COOKIE: &str = "/run/ghostnector/tor-control.cookie";
+    const DEFAULT_TOR_CONTROL_PORT: u16 = 9051;
+    const DEFAULT_TOR_DNS_PORT: u16 = 9053;
+    const DEFAULT_TOR_BUDGET_SECONDS: u64 = 120;
 
     const USAGE: &str = "\
 ghostnector-core - the control plane (no privileges)
@@ -31,14 +44,46 @@ OPTIONS:
                                           [default: /var/lib/ghostnector/intent.json]
     --group <NAME>      group allowed to talk to this socket; without it, only
                         the uid running the daemon can connect
+
+  Tor supervision:
+    --services <MODE>   'systemd' to start and stop Tor ourselves, 'external' if
+                        the operator runs Tor and we only wait for it
+                                                          [default: systemd]
+    --systemctl <PATH>  the service manager to use     [default: /usr/bin/systemctl]
+    --tor-unit <NAME>   the unit that runs Tor [default: ghostnector-tor.service]
+    --torrc <PATH>      where Tor's configuration is written
+                                              [default: /run/ghostnector/torrc]
+    --tor-data-dir <PATH>   Tor's data directory           [default: /var/lib/tor]
+    --tor-cookie <PATH>     Tor's control cookie
+                                   [default: /run/ghostnector/tor-control.cookie]
+    --tor-control-port <PORT>   Tor's control port           [default: 9051]
+    --tor-dns-port <PORT>       Tor's DNS listener, which the DNS chokepoint
+                                forwards to                      [default: 9053]
+    --tor-bootstrap-seconds <SECONDS>   how long to wait for Tor [default: 120]
+
     -h, --help          print this text
     -V, --version       print the version";
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ServicesMode {
+        Systemd,
+        External,
+    }
 
     struct Config {
         socket: PathBuf,
         helper: PathBuf,
         journal: PathBuf,
         group: Option<String>,
+        services: ServicesMode,
+        systemctl: PathBuf,
+        tor_unit: String,
+        torrc: PathBuf,
+        tor_data: PathBuf,
+        tor_cookie: PathBuf,
+        tor_control_port: u16,
+        tor_dns_port: u16,
+        tor_budget: Duration,
     }
 
     pub fn main() -> ExitCode {
@@ -80,11 +125,13 @@ OPTIONS:
         };
 
         let helper = Helper::new(config.helper.clone());
+        let services = build_services(&config)?;
         let engine = Arc::new(Engine::new(
             EngineConfig {
                 journal_path: config.journal.clone(),
             },
             Arc::new(helper),
+            services,
         ));
 
         // Reconcile before serving: the kernel's answer, not ours, decides what is enforced.
@@ -106,6 +153,37 @@ OPTIONS:
         server.serve(listener).map_err(|error| error.to_string())
     }
 
+    fn build_services(config: &Config) -> Result<Arc<dyn Services>, String> {
+        let tor = TorControl::new(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, config.tor_control_port)),
+            config.tor_cookie.clone(),
+            Duration::from_secs(10),
+        );
+        let settings = TorSettings {
+            dns_port: config.tor_dns_port,
+            control_port: config.tor_control_port,
+            data_directory: config.tor_data.clone(),
+            cookie_path: config.tor_cookie.clone(),
+            ..TorSettings::default()
+        };
+
+        match config.services {
+            ServicesMode::Systemd => {
+                let supervisor = SystemdUnits::new(config.systemctl.clone())
+                    .map_err(|error| error.to_string())?;
+                Ok(Arc::new(SystemdServices::new(
+                    Arc::new(supervisor),
+                    tor,
+                    config.tor_unit.clone(),
+                    config.torrc.clone(),
+                    settings,
+                    config.tor_budget,
+                )))
+            }
+            ServicesMode::External => Ok(Arc::new(ExternalServices::new(tor, config.tor_budget))),
+        }
+    }
+
     fn parse<I>(arguments: I) -> Result<Config, String>
     where
         I: Iterator<Item = String>,
@@ -114,6 +192,15 @@ OPTIONS:
         let mut helper = PathBuf::from(DEFAULT_HELPER);
         let mut journal = PathBuf::from(DEFAULT_JOURNAL);
         let mut group: Option<String> = None;
+        let mut services = ServicesMode::Systemd;
+        let mut systemctl = PathBuf::from(DEFAULT_SYSTEMCTL);
+        let mut tor_unit = DEFAULT_TOR_UNIT.to_string();
+        let mut torrc = PathBuf::from(DEFAULT_TORRC);
+        let mut tor_data = PathBuf::from(DEFAULT_TOR_DATA);
+        let mut tor_cookie = PathBuf::from(DEFAULT_TOR_COOKIE);
+        let mut tor_control_port = DEFAULT_TOR_CONTROL_PORT;
+        let mut tor_dns_port = DEFAULT_TOR_DNS_PORT;
+        let mut tor_budget = Duration::from_secs(DEFAULT_TOR_BUDGET_SECONDS);
 
         let mut arguments = arguments.peekable();
         while let Some(option) = arguments.next() {
@@ -126,6 +213,10 @@ OPTIONS:
                 "--socket" => socket = Some(absolute(&option, value()?)?),
                 "--helper" => helper = absolute(&option, value()?)?,
                 "--journal" => journal = absolute(&option, value()?)?,
+                "--systemctl" => systemctl = absolute(&option, value()?)?,
+                "--torrc" => torrc = absolute(&option, value()?)?,
+                "--tor-data-dir" => tor_data = absolute(&option, value()?)?,
+                "--tor-cookie" => tor_cookie = absolute(&option, value()?)?,
                 "--group" => {
                     let name = value()?;
                     if name.is_empty() || name.len() > 32 {
@@ -134,6 +225,44 @@ OPTIONS:
                         ));
                     }
                     group = Some(name);
+                }
+                "--services" => {
+                    services = match value()?.as_str() {
+                        "systemd" => ServicesMode::Systemd,
+                        "external" => ServicesMode::External,
+                        other => {
+                            return Err(format!(
+                                "value for '{option}' is not usable: expected systemd or \
+                                 external, found '{other}'"
+                            ))
+                        }
+                    }
+                }
+                "--tor-unit" => {
+                    let unit = value()?;
+                    if unit.is_empty()
+                        || unit.starts_with('-')
+                        || !unit.chars().all(|c| {
+                            c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@')
+                        })
+                    {
+                        return Err(format!("value for '{option}' is not usable: bad unit name"));
+                    }
+                    tor_unit = unit;
+                }
+                "--tor-control-port" => tor_control_port = port(&option, &value()?)?,
+                "--tor-dns-port" => tor_dns_port = port(&option, &value()?)?,
+                "--tor-bootstrap-seconds" => {
+                    let raw = value()?;
+                    let seconds: u64 = raw.parse().map_err(|_| {
+                        format!("value for '{option}' is not usable: expected a number of seconds")
+                    })?;
+                    if seconds == 0 || seconds > 3600 {
+                        return Err(format!(
+                            "value for '{option}' is not usable: expected 1 to 3600 seconds"
+                        ));
+                    }
+                    tor_budget = Duration::from_secs(seconds);
                 }
                 other => return Err(format!("unknown option '{other}'\n\n{USAGE}")),
             }
@@ -144,6 +273,15 @@ OPTIONS:
             helper,
             journal,
             group,
+            services,
+            systemctl,
+            tor_unit,
+            torrc,
+            tor_data,
+            tor_cookie,
+            tor_control_port,
+            tor_dns_port,
+            tor_budget,
         })
     }
 
@@ -154,6 +292,18 @@ OPTIONS:
             ));
         }
         Ok(PathBuf::from(raw))
+    }
+
+    fn port(option: &str, raw: &str) -> Result<u16, String> {
+        let port: u16 = raw
+            .parse()
+            .map_err(|_| format!("value for '{option}' is not usable: expected a port"))?;
+        if port == 0 {
+            return Err(format!(
+                "value for '{option}' is not usable: port 0 is not usable"
+            ));
+        }
+        Ok(port)
     }
 }
 

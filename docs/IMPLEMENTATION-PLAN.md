@@ -97,7 +97,8 @@ README), multi-host routing, TUN/userspace-forwarding applier, ODoH resolver sel
 | M0 | **done and verified** — 28 unit tests pass (executed on Windows before Smart App Control started blocking local test binaries), `clippy -D warnings` clean, `check --target x86_64-unknown-linux-gnu` clean |
 | M1 | **done and verified** — ruleset IR, 20-class invariant checker, profile compiler, nftables renderer pinned by golden files, and `netd`, the privileged helper. Evidence: 110 unit tests, 5 kernel-level policy tests, and an end-to-end socket test, all green in WSL2; `clippy -D warnings` clean on Windows and the Linux target |
 | M2 | **done and verified** — `ghostnector-core` (state machine with the DR-15 guard, atomic intent journal, IPC server) and `ghostnector-cli`. Evidence: 161 unit tests, plus `scripts/core-cli-test.sh` proving cli → core → netd → kernel end to end, that an unauthorised client is refused, and that a restart with protection requested but nothing applied fails closed |
-| M3 | next — Tor service supervision, bootstrap wait, health reporting |
+| M3 | **in progress** — Tor's configuration and supervision are in place: a `torrc` renderer whose tests refuse the settings that trade privacy for speed, `systemd`/`external` service supervision, a cookie-authenticated read-only control-port client, and a connect sequence of *deny → bring up → wait for bootstrap → open*. Core derives Tor's ports from the helper's report, so the firewall and the service cannot disagree. Remaining for M3: observing a real Tor, and health in the interface |
+| M4 | next — resolver ownership: the DNS chokepoint and the three resolver environments |
 
 ### What M1 built (`crates/ghostnector-netd`)
 
@@ -149,6 +150,10 @@ because it teaches you to ignore failures.
 
 - Windows: Rust 1.98.1 (MSVC), Linux target std installed. Use for `fmt`, `clippy`, `check
   --target x86_64-unknown-linux-gnu`. **Cannot execute test binaries** (R9).
+- **`clippy` alone is not enough for the unix-gated crates.** `ghostnector-netd`, `-core`, and `-cli`
+  are `#![cfg(unix)]`, so on Windows they compile to nothing and clippy passes trivially. The real
+  static check is `cargo check --workspace --all-targets --target x86_64-unknown-linux-gnu`; run it
+  before believing anything is green.
 - WSL2: Ubuntu 24.04.5 LTS, kernel 6.18.33.2-microsoft-standard-WSL2, systemd running, cgroup v2.
   Use for all test execution.
 - Builds from `/mnt/c` are slow; keep artefacts inside the VM:

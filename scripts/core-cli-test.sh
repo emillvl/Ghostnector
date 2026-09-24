@@ -4,15 +4,21 @@
 #
 #   ghostnector (CLI)  ->  ghostnector-core  ->  ghostnector-netd  ->  kernel
 #
+# Tor is stubbed rather than real: systemd is not namespaced, so a unit started here would run
+# outside the namespace, and a real Tor bootstrap needs the public network and half a minute. The
+# stub speaks Tor's control protocol from inside the namespace, which is exactly what the control
+# plane talks to. It is configured with --services external, meaning "the operator runs Tor, we only
+# wait for it to be ready" - a real deployment mode, not a test backdoor.
+#
 # What it proves:
 #   1. a client that is not allowed to talk to the control plane is refused
-#   2. connect applies the policy, and the kernel really has it
+#   2. connect brings the service up, and the kernel really has the policy
 #   3. the state is reported as protected-but-unverified, never as "protected and verified"
 #   4. panic leaves the machine denied, and disconnect returns it to the baseline
 #   5. a restart that finds protection requested but nothing applied fails closed rather than
 #      quietly returning to the clearnet
 #
-# Requires: root, iproute2, nftables, setpriv (util-linux).
+# Requires: root, iproute2, nftables, python3, setpriv (util-linux).
 
 set -euo pipefail
 
@@ -23,20 +29,24 @@ BINDIR="/tmp/gh-bin"
 WORKDIR="/tmp/gh-core-test"
 CORE_USER="ghostnector-core"
 OUTSIDER="ghostnector-outsider"
+CONTROL_PORT="9051"
+FAKE_TOR="/tmp/gh-fake-tor.py"
 NETD_PID=""
 CORE_PID=""
+TOR_PID=""
 
 cleanup() {
     [ -n "$CORE_PID" ] && kill "$CORE_PID" 2>/dev/null || true
     [ -n "$NETD_PID" ] && kill "$NETD_PID" 2>/dev/null || true
+    [ -n "$TOR_PID" ] && kill "$TOR_PID" 2>/dev/null || true
     ip netns del "$NS" 2>/dev/null || true
-    rm -rf "$BINDIR" "$WORKDIR" "$RUNDIR"
+    rm -rf "$BINDIR" "$WORKDIR" "$RUNDIR" "$FAKE_TOR"
 }
 trap cleanup EXIT
 
 fail() {
     echo "FAIL: $*" >&2
-    for log in /tmp/gh-core.log /tmp/gh-netd-stack.log; do
+    for log in /tmp/gh-core.log /tmp/gh-netd-stack.log /tmp/gh-fake-tor.log; do
         [ -f "$log" ] && { echo "--- $log ---"; cat "$log"; }
     done
     exit 1
@@ -55,7 +65,6 @@ CORE_GID="$(id -g "$CORE_USER")"
 OUTSIDER_UID="$(id -u "$OUTSIDER")"
 OUTSIDER_GID="$(id -g "$OUTSIDER")"
 
-# The build directory belongs to root, so the unprivileged daemon gets its own copy.
 mkdir -p "$BINDIR"
 install -m 0755 "$TARGET_DIR/ghostnector-netd" "$BINDIR/ghostnector-netd"
 install -m 0755 "$TARGET_DIR/ghostnector-core" "$BINDIR/ghostnector-core"
@@ -68,8 +77,13 @@ chown "$CORE_UID" "$WORKDIR"
 chown "$CORE_UID" "$RUNDIR"
 chmod 0755 "$RUNDIR"
 JOURNAL="$WORKDIR/intent.json"
+COOKIE="$WORKDIR/control_auth_cookie"
+head -c 32 /dev/urandom >"$COOKIE"
+chown "$CORE_UID" "$COOKIE"
 
 ip netns add "$NS"
+# A fresh namespace has its loopback down, and Tor's control port is on loopback.
+ip -n "$NS" link set lo up
 
 in_ns() { ip netns exec "$NS" "$@"; }
 as_user() {
@@ -87,6 +101,55 @@ wait_for_socket() {
     return 1
 }
 
+# ---------------------------------------------------------------- a stand-in for Tor
+cat >"$FAKE_TOR" <<'PY'
+import socket, sys, threading
+
+port = int(sys.argv[1])
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("127.0.0.1", port))
+server.listen(16)
+
+READY = (
+    b"250-status/bootstrap-phase=NOTICE BOOTSTRAP PROGRESS=100 TAG=done SUMMARY=\"Done\"\r\n"
+    b"250 OK\r\n"
+)
+
+
+def handle(connection):
+    try:
+        connection.sendall(b"250 OK\r\n")
+        pending = b""
+        while True:
+            chunk = connection.recv(4096)
+            if not chunk:
+                return
+            pending += chunk
+            while b"\n" in pending:
+                line, pending = pending.split(b"\n", 1)
+                command = line.strip().upper()
+                if command.startswith(b"AUTHENTICATE"):
+                    connection.sendall(b"250 OK\r\n")
+                elif command.startswith(b"GETINFO STATUS/BOOTSTRAP-PHASE"):
+                    connection.sendall(READY)
+                else:
+                    connection.sendall(b"510 Unrecognized command\r\n")
+    except OSError:
+        pass
+    finally:
+        connection.close()
+
+
+while True:
+    conn, _ = server.accept()
+    threading.Thread(target=handle, args=(conn,), daemon=True).start()
+PY
+
+in_ns python3 "$FAKE_TOR" "$CONTROL_PORT" >/tmp/gh-fake-tor.log 2>&1 &
+TOR_PID=$!
+sleep 0.5
+
 start_stack() {
     in_ns "$BINDIR/ghostnector-netd" --socket "$RUNDIR/netd.sock" --peer-uid "$CORE_UID" \
         >/tmp/gh-netd-stack.log 2>&1 &
@@ -95,6 +158,8 @@ start_stack() {
 
     as_user "$CORE_UID" "$CORE_GID" "$BINDIR/ghostnector-core" \
         --socket "$RUNDIR/core.sock" --helper "$RUNDIR/netd.sock" --journal "$JOURNAL" \
+        --services external --tor-cookie "$COOKIE" --tor-control-port "$CONTROL_PORT" \
+        --tor-bootstrap-seconds 10 \
         >/tmp/gh-core.log 2>&1 &
     CORE_PID=$!
     wait_for_socket "$RUNDIR/core.sock" || fail "the control plane did not start"
@@ -126,7 +191,10 @@ case "$STATUS" in
 *) fail "unexpected initial state: $STATUS" ;;
 esac
 
-CONNECTED="$(cli connect)"
+if ! CONNECTED="$(cli connect 2>&1)"; then
+    echo "$CONNECTED"
+    fail "connect failed"
+fi
 case "$CONNECTED" in
 *"protected, but unverified"*) ok "connect reports protected-but-unverified" ;;
 *) fail "connect did not report a protected state: $CONNECTED" ;;
@@ -134,6 +202,10 @@ esac
 case "$CONNECTED" in
 *"nothing can verify it yet"*) ok "it says plainly that nothing has verified it" ;;
 *) fail "the verification status was not reported: $CONNECTED" ;;
+esac
+case "$CONNECTED" in
+*"managed outside Ghostnector"*) ok "it says who is running Tor" ;;
+*) fail "the service note was missing: $CONNECTED" ;;
 esac
 
 in_ns nft list tables | grep -q ghostnector || fail "the kernel has no policy after connect"
