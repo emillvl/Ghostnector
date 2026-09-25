@@ -11,6 +11,8 @@
 #   2. a connection from uid 0 is refused, even though root may open the file (SO_PEERCRED)
 #   3. the peer can apply a profile, see the kernel-side table in the report, and revert it
 #   4. the kernel really has no table afterwards, and no other table was created
+#   5. the packaged capability set starts the helper and completes a session; without CAP_CHOWN the
+#      socket handoff fails for the expected reason (defect D-23)
 #
 # Requires: root, iproute2, nftables, python3, setpriv (util-linux).
 
@@ -20,16 +22,20 @@ NETD="${1:?usage: netd-socket-test.sh <path-to-ghostnector-netd>}"
 NS="gh-netd-test"
 RUNDIR="/run/ghostnector"
 SOCK="$RUNDIR/netd.sock"
+SOCK_PACKAGED="$RUNDIR/netd-packaged.sock"
+SOCK_NOCHOWN="$RUNDIR/netd-nochown.sock"
 PEER_USER="ghostnector-core"
 OUTSIDER_USER="ghostnector-outsider"
 CLIENT="/tmp/gh-netd-client.py"
 LOG="/tmp/gh-netd.log"
 NETD_PID=""
+PACKAGED_PID=""
 
 cleanup() {
     if [ -n "$NETD_PID" ]; then kill "$NETD_PID" 2>/dev/null || true; fi
+    if [ -n "$PACKAGED_PID" ]; then kill "$PACKAGED_PID" 2>/dev/null || true; fi
     ip netns del "$NS" 2>/dev/null || true
-    rm -f "$SOCK" "$CLIENT"
+    rm -f "$SOCK" "$SOCK_PACKAGED" "$SOCK_NOCHOWN" "$CLIENT"
 }
 trap cleanup EXIT
 
@@ -182,5 +188,56 @@ ok "the kernel has no ghostnector table after revert"
 REMAINING="$(ip netns exec "$NS" nft list tables | wc -l)"
 [ "$REMAINING" = "0" ] || fail "unexpected tables remain: $REMAINING"
 ok "no other tables were created"
+
+# ---------------------------------------------------------------- the packaged capability set
+# D-23: the unit's job includes handing the socket to the control plane, which needs CAP_CHOWN.
+# Both directions are measured here, exactly as appd's gate does for its own unit.
+echo "[5] the packaged capability set is sufficient, and CAP_CHOWN is what hands over the socket"
+ip netns exec "$NS" setpriv --reuid=0 --regid=0 --clear-groups \
+    --bounding-set=-all,+net_admin,+chown \
+    --inh-caps +net_admin --ambient-caps +net_admin \
+    "$NETD" --socket "$SOCK_PACKAGED" --peer-uid "$PEER_UID" >/tmp/gh-netd-packaged.log 2>&1 &
+PACKAGED_PID=$!
+for _ in $(seq 1 50); do
+    [ -S "$SOCK_PACKAGED" ] && break
+    sleep 0.1
+done
+[ -S "$SOCK_PACKAGED" ] || { cat /tmp/gh-netd-packaged.log; fail "the packaged set did not start"; }
+read -r mode owner < <(stat -c '%a %u' "$SOCK_PACKAGED")
+[ "$mode" = "600" ] && [ "$owner" = "$PEER_UID" ] ||
+    fail "the packaged set prepared the socket wrongly: mode $mode owner $owner"
+ok "the packaged capability set hands the socket over (mode 600, owner $PEER_UID)"
+
+PACKAGED_SESSION="$(setpriv --reuid="$PEER_UID" --regid="$PEER_GID" --clear-groups \
+    python3 "$CLIENT" "$SOCK_PACKAGED" full 2>&1)" || {
+    echo "$PACKAGED_SESSION"
+    fail "the peer's session failed under the packaged set"
+}
+case "$PACKAGED_SESSION" in
+*'APPLY {"result":"applied"'*) ok "the policy applies under the packaged set" ;;
+*) fail "apply failed under the packaged set: $PACKAGED_SESSION" ;;
+esac
+kill "$PACKAGED_PID" 2>/dev/null || true
+wait "$PACKAGED_PID" 2>/dev/null || true
+PACKAGED_PID=""
+rm -f "$SOCK_PACKAGED"
+
+# The same set without CAP_CHOWN: the helper must fail closed at the handoff, and it must fail with
+# the socket already restricted (the reorder), not peer-owned with a permissive mode.
+set +e
+timeout 10 ip netns exec "$NS" setpriv --reuid=0 --regid=0 --clear-groups \
+    --bounding-set=-all,+net_admin \
+    --inh-caps +net_admin --ambient-caps +net_admin \
+    "$NETD" --socket "$SOCK_NOCHOWN" --peer-uid "$PEER_UID" >/tmp/gh-netd-nochown.log 2>&1
+RC=$?
+set -e
+[ "$RC" != "0" ] && [ "$RC" != "124" ] ||
+    fail "the helper started without CAP_CHOWN (rc=$RC)"
+grep -q "cannot hand the socket" /tmp/gh-netd-nochown.log ||
+    { cat /tmp/gh-netd-nochown.log; fail "the failure was not the socket handoff"; }
+[ "$(stat -c %a "$SOCK_NOCHOWN")" = "600" ] ||
+    fail "the failed handoff left a permissive socket: $(stat -c %a "$SOCK_NOCHOWN")"
+ok "without CAP_CHOWN the handoff fails closed (EPERM) with the socket already restricted"
+rm -f "$SOCK_NOCHOWN"
 
 echo "PASS: netd socket"

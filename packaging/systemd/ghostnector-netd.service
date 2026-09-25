@@ -19,9 +19,15 @@ ExecStart=/usr/libexec/ghostnector-netd \
     --tor-user debian-tor \
     --dnscrypt-user dnscrypt-proxy
 
-# The whole point of this process is that it holds one capability and nothing else.
+# The whole point of this process is that it holds the least that lets it work.
+#   * CAP_NET_ADMIN writes the policy and flushes conntrack;
+#   * CAP_CHOWN hands the socket to the control plane's uid (the mode is set before the chown, so
+#     CAP_FOWNER is not needed). Defect D-23: without CAP_CHOWN the helper cannot start under
+#     systemd at all.
+# Only CAP_NET_ADMIN is ambient, so the `nft` and `conntrack` tools this helper runs inherit
+# nothing else.
 User=root
-CapabilityBoundingSet=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_CHOWN
 AmbientCapabilities=CAP_NET_ADMIN
 NoNewPrivileges=yes
 

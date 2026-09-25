@@ -28,6 +28,8 @@ pub mod identities;
 pub mod server;
 
 #[cfg(test)]
+pub mod hardening;
+#[cfg(test)]
 pub mod testing;
 
 pub use backend::{Backend, BackendError, NftCli};
