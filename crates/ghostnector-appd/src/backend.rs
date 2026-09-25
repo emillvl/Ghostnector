@@ -606,7 +606,9 @@ impl Namespaces for SystemNamespaces {
 
 /// A tool must be absolute, a regular file, root-owned, and not writable by group or others: an
 /// absolute path is only meaningful if the file behind it cannot be replaced.
-fn check_tool(path: &Path) -> Result<(), BackendError> {
+///
+/// Public so the binary can verify the launch helper before serving a single request.
+pub fn check_tool(path: &Path) -> Result<(), BackendError> {
     let reject = |reason: String| BackendError::ToolUnusable {
         path: path.to_path_buf(),
         reason,

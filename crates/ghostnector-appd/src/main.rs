@@ -27,7 +27,7 @@ fn main() -> std::process::ExitCode {
             println!("ghostnector-appd {VERSION}");
             return ExitCode::SUCCESS;
         }
-        Parsed::Run(config) => config,
+        Parsed::Run(config) => *config,
     };
 
     let backend = match SystemNamespaces::new(
@@ -44,6 +44,12 @@ fn main() -> std::process::ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // The launch helper is executed on behalf of users; verify it before serving anything.
+    if let Err(error) = ghostnector_appd::backend::check_tool(&config.launcher) {
+        eprintln!("ghostnector-appd: {error}");
+        return ExitCode::FAILURE;
+    }
 
     let server = match Server::new(config.clone(), backend) {
         Ok(server) => Arc::new(server),

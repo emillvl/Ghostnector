@@ -34,7 +34,7 @@ mod tests {
             ("KeepCapabilities", "yes"),
             ("NoNewPrivileges", "yes"),
             ("RestrictAddressFamilies", "AF_UNIX AF_NETLINK"),
-            ("RestrictNamespaces", "net"),
+            ("RestrictNamespaces", "net mnt"),
             ("SystemCallFilter", "@system-service"),
             ("ProtectSystem", "strict"),
             ("ReadWritePaths", "/run/ghostnector /run/netns"),
@@ -48,6 +48,9 @@ mod tests {
         }
         if !text.contains("/usr/libexec/ghostnector-appd") {
             problems.push("the unit does not start the helper from /usr/libexec".to_string());
+        }
+        if !text.contains("/usr/libexec/ghostnector-appd-launch") {
+            problems.push("the unit does not name the launch helper".to_string());
         }
 
         // The bounding set may contain exactly the three capabilities the design names. Anything

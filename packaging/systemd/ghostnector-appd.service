@@ -15,6 +15,7 @@ ExecStart=/usr/libexec/ghostnector-appd \
     --socket /run/ghostnector/appd.sock \
     --peer-user ghostnector \
     --state-dir /run/ghostnector/apps \
+    --launcher /usr/libexec/ghostnector-appd-launch \
     --bridge ghbr0 \
     --core 10.200.0.1 \
     --prefix 24 \
@@ -36,7 +37,9 @@ NoNewPrivileges=yes
 
 # It speaks netlink and unix sockets. It never opens an internet socket itself.
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
-RestrictNamespaces=net
+# `net` for the namespaces it owns; `mnt` for the launch helper's private mount namespace, which
+# bind-mounts each group's resolver configuration over /etc/resolv.conf.
+RestrictNamespaces=net mnt
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 RestrictSUIDSGID=yes

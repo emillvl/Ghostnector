@@ -58,6 +58,17 @@ pub enum AppVerb {
         /// The group's id.
         id: u32,
     },
+    /// Prepare a shell session inside one group.
+    ///
+    /// The caller names the intended user (a bounded integer, not a command or a path). The helper
+    /// enforces it against the kernel: the connection that drives the shell must come from exactly
+    /// that uid via `SO_PEERCRED`, so a caller cannot obtain a shell as someone else.
+    Launch {
+        /// The group's id.
+        id: u32,
+        /// The user the session is for.
+        user_uid: u32,
+    },
     /// List every group the helper knows, with no traffic information of any kind.
     ReportRegistry,
     /// Destroy every group and the bridge: the APP-scope equivalent of reverting the policy.
@@ -142,6 +153,14 @@ pub enum AppResponse {
         /// The first difference, or a note when there is none. Policy text only.
         detail: String,
     },
+    /// A shell session is prepared.
+    Launched {
+        /// The group the session belongs to.
+        entry: AppEntry,
+        /// The socket the intended user connects to. Derived by the helper from its own state
+        /// directory and the group id; never accepted from a client.
+        socket: String,
+    },
     /// The answer to [`AppVerb::ReportRegistry`].
     Report(AppReport),
     /// The verb failed.
@@ -173,6 +192,14 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&AppVerb::Verify { id: 7 }).unwrap(),
             r#"{"verb":"verify","id":7}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&AppVerb::Launch {
+                id: 7,
+                user_uid: 1000
+            })
+            .unwrap(),
+            r#"{"verb":"launch","id":7,"user_uid":1000}"#
         );
         assert_eq!(
             serde_json::to_string(&AppVerb::ReportRegistry).unwrap(),
@@ -214,6 +241,10 @@ mod tests {
             AppVerb::Destroy { id: 1 },
             AppVerb::Inspect { id: 1 },
             AppVerb::Verify { id: 1 },
+            AppVerb::Launch {
+                id: 1,
+                user_uid: 1000,
+            },
             AppVerb::ReportRegistry,
             AppVerb::Revert,
         ];
@@ -242,6 +273,16 @@ mod tests {
             AppResponse::Verified {
                 matches: true,
                 detail: "the namespace is the one that was installed".to_string(),
+            },
+            AppResponse::Launched {
+                entry: AppEntry {
+                    id: 1,
+                    owner_uid: 1000,
+                    address: Ipv4Addr::new(10, 200, 0, 2),
+                    created_at: 1,
+                    present: true,
+                },
+                socket: "/run/ghostnector/apps/1/stdio.sock".to_string(),
             },
             AppResponse::Report(AppReport::default()),
         ];

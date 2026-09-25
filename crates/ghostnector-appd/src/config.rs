@@ -17,6 +17,8 @@ pub const DEFAULT_NFT: &str = "/usr/sbin/nft";
 pub const DEFAULT_IP: &str = "/usr/sbin/ip";
 /// Default path of the bridge control tool (port isolation).
 pub const DEFAULT_BRIDGE_CTL: &str = "/usr/sbin/bridge";
+/// Default path of the privilege-dropping launch helper.
+pub const DEFAULT_LAUNCHER: &str = "/usr/libexec/ghostnector-appd-launch";
 /// Default state directory: the registry and one directory per group.
 pub const DEFAULT_STATE_DIR: &str = "/run/ghostnector/apps";
 
@@ -33,6 +35,8 @@ pub struct Config {
     pub ip: PathBuf,
     /// Absolute path to `bridge` (used only for port isolation).
     pub bridge_ctl: PathBuf,
+    /// Absolute path to the privilege-dropping launch helper.
+    pub launcher: PathBuf,
     /// Where the registry and per-group files live.
     pub state_dir: PathBuf,
     /// The bridge carrying app links.
@@ -51,7 +55,7 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Parsed {
     /// Run with this configuration.
-    Run(Config),
+    Run(Box<Config>),
     /// Print usage and exit successfully.
     Help,
     /// Print the version and exit successfully.
@@ -98,6 +102,7 @@ OPTIONS:
     --nft <PATH>           policy tool                [default: /usr/sbin/nft]
     --ip <PATH>            network tool               [default: /usr/sbin/ip]
     --bridge-ctl <PATH>    bridge control tool        [default: /usr/sbin/bridge]
+    --launcher <PATH>      privilege-drop helper     [default: /usr/libexec/ghostnector-appd-launch]
     --state-dir <PATH>     registry and per-group files
                                            [default: /run/ghostnector/apps]
     --bridge <NAME>        bridge carrying app links  [default: ghbr0]
@@ -119,6 +124,7 @@ OPTIONS:
         let mut nft = PathBuf::from(DEFAULT_NFT);
         let mut ip = PathBuf::from(DEFAULT_IP);
         let mut bridge_ctl = PathBuf::from(DEFAULT_BRIDGE_CTL);
+        let mut launcher = PathBuf::from(DEFAULT_LAUNCHER);
         let mut state_dir = PathBuf::from(DEFAULT_STATE_DIR);
         let mut bridge = app::DEFAULT_APP_BRIDGE.to_string();
         let mut core = app::DEFAULT_APP_CORE_ADDRESS;
@@ -145,6 +151,7 @@ OPTIONS:
                 "--nft" => nft = absolute(&option, &value()?)?,
                 "--ip" => ip = absolute(&option, &value()?)?,
                 "--bridge-ctl" => bridge_ctl = absolute(&option, &value()?)?,
+                "--launcher" => launcher = absolute(&option, &value()?)?,
                 "--state-dir" => state_dir = absolute(&option, &value()?)?,
                 "--peer-uid" => {
                     let raw = value()?;
@@ -264,19 +271,20 @@ OPTIONS:
         let socket = socket.ok_or(ConfigError::Missing("--socket"))?;
         let peer_uid = peer_uid.ok_or(ConfigError::Missing("--peer-uid or --peer-user"))?;
 
-        Ok(Parsed::Run(Config {
+        Ok(Parsed::Run(Box::new(Config {
             socket,
             peer_uid,
             nft,
             ip,
             bridge_ctl,
+            launcher,
             state_dir,
             bridge,
             core,
             prefix,
             dead_device,
             max_groups,
-        }))
+        })))
     }
 
     /// A one-line description for the log.
@@ -318,7 +326,7 @@ mod tests {
 
     fn run(list: &[&str]) -> Config {
         match Config::parse(args(list)).expect("should parse") {
-            Parsed::Run(config) => config,
+            Parsed::Run(config) => *config,
             other => panic!("expected Run, got {other:?}"),
         }
     }
@@ -338,6 +346,10 @@ mod tests {
         assert_eq!(config.dead_device, "ghdead");
         assert_eq!(config.max_groups, 32);
         assert_eq!(config.nft, PathBuf::from("/usr/sbin/nft"));
+        assert_eq!(
+            config.launcher,
+            PathBuf::from("/usr/libexec/ghostnector-appd-launch")
+        );
     }
 
     #[test]

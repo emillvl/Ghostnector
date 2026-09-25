@@ -13,8 +13,10 @@
 #   4. `Verify` compares the namespace's own ruleset against what was installed, and notices both a
 #      ruleset change and a shape change (proxy ARP);
 #   5. destroy is idempotent, revert removes every object, and nothing stale is left;
-#   6. CAP_SYS_ADMIN is necessary: an instance started with only CAP_NET_ADMIN cannot create a
-#      namespace (EPERM), which is the empirical justification for the unit's capability set.
+#   6. a shell session runs inside the group as the intended user, with the session socket owned by
+#      that user, a second session refused, an outsider refused by the kernel peer check even with a
+#      permissive socket, and permitted/effective/inheritable/ambient capabilities all empty;
+#   7. the packaged capability set is sufficient and CAP_SYS_ADMIN is necessary.
 #
 # Requires: root, iproute2, nftables, python3, setpriv (util-linux).
 
@@ -22,6 +24,7 @@ set -euo pipefail
 
 APPD="${1:?usage: appd-socket-test.sh <path-to-ghostnector-appd>}"
 APPD="$(cd "$(dirname "$APPD")" && pwd)/$(basename "$APPD")"
+LAUNCHER="$(dirname "$APPD")/ghostnector-appd-launch"
 
 RUNDIR="/run/ghostnector"
 SOCK="$RUNDIR/appd-test.sock"
@@ -73,10 +76,17 @@ for user in "$CORE_USER" "$OUTSIDER"; do
     id -u "$user" >/dev/null 2>&1 || \
         useradd --system --user-group --no-create-home --shell /usr/sbin/nologin "$user"
 done
+LAUNCH_USER="ghostnector-launch-test"
+if ! id -u "$LAUNCH_USER" >/dev/null 2>&1; then
+    useradd --system --user-group --no-create-home --shell /bin/sh "$LAUNCH_USER"
+fi
 CORE_UID="$(id -u "$CORE_USER")"
 CORE_GID="$(id -g "$CORE_USER")"
 OUTSIDER_UID="$(id -u "$OUTSIDER")"
 OUTSIDER_GID="$(id -g "$OUTSIDER")"
+LAUNCH_UID="$(id -u "$LAUNCH_USER")"
+LAUNCH_GID="$(id -g "$LAUNCH_USER")"
+[ -x "$LAUNCHER" ] || fail "the launch helper was not found at $LAUNCHER"
 
 mkdir -p "$WORK" "$RUNDIR" "$STATE" "$STATE2"
 chmod 0755 "$RUNDIR"
@@ -98,6 +108,32 @@ for frame in frames:
     print(data.decode(errors="replace").strip())
 PY
 
+cat >"$WORK/session.py" <<'PY'
+import socket, sys
+
+path, script = sys.argv[1], sys.argv[2]
+connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+connection.settimeout(20)
+try:
+    connection.connect(path)
+except OSError as error:
+    print(f"CONNECT-FAILED: {error}")
+    sys.exit(3)
+connection.sendall(script.encode())
+connection.shutdown(socket.SHUT_WR)
+data = b""
+while True:
+    try:
+        chunk = connection.recv(65536)
+    except OSError as error:
+        print(f"READ-FAILED: {error}")
+        break
+    if not chunk:
+        break
+    data += chunk
+sys.stdout.write(data.decode(errors="replace"))
+PY
+
 handshake='{"verb":"hello","protocol":1}'
 
 call() { # call <frame> ...  (as the configured peer)
@@ -116,6 +152,7 @@ print(value)' "$1" "$2"
 echo "[1] the socket is owner-only and the peer is checked"
 python3 "$WORK/client.py" "$SOCK" >/dev/null 2>&1 || true
 "$APPD" --socket "$SOCK" --peer-uid "$CORE_UID" --state-dir "$STATE" \
+    --launcher "$LAUNCHER" \
     --bridge "$BRIDGE" --core "$CORE" --prefix "$PREFIX" --dead-device "$DEAD" \
     >"$WORK/appd.log" 2>&1 &
 APPD_PID=$!
@@ -206,7 +243,92 @@ esac
 note "$ANSWER"
 sysctl -qw "net.ipv4.conf.ghav$ID1.proxy_arp=0"
 
-echo "[5] destroy is idempotent and revert removes everything"
+echo "[5] a shell session inside the group, with every granting capability dropped"
+LAUNCHED="$(call "{\"verb\":\"launch\",\"id\":$ID1,\"user_uid\":$LAUNCH_UID}")"
+case "$LAUNCHED" in
+*'"result":"launched"'*) ok "a session socket was prepared" ;;
+*) fail "launch failed: $LAUNCHED" ;;
+esac
+SESSION_SOCK="$(field "$LAUNCHED" socket)"
+[ -S "$SESSION_SOCK" ] || fail "the session socket does not exist"
+[ "$(stat -c %a "$SESSION_SOCK")" = "600" ] ||
+    fail "the session socket is not mode 600"
+[ "$(stat -c %u "$SESSION_SOCK")" = "$LAUNCH_UID" ] ||
+    fail "the session socket is not owned by the intended user"
+ok "the session socket belongs to uid $LAUNCH_UID alone"
+
+SECOND="$(call "{\"verb\":\"launch\",\"id\":$ID1,\"user_uid\":$LAUNCH_UID}")"
+case "$SECOND" in
+*'"code":"busy"'*) ok "a second session is refused while one is prepared" ;;
+*) fail "a second launch was not refused: $SECOND" ;;
+esac
+
+# Even if the filesystem gate were widened, the kernel's peer check must refuse another user.
+chmod 666 "$SESSION_SOCK"
+OUTSIDER_SESSION="$(setpriv --reuid="$OUTSIDER_UID" --regid="$OUTSIDER_GID" --clear-groups \
+    python3 "$WORK/session.py" "$SESSION_SOCK" "id -u" 2>&1 || true)"
+case "$OUTSIDER_SESSION" in
+*"$LAUNCH_UID"*) fail "an outsider obtained a session: $OUTSIDER_SESSION" ;;
+*) ok "an outsider cannot drive the session, even with a permissive socket" ;;
+esac
+for _ in $(seq 1 20); do [ -S "$SESSION_SOCK" ] || break; sleep 0.1; done
+[ -S "$SESSION_SOCK" ] && fail "the refused session socket was not cleaned up"
+
+LAUNCHED="$(call "{\"verb\":\"launch\",\"id\":$ID1,\"user_uid\":$LAUNCH_UID}")"
+SESSION_SOCK="$(field "$LAUNCHED" socket)"
+SCRIPT='id -u
+id -g
+grep -E "^Cap(Prm|Eff|Inh|Amb):" /proc/self/status
+cat /etc/resolv.conf
+ip route show
+readlink /proc/self/ns/net
+readlink /proc/self/ns/mnt
+exit 0
+'
+OUTPUT="$(setpriv --reuid="$LAUNCH_UID" --regid="$LAUNCH_GID" --clear-groups \
+    python3 "$WORK/session.py" "$SESSION_SOCK" "$SCRIPT" 2>&1)" || {
+    echo "$OUTPUT"
+    fail "the session failed"
+}
+case "$OUTPUT" in
+*"$LAUNCH_UID"*) ok "the shell runs as the intended user" ;;
+*) fail "the shell did not report uid $LAUNCH_UID: $OUTPUT" ;;
+esac
+CAPS_BAD=0
+while IFS= read -r line; do
+    case "$line" in
+    CapPrm:* | CapEff:* | CapInh:* | CapAmb:*)
+        case "$line" in
+        *0000000000000000*) ;;
+        *) CAPS_BAD=1 ;;
+        esac
+        ;;
+    esac
+done <<<"$OUTPUT"
+[ "$CAPS_BAD" = "0" ] || {
+    echo "$OUTPUT"
+    fail "the shell retained a capability"
+}
+ok "permitted, effective, inheritable and ambient capabilities are all empty"
+case "$OUTPUT" in
+*"nameserver $CORE"*) ok "the session's resolver points at the chokepoint" ;;
+*) fail "the resolver configuration was not bound in: $OUTPUT" ;;
+esac
+case "$OUTPUT" in
+*"default dev $DEAD"*) ok "the session is inside the dead-end namespace" ;;
+*) fail "the session's routes are wrong: $OUTPUT" ;;
+esac
+HOST_NET_NS="$(readlink /proc/self/ns/net)"
+HOST_MNT_NS="$(readlink /proc/self/ns/mnt)"
+case "$OUTPUT" in
+*"$HOST_NET_NS"*) fail "the session shares the host network namespace" ;;
+esac
+case "$OUTPUT" in
+*"$HOST_MNT_NS"*) fail "the session shares the host mount namespace" ;;
+esac
+ok "the session has its own network and mount namespaces"
+
+echo "[6] destroy is idempotent and revert removes everything"
 call "{\"verb\":\"destroy\",\"id\":$ID2}" >/dev/null
 [ ! -e "/run/netns/ghapp$ID2" ] || fail "the namespace survived destroy"
 call "{\"verb\":\"destroy\",\"id\":$ID2}" >/dev/null
@@ -229,13 +351,14 @@ ip link show "$BRIDGE" >/dev/null 2>&1 && fail "revert left the bridge behind"
     fail "revert left host links behind"
 ok "every namespace, link and the bridge are gone"
 
-echo "[6] the packaged capability set is sufficient, and CAP_SYS_ADMIN is necessary"
+echo "[7] the packaged capability set is sufficient, and CAP_SYS_ADMIN is necessary"
 # Exactly the packaged state: bounding {net_admin, sys_admin, chown}, ambient net_admin only.
 # (A root process's permitted set after exec is its bounding set, which is what setpriv emulates.)
 setpriv --reuid=0 --regid=0 --clear-groups \
     --bounding-set=-all,+net_admin,+sys_admin,+chown \
     --inh-caps +net_admin --ambient-caps +net_admin \
     "$APPD" --socket "$SOCK3" --peer-uid "$CORE_UID" --state-dir "$STATE3" \
+    --launcher "$LAUNCHER" \
     --bridge "$BRIDGE3" --core "$CORE" --prefix "$PREFIX" --dead-device "$DEAD" \
     >"$WORK/appd3.log" 2>&1 &
 APPD3_PID=$!
@@ -277,6 +400,7 @@ setpriv --reuid=0 --regid=0 --clear-groups \
     --bounding-set=-all,+net_admin,+chown \
     --inh-caps +net_admin --ambient-caps +net_admin \
     "$APPD" --socket "$SOCK2" --peer-uid "$CORE_UID" --state-dir "$STATE2" \
+    --launcher "$LAUNCHER" \
     --bridge "$BRIDGE2" --core "$CORE" --prefix "$PREFIX" --dead-device "$DEAD" \
     >"$WORK/appd2.log" 2>&1 &
 APPD2_PID=$!

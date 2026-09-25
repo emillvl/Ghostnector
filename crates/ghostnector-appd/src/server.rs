@@ -12,11 +12,13 @@
 //! touches the kernel runs through the backend's serialised namespace entry.
 
 use std::io::{BufRead, Write};
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -24,7 +26,9 @@ use ghostnector_policy::canonical_kernel_ruleset;
 use ghostnector_spec::appd::{AppEntry, AppReport, AppResponse, AppVerb, APP_PROTOCOL_VERSION};
 use ghostnector_spec::backend::Ports;
 use ghostnector_spec::ipc::{ErrorBody, ErrorCode};
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+use nix::unistd::{Uid, User};
 
 use crate::backend::{BackendError, GroupRequest, Namespaces};
 use crate::config::Config;
@@ -68,6 +72,8 @@ pub struct Server<B: Namespaces + 'static> {
     backend: Arc<B>,
     registry: Registry,
     connections: AtomicUsize,
+    /// Serialises preparing a session socket, so two Launch requests cannot both win the race.
+    launch_lock: Mutex<()>,
 }
 
 impl<B: Namespaces + 'static> Server<B> {
@@ -79,6 +85,7 @@ impl<B: Namespaces + 'static> Server<B> {
             backend,
             registry,
             connections: AtomicUsize::new(0),
+            launch_lock: Mutex::new(()),
         })
     }
 
@@ -145,6 +152,10 @@ impl<B: Namespaces + 'static> Server<B> {
             },
             AppVerb::Verify { id } => match self.verify(id, peer_uid) {
                 Ok((matches, detail)) => AppResponse::Verified { matches, detail },
+                Err(body) => AppResponse::Error(body),
+            },
+            AppVerb::Launch { id, user_uid } => match self.launch(id, user_uid, peer_uid) {
+                Ok((entry, socket)) => AppResponse::Launched { entry, socket },
                 Err(body) => AppResponse::Error(body),
             },
             AppVerb::ReportRegistry => AppResponse::Report(self.report()),
@@ -347,6 +358,14 @@ impl<B: Namespaces + 'static> Server<B> {
         self.backend
             .destroy(id)
             .map_err(|error| self.backend_problem(error))?;
+        // A prepared (not yet connected) session socket goes with the group; a running session's
+        // thread removes its own when it ends.
+        let _ = std::fs::remove_file(
+            self.config
+                .state_dir
+                .join(id.to_string())
+                .join("stdio.sock"),
+        );
         self.registry
             .remove(id)
             .map_err(|error| self.registry_problem(error))?;
@@ -466,9 +485,98 @@ impl<B: Namespaces + 'static> Server<B> {
         ))
     }
 
+    /// Prepare a shell session socket for a group.
+    ///
+    /// The caller names the intended user; the kernel enforces it: the session connection must come
+    /// from exactly that uid. The socket lives in the helper's own state directory and is handed to
+    /// that uid, so the user — not the caller — is the only one who can drive the shell.
+    fn launch(
+        &self,
+        id: u32,
+        user_uid: u32,
+        peer_uid: u32,
+    ) -> Result<(AppEntry, String), ErrorBody> {
+        let record = self
+            .registry
+            .get(id)
+            .ok_or_else(|| self.problem(ErrorCode::UnsafeState, format!("no group {id}")))?;
+        self.require_owner(&record, peer_uid)?;
+
+        if !self
+            .backend
+            .group_present(id)
+            .map_err(|error| self.backend_problem(error))?
+        {
+            return Err(self.problem(
+                ErrorCode::UnsafeState,
+                "the namespace or its link is missing".to_string(),
+            ));
+        }
+        if user_uid == 0 {
+            return Err(self.problem(
+                ErrorCode::NotAuthorized,
+                "refusing to prepare a session as root".to_string(),
+            ));
+        }
+        let user = User::from_uid(Uid::from_raw(user_uid))
+            .map_err(|error| self.problem(ErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| {
+                self.problem(
+                    ErrorCode::UnsafeState,
+                    format!("no user with uid {user_uid}"),
+                )
+            })?;
+        let _ = user;
+
+        let _guard = self
+            .launch_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let directory = self.config.state_dir.join(id.to_string());
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| self.problem(ErrorCode::Internal, error.to_string()))?;
+        let socket_path = directory.join("stdio.sock");
+        if socket_path.exists() {
+            return Err(self.problem(
+                ErrorCode::Busy,
+                "a session is already prepared for this group".to_string(),
+            ));
+        }
+        let listener = UnixListener::bind(&socket_path)
+            .map_err(|error| self.problem(ErrorCode::Internal, error.to_string()))?;
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| self.problem(ErrorCode::Internal, error.to_string()))?;
+        nix::unistd::chown(socket_path.as_path(), Some(Uid::from_raw(user_uid)), None)
+            .map_err(|error| self.problem(ErrorCode::Internal, error.to_string()))?;
+
+        let launcher = self.config.launcher.clone();
+        let state_dir = self.config.state_dir.clone();
+        let thread_socket = socket_path.clone();
+        thread::spawn(move || {
+            session_loop(listener, thread_socket, id, user_uid, launcher, state_dir);
+        });
+
+        Ok((
+            AppEntry {
+                id: record.id,
+                owner_uid: record.owner_uid,
+                address: record.address,
+                created_at: record.created_at,
+                present: true,
+            },
+            socket_path.display().to_string(),
+        ))
+    }
+
     fn revert(&self) -> Result<AppReport, ErrorBody> {
         let mut first_error = None;
         for record in self.registry.records() {
+            let _ = std::fs::remove_file(
+                self.config
+                    .state_dir
+                    .join(record.id.to_string())
+                    .join("stdio.sock"),
+            );
             if let Err(error) = self.backend.destroy(record.id) {
                 first_error.get_or_insert(error);
             }
@@ -525,6 +633,80 @@ impl<B: Namespaces + 'static> Server<B> {
     fn registry_problem(&self, error: RegistryError) -> ErrorBody {
         self.problem(ErrorCode::Internal, error.to_string())
     }
+}
+
+/// Wait for one session connection, verify who it is, and run the launch helper with it.
+///
+/// The connection's uid is the authorization: the kernel reports it, and it must be exactly the user
+/// the session was prepared for. A caller who asked for someone else's session never gets one.
+fn session_once(
+    listener: &UnixListener,
+    id: u32,
+    user_uid: u32,
+    launcher: &std::path::Path,
+    state_dir: &std::path::Path,
+) -> Result<(), ServerError> {
+    let mut fds = [PollFd::new(listener.as_fd(), PollFlags::POLLIN)];
+    let ready = poll(&mut fds, PollTimeout::from(60_000u16))
+        .map_err(|error| ServerError::Io(error.to_string()))?;
+    if ready == 0 {
+        return Err(ServerError::Io(
+            "no session connected within the time budget".to_string(),
+        ));
+    }
+    let (stream, _) = listener
+        .accept()
+        .map_err(|error| ServerError::Accept(error.to_string()))?;
+    let peer = peer_uid(&stream)?;
+    if peer != user_uid {
+        return Err(ServerError::PeerCredentials(format!(
+            "refused a session from uid {peer}; it was prepared for uid {user_uid}"
+        )));
+    }
+
+    let input: OwnedFd = stream
+        .try_clone()
+        .map_err(|error| ServerError::Io(error.to_string()))?
+        .into();
+    let output: OwnedFd = stream
+        .try_clone()
+        .map_err(|error| ServerError::Io(error.to_string()))?
+        .into();
+    let errors: OwnedFd = stream.into();
+
+    let status = Command::new(launcher)
+        .arg("--id")
+        .arg(id.to_string())
+        .arg("--uid")
+        .arg(user_uid.to_string())
+        .arg("--state-dir")
+        .arg(state_dir)
+        .stdin(Stdio::from(input))
+        .stdout(Stdio::from(output))
+        .stderr(Stdio::from(errors))
+        .status()
+        .map_err(|error| ServerError::Io(format!("cannot run the launch helper: {error}")))?;
+    if !status.success() {
+        return Err(ServerError::Io(format!(
+            "the launch helper exited with {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// One prepared session: wait, run, and always leave the socket path clean.
+fn session_loop(
+    listener: UnixListener,
+    socket_path: PathBuf,
+    id: u32,
+    user_uid: u32,
+    launcher: PathBuf,
+    state_dir: PathBuf,
+) {
+    if let Err(error) = session_once(&listener, id, user_uid, &launcher, &state_dir) {
+        eprintln!("ghostnector-appd: session {id}: {error}");
+    }
+    let _ = std::fs::remove_file(&socket_path);
 }
 
 /// Whether a peer with this uid may talk to the helper.
@@ -597,6 +779,7 @@ mod tests {
     use crate::config::Config;
     use crate::testing::MockNamespaces;
     use ghostnector_spec::appd::{AppReport, AppResponse, AppVerb};
+    use std::os::unix::fs::MetadataExt;
 
     const PEER: u32 = 1000;
     const OTHER: u32 = 1001;
@@ -623,7 +806,7 @@ mod tests {
         )
         .expect("test config parses")
         {
-            crate::config::Parsed::Run(config) => config,
+            crate::config::Parsed::Run(config) => *config,
             other => panic!("expected a runnable config, got {other:?}"),
         }
     }
@@ -855,6 +1038,87 @@ mod tests {
                 assert!(notes.is_empty(), "{notes:?}");
             }
             other => panic!("expected an inspection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn launch_refuses_without_a_group_or_a_real_user() {
+        let (_backend, server) = server(8);
+        applied(server.handle(AppVerb::EnsureBridge { ports: ports() }, PEER));
+        match server.handle(
+            AppVerb::Launch {
+                id: 1,
+                user_uid: PEER,
+            },
+            PEER,
+        ) {
+            AppResponse::Error(body) => assert_eq!(body.code, ErrorCode::UnsafeState),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        let entry = match server.handle(AppVerb::Create, PEER) {
+            AppResponse::Created { entry } => entry,
+            other => panic!("expected a created group, got {other:?}"),
+        };
+        match server.handle(
+            AppVerb::Launch {
+                id: entry.id,
+                user_uid: 0,
+            },
+            PEER,
+        ) {
+            AppResponse::Error(body) => assert_eq!(body.code, ErrorCode::NotAuthorized),
+            other => panic!("expected root to be refused, got {other:?}"),
+        }
+        match server.handle(
+            AppVerb::Launch {
+                id: entry.id,
+                user_uid: 4_000_000_000,
+            },
+            PEER,
+        ) {
+            AppResponse::Error(body) => assert_eq!(body.code, ErrorCode::UnsafeState),
+            other => panic!("expected an unknown user to be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn launch_prepares_one_session_socket_and_refuses_a_second() {
+        if !nix::unistd::Uid::effective().is_root() {
+            // Preparing the socket hands it to the user, which needs CAP_CHOWN.
+            return;
+        }
+        let Ok(Some(user)) = nix::unistd::User::from_name("nobody") else {
+            return;
+        };
+        let (_backend, server) = server(8);
+        applied(server.handle(AppVerb::EnsureBridge { ports: ports() }, PEER));
+        let entry = match server.handle(AppVerb::Create, PEER) {
+            AppResponse::Created { entry } => entry,
+            other => panic!("expected a created group, got {other:?}"),
+        };
+        let socket = match server.handle(
+            AppVerb::Launch {
+                id: entry.id,
+                user_uid: user.uid.as_raw(),
+            },
+            PEER,
+        ) {
+            AppResponse::Launched { socket, .. } => socket,
+            other => panic!("expected a prepared session, got {other:?}"),
+        };
+        let metadata = std::fs::metadata(&socket).expect("the session socket exists");
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(metadata.uid(), user.uid.as_raw());
+
+        match server.handle(
+            AppVerb::Launch {
+                id: entry.id,
+                user_uid: user.uid.as_raw(),
+            },
+            PEER,
+        ) {
+            AppResponse::Error(body) => assert_eq!(body.code, ErrorCode::Busy),
+            other => panic!("expected a second session to be refused, got {other:?}"),
         }
     }
 
