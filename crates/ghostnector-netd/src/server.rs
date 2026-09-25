@@ -22,7 +22,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 
-use ghostnector_policy::{compile, render_replace_script, render_revert_script, Environment};
+use ghostnector_policy::{
+    canonical_kernel_ruleset, compile, render_replace_script, render_revert_script, Environment,
+};
 use ghostnector_spec::backend::{Params, Ports, ProfileId, Report, ResolvedIdentity, Verb};
 use ghostnector_spec::exemption::Exemption;
 use ghostnector_spec::ipc::{ErrorBody, ErrorCode, HelperResponse, PROTOCOL_VERSION};
@@ -72,37 +74,6 @@ struct Applied {
     /// verification time is against *this*, not against what the helper intended to write, so a
     /// change made by anything else is visible even though the helper knows nothing about it.
     effective: Option<String>,
-}
-
-/// Reduce a kernel ruleset listing to the part that describes policy rather than traffic.
-///
-/// Counters carry live values, so they change with use and are not part of the policy. Everything
-/// else is compared exactly: this runs against two listings from the same formatter, so there is no
-/// brittleness to trade against precision.
-fn canonical(ruleset: &str) -> String {
-    let mut out = String::new();
-    for line in ruleset.lines() {
-        if line.trim_start().starts_with("destroy table") {
-            continue;
-        }
-        let mut kept: Vec<&str> = Vec::new();
-        let mut tokens = line.split_whitespace().peekable();
-        while let Some(token) = tokens.next() {
-            if (token == "packets" || token == "bytes")
-                && kept.last().is_some_and(|last| *last == "counter")
-            {
-                tokens.next(); // the number that follows
-                continue;
-            }
-            kept.push(token);
-        }
-        if kept.is_empty() {
-            continue;
-        }
-        out.push_str(&kept.join(" "));
-        out.push('\n');
-    }
-    out
 }
 
 /// The privileged helper.
@@ -320,7 +291,7 @@ impl<B: Backend + 'static, I: Identities + 'static> Server<B, I> {
         let effective = self
             .backend
             .list_table()
-            .map(|live| canonical(&live))
+            .map(|live| canonical_kernel_ruleset(&live))
             .map_err(|error| self.problem(ErrorCode::BackendFailure, error.to_string()))?;
 
         let mut notes = Vec::new();
@@ -384,7 +355,7 @@ impl<B: Backend + 'static, I: Identities + 'static> Server<B, I> {
             .backend
             .list_table()
             .map_err(|error| self.problem(ErrorCode::BackendFailure, error.to_string()))?;
-        let live = canonical(&live);
+        let live = canonical_kernel_ruleset(&live);
         if live == expected {
             return Ok((
                 true,
@@ -535,6 +506,11 @@ pub fn bind_socket(config: &Config) -> Result<UnixListener, ServerError> {
 
     let listener = UnixListener::bind(path).map_err(|error| reject(error.to_string()))?;
 
+    // Restrict before handing over. Restricting after would leave the socket owned by the peer with
+    // the umask's mode until the chmod, and a chmod after a chown needs CAP_FOWNER, which the unit
+    // does not grant (defect D-23).
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| reject(format!("cannot restrict the socket: {error}")))?;
     nix::unistd::chown(
         path.as_path(),
         Some(nix::unistd::Uid::from_raw(config.peer_uid)),
@@ -546,8 +522,6 @@ pub fn bind_socket(config: &Config) -> Result<UnixListener, ServerError> {
             config.peer_uid
         ))
     })?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|error| reject(format!("cannot restrict the socket: {error}")))?;
 
     Ok(listener)
 }
@@ -697,8 +671,10 @@ mod tests {
 
     #[test]
     fn counters_are_not_part_of_the_policy() {
+        // The canonicaliser now lives in the policy crate so both helpers share it; this test keeps
+        // the property in netd's own suite, where the comparison is made.
         let live = "\ttable inet ghostnector {\n\t\tcounter packets 42 bytes 900 accept\n\t}\n";
-        let without = canonical(live);
+        let without = canonical_kernel_ruleset(live);
         assert!(!without.contains("42"), "{without}");
         assert!(!without.contains("900"), "{without}");
         assert!(without.contains("counter accept"), "{without}");

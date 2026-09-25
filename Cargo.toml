@@ -4,6 +4,7 @@ members = [
     "crates/ghostnector-spec",
     "crates/ghostnector-policy",
     "crates/ghostnector-netd",
+    "crates/ghostnector-appd",
     "crates/ghostnector-core",
     "crates/ghostnector-cli",
     "crates/ghostnector-dns",

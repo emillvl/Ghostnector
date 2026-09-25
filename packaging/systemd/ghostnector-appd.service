@@ -1,0 +1,56 @@
+[Unit]
+Description=Ghostnector APP-scope namespace helper (dead-end namespaces)
+Documentation=man:ghostnector-appd(8)
+# The control plane starts before any transition needs this helper, and the boot guard must not wait
+# on it: APP namespaces are volatile by design and nothing at boot depends on them.
+DefaultDependencies=no
+After=local-fs.target systemd-tmpfiles-setup.service ghostnector-netd.service
+Before=sysinit.target
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=exec
+ExecStart=/usr/libexec/ghostnector-appd \
+    --socket /run/ghostnector/appd.sock \
+    --peer-user ghostnector \
+    --state-dir /run/ghostnector/apps \
+    --bridge ghbr0 \
+    --core 10.200.0.1 \
+    --prefix 24 \
+    --dead-device ghdead
+
+# The minimum that does the work, measured (the M8.2 gate runs this helper under this exact
+# capability state and under the same state minus CAP_SYS_ADMIN):
+#   * creating a namespace (unshare) and entering one (setns) need CAP_SYS_ADMIN;
+#   * links, addresses, routes, bridge membership and per-namespace sysctls need CAP_NET_ADMIN;
+#   * handing the socket to the control plane's uid needs CAP_CHOWN (the mode is set before the
+#     chown, so CAP_FOWNER is not needed and the socket is never briefly peer-owned with a
+#     permissive mode).
+# KeepCapabilities keeps the set across exec. Only CAP_NET_ADMIN is ambient, so the tools this
+# helper runs (`ip`, `bridge`, `nft`) never inherit CAP_SYS_ADMIN or CAP_CHOWN.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_CHOWN
+KeepCapabilities=yes
+AmbientCapabilities=CAP_NET_ADMIN
+NoNewPrivileges=yes
+
+# It speaks netlink and unix sockets. It never opens an internet socket itself.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictNamespaces=net
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ReadWritePaths=/run/ghostnector /run/netns
+
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=sysinit.target

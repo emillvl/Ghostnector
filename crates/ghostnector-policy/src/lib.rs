@@ -17,12 +17,14 @@
 //! reasons about the ruleset as data, so a compiler bug shows up as a rejected policy rather than a
 //! silent hole.
 
+pub mod canonical;
 pub mod compile;
 pub mod invariants;
 pub mod ir;
 pub mod render;
 
-pub use compile::{compile, CompiledPolicy, Environment, PolicyError};
+pub use canonical::canonical_kernel_ruleset;
+pub use compile::{compile, compile_app_namespace, CompiledPolicy, Environment, PolicyError};
 pub use invariants::{check, CheckContext, InvariantViolation, ViolationCode};
 pub use ir::{
     Chain, ChainKind, CtState, Expr, Family, Hook, Mechanism, Proto, RejectKind, Rule, RuleOrigin,

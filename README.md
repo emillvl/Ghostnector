@@ -3,9 +3,9 @@
 Network-level privacy for Linux: transparent Tor routing, encrypted DNS, isolated I2P, and a
 fail-closed default-deny policy that cannot silently return traffic to the clearnet.
 
-**Status:** early implementation (M0 — contracts and repo skeleton).
+**Status:** M1–M7 complete and frozen at `v1.0.0-rc2`; M8 (`APP` scope) in progress.
 **Architecture:** [`ARCHITECTURE-REVIEW.md`](ARCHITECTURE-REVIEW.md) — read this first; every decision
-in the code cites it.
+in the code cites it. **M8 decisions:** [`docs/M8-DECISIONS.md`](docs/M8-DECISIONS.md).
 **Plan:** [`docs/IMPLEMENTATION-PLAN.md`](docs/IMPLEMENTATION-PLAN.md).
 
 ## Platform: Linux only
@@ -21,9 +21,12 @@ The code is deliberately split so that everything except the kernel-facing backe
 |---|---|
 | `ghostnector-spec` — profile/scope/state/IPC vocabulary | Portable, no OS calls |
 | `ghostnector-policy` — desired state → ruleset IR | Portable, pure functions |
-| `ghostnector-journal` — intent log, snapshots, rollback | Portable |
-| `ghostnector-netd` — the privileged helper that touches the kernel | Linux only |
-| `ghostnector-core`, `ghostnector-cli` | Portable (talk to `netd` over a socket) |
+| `ghostnector-netd` — the privileged helper that touches the host firewall | Linux only |
+| `ghostnector-appd` — the privileged helper that owns APP namespaces | Linux only |
+| `ghostnector-core` — the control plane: state machine, journal, orchestration | Linux only |
+| `ghostnector-cli` | Linux only |
+| `ghostnector-bootguard` — early fail-closed baseline after reboot | Linux only |
+| `ghostnector-dns` — the DNS chokepoint relay | Linux only |
 
 A future non-Linux backend is therefore *possible* without rewriting the policy engine, but it would
 be a different product with materially weaker guarantees.
@@ -33,14 +36,15 @@ be a different product with materially weaker guarantees.
 ```
 crates/
   ghostnector-spec/       shared vocabulary: profiles, state, exemptions, IPC, helper verbs
-  ghostnector-policy/     (M1) desired state -> nftables ruleset IR + invariant checks
-  ghostnector-netd/       (M1) privileged helper: apply/revert, conntrack, namespaces
-  ghostnector-core/       (M2) state machine, journal, orchestration, IPC server
-  ghostnector-cli/        (M2) command-line client
-  ghostnector-bootguard/  (M6) early fail-closed baseline after reboot
-  ghostnector-verify/     (M5) continuous escape/identity/canary verification
+  ghostnector-policy/     desired state -> nftables ruleset IR + invariant checks
+  ghostnector-netd/       privileged helper: apply/revert the host firewall, conntrack
+  ghostnector-appd/       privileged helper: APP namespaces, dead ends, namespace verification
+  ghostnector-core/       state machine, journal, orchestration, verification, IPC server
+  ghostnector-cli/        command-line client
+  ghostnector-bootguard/  early fail-closed baseline after reboot
+  ghostnector-dns/        the DNS chokepoint relay
 docs/
-packaging/                (M1) systemd units, sysusers, tmpfiles, polkit policy
+packaging/                systemd units, sysusers, tmpfiles
 ```
 
 ## Build and test

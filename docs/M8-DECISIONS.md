@@ -39,6 +39,8 @@ M8.0 (D-22 fix, wording, documentation, regression tests, full M1–M7 gate) →
 `appd` → M8.3 launcher → M8.4 core integration → M8.5 verification → M8.6 harness/adversarial and
 the claims record. A clean, tested checkpoint is kept after each phase.
 
+| M8.2 `appd` | **done** — the measured capability set is `CAP_NET_ADMIN CAP_SYS_ADMIN CAP_CHOWN` (only `CAP_NET_ADMIN` ambient): namespace creation/entry need the middle one, links/addresses/routes/sysctls the first, and the socket handoff the last. The gate runs the helper under exactly that set (lifecycle and verification pass) and under the same set minus `CAP_SYS_ADMIN` (creation fails with EPERM), which is the empirical justification. The measured work also found **D-23** in `netd`'s packaged set (below). |
+
 ## The topology experiment (added in M8.0)
 
 `scripts/app-topology-test.sh` proves against the real kernel:
