@@ -95,8 +95,10 @@ fn render_chain(out: &mut String, chain: &Chain, sets: &[Set]) {
         Verdict::Drop => "drop",
         // nftables does not permit a reject policy on a base chain.
         Verdict::Reject { .. } => "drop",
-        Verdict::Return => "accept",
-        Verdict::Redirect { .. } => "accept",
+        // `Return`, `Redirect` and `Dnat` are verdicts a rule uses; the invariant checker refuses a
+        // filter chain whose policy is one of them (`InvalidChainPolicy`), so this arm is only a
+        // total-function convenience for a hand-built ruleset.
+        Verdict::Return | Verdict::Redirect { .. } | Verdict::Dnat { .. } => "accept",
     };
     let _ = writeln!(out, "    chain {} {{", chain.name);
     let _ = writeln!(
@@ -187,6 +189,9 @@ fn render_verdict(verdict: Verdict) -> String {
         Verdict::Drop => "drop".to_string(),
         Verdict::Return => "return".to_string(),
         Verdict::Redirect { port } => format!("redirect to :{port}"),
+        // A destination rewrite to the host-local core address. There is no source-rewriting
+        // verdict in the IR, so no policy can contain SNAT or masquerade.
+        Verdict::Dnat { addr, port } => format!("dnat ip to {addr}:{port}"),
         Verdict::Reject { kind } => match kind {
             RejectKind::AdminProhibited => "reject with icmpx type admin-prohibited".to_string(),
             RejectKind::PortUnreachable => "reject with icmpx type port-unreachable".to_string(),
@@ -222,7 +227,7 @@ fn sanitise(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compile::{compile, Environment};
+    use crate::compile::{compile, compile_app_namespace, Environment};
     use ghostnector_spec::backend::{Params, ProfileId};
     use std::path::PathBuf;
 
@@ -234,6 +239,9 @@ mod tests {
             chokepoint_port: 53,
             socks_port: 9050,
             dhcp_client_port: 68,
+            app_core: ghostnector_spec::app::DEFAULT_APP_CORE_ADDRESS,
+            app_prefix: ghostnector_spec::app::DEFAULT_APP_PREFIX,
+            app_bridge: ghostnector_spec::app::DEFAULT_APP_BRIDGE.to_string(),
         }
     }
 
@@ -265,6 +273,30 @@ mod tests {
         ]
     }
 
+    /// Every policy Ghostnector can render, including both halves of APP scope.
+    fn all_policies() -> Vec<(&'static str, crate::compile::CompiledPolicy)> {
+        let environment = env();
+        let mut policies: Vec<_> = cases()
+            .into_iter()
+            .map(|(name, profile, params)| {
+                (
+                    name,
+                    compile(profile, &params, &environment).expect("the profile compiles"),
+                )
+            })
+            .collect();
+        policies.push((
+            "tor_app_host.nft",
+            compile(ProfileId::TorApp, &Params::default(), &environment)
+                .expect("the APP host profile compiles"),
+        ));
+        policies.push((
+            "tor_app_namespace.nft",
+            compile_app_namespace(&environment).expect("the APP namespace profile compiles"),
+        ));
+        policies
+    }
+
     fn golden_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("golden")
     }
@@ -279,8 +311,7 @@ mod tests {
 
     #[test]
     fn every_compiled_profile_renders_something_applicable() {
-        for (name, profile, params) in cases() {
-            let policy = compile(profile, &params, &env()).unwrap();
+        for (name, policy) in all_policies() {
             let rendered = render_replace_script(&policy.ruleset);
             assert!(
                 rendered.starts_with("destroy table inet ghostnector"),
@@ -291,6 +322,21 @@ mod tests {
                 assert!(rendered.contains(&format!("chain {chain} {{")), "{name}");
             }
             assert!(rendered.ends_with("}\n"), "{name} must close the table");
+        }
+    }
+
+    #[test]
+    fn nothing_ghostnector_renders_can_express_source_rewriting() {
+        // The IR has no source-rewriting verdict and the renderer never emits one; this is the M8
+        // no-SNAT property at the only place it could be introduced.
+        for (name, policy) in all_policies() {
+            let rendered = render_replace_script(&policy.ruleset);
+            for forbidden in ["masquerade", "snat", "srcnat"] {
+                assert!(
+                    !rendered.contains(forbidden),
+                    "{name} contains '{forbidden}':\n{rendered}"
+                );
+            }
         }
     }
 
@@ -342,8 +388,7 @@ mod tests {
         // nftables cannot infer the protocol for a second port match, so `udp sport 68 dport 67` is a
         // syntax error and the policy never reaches the kernel. That is how the inverted DHCP
         // exemption was found the second time: the first fix rendered a rule nft refused.
-        for (name, profile, params) in cases() {
-            let policy = compile(profile, &params, &env()).unwrap();
+        for (name, policy) in all_policies() {
             for line in render_replace_script(&policy.ruleset).lines() {
                 let words: Vec<&str> = line.split_whitespace().collect();
                 for window in words.windows(3) {
@@ -364,8 +409,7 @@ mod tests {
         let dir = golden_dir();
         std::fs::create_dir_all(&dir).unwrap();
 
-        for (name, profile, params) in cases() {
-            let policy = compile(profile, &params, &env()).unwrap();
+        for (name, policy) in all_policies() {
             let rendered = render_replace_script(&policy.ruleset);
             let path = dir.join(name);
 

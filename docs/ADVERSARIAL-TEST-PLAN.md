@@ -239,7 +239,10 @@ that ignored the connect result). Each has a regression test that fails on the o
 The APP scope brings a new enforcement surface — namespaces, a host-side APP table with input/forward
 guards only, a bridge, and a launcher — and the M7 lesson applies unchanged: an untested surface is
 not protected. The M8 campaign extends the observation points and adds the `AA` class. The topology
-assumption itself is already pinned by `scripts/app-topology-test.sh`.
+assumption itself is already pinned by `scripts/app-topology-test.sh`, and the rendered policy is
+already exercised against the kernel by `scripts/app-policy-test.sh` (M8.1): applicability, DNAT with
+source preservation, the flushed-DNAT dead end, and the host link bounded to the core listeners.
+The AA cases extend those two scripts to the real components.
 
 Planned cases, to be implemented in M8.6 against the real components:
 

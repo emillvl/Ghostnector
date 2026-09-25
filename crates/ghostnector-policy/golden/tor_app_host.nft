@@ -1,0 +1,35 @@
+destroy table inet ghostnector
+table inet ghostnector {
+    set loopback4 {
+        type ipv4_addr
+        flags interval
+        elements = { 127.0.0.0/8 }
+    }
+    set loopback6 {
+        type ipv6_addr
+        flags interval
+        elements = { ::1/128 }
+    }
+    set appcore4 {
+        type ipv4_addr
+        flags interval
+        elements = { 10.200.0.1/32 }
+    }
+    chain in_filter {
+        type filter hook input priority 0; policy accept;
+        iifname "lo" counter accept comment "loopback delivery"
+        iifname "ghbr0" ip daddr @appcore4 tcp dport 9040 counter accept comment "the app link reaches this core listener"
+        iifname "ghbr0" ip daddr @appcore4 tcp dport 53 counter accept comment "the app link reaches this core listener"
+        iifname "ghbr0" ip daddr @appcore4 tcp dport 9050 counter accept comment "the app link reaches this core listener"
+        iifname "ghbr0" ip daddr @appcore4 udp dport 53 counter accept comment "the app link reaches the DNS chokepoint"
+        iifname "ghbr0" counter drop comment "nothing else from the app link"
+        tcp dport 9040 counter drop comment "the transparent proxies are not for the network"
+        tcp dport 53 counter drop comment "the transparent proxies are not for the network"
+        tcp dport 9050 counter drop comment "the transparent proxies are not for the network"
+        udp dport 53 counter drop comment "the DNS chokepoint is not for the network"
+    }
+    chain fwd_filter {
+        type filter hook forward priority 0; policy drop;
+        counter drop comment "containers and virtual machines must not leak around the output chain"
+    }
+}

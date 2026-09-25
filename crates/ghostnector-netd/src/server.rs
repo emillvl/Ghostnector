@@ -437,6 +437,9 @@ impl<B: Backend + 'static, I: Identities + 'static> Server<B, I> {
             chokepoint_port: self.config.chokepoint_port,
             socks_port: self.config.socks_port,
             dhcp_client_port: self.config.dhcp_client_port,
+            app_core: self.config.app_core,
+            app_prefix: ghostnector_spec::app::DEFAULT_APP_PREFIX,
+            app_bridge: self.config.app_bridge.clone(),
         }
     }
 
@@ -852,7 +855,7 @@ mod tests {
     fn unsupported_profiles_are_refused_rather_than_approximated() {
         let (backend, server) = server();
         let request = Verb::ApplyProfile {
-            profile: ProfileId::TorApp,
+            profile: ProfileId::I2pIsolated,
             params: Params::default(),
         };
         let mut out = Vec::new();
@@ -868,6 +871,65 @@ mod tests {
         let body = text(&out);
         assert!(body.contains("invalid_profile"), "{body}");
         assert!(body.contains("not implemented"), "{body}");
+        assert!(backend.scripts().is_empty());
+    }
+
+    #[test]
+    fn applying_tor_app_renders_a_host_table_with_no_output_policy() {
+        let (backend, server) = server();
+        let request = Verb::ApplyProfile {
+            profile: ProfileId::TorApp,
+            params: Params::default(),
+        };
+        let mut out = Vec::new();
+        exchange(
+            &server,
+            &format!(
+                "{}{}\n",
+                handshake(),
+                serde_json::to_string(&request).expect("encode")
+            ),
+            &mut out,
+        );
+        let body = text(&out);
+        assert!(body.contains("\"result\":\"applied\""), "{body}");
+        let scripts = backend.scripts();
+        assert_eq!(scripts.len(), 1, "exactly one atomic replacement");
+        assert!(scripts[0].contains("iifname \"ghbr0\""), "{}", scripts[0]);
+        assert!(
+            !scripts[0].contains("redirect to"),
+            "an APP host table must not redirect anything: {}",
+            scripts[0]
+        );
+        assert!(
+            !scripts[0].contains("chain out_filter"),
+            "an APP host table must not acquire an output policy: {}",
+            scripts[0]
+        );
+    }
+
+    #[test]
+    fn app_scope_refuses_lan_over_the_helper_interface_too() {
+        let (backend, server) = server();
+        let request = Verb::ApplyProfile {
+            profile: ProfileId::TorApp,
+            params: Params {
+                allow_lan: true,
+                ..Params::default()
+            },
+        };
+        let mut out = Vec::new();
+        exchange(
+            &server,
+            &format!(
+                "{}{}\n",
+                handshake(),
+                serde_json::to_string(&request).expect("encode")
+            ),
+            &mut out,
+        );
+        let body = text(&out);
+        assert!(body.contains("allow_lan"), "{body}");
         assert!(backend.scripts().is_empty());
     }
 

@@ -10,7 +10,7 @@
 
 use std::fmt;
 
-use crate::ir::{Chain, Expr, Proto, RuleOrigin, Ruleset, Verdict};
+use crate::ir::{Chain, Expr, Mechanism, Proto, RuleOrigin, Ruleset, Verdict};
 use ghostnector_spec::exemption::{Exemption, SUBJECT_DHCP};
 use ghostnector_spec::profile::Scope;
 use serde::{Deserialize, Serialize};
@@ -18,12 +18,37 @@ use serde::{Deserialize, Serialize};
 /// The name of the single table Ghostnector owns (review §12.1).
 pub const TABLE_NAME: &str = "ghostnector";
 
+/// The name of the set holding the host-local APP core address.
+///
+/// The compiler declares it and the checker requires it exactly; a destination accept that is not
+/// this set does not mean "the core address".
+pub const APP_CORE_SET: &str = "appcore4";
+
 /// The chains every profile must define.
 pub const REQUIRED_CHAINS: [&str; 3] = ["out_filter", "out_nat", "fwd_filter"];
+
+/// Which shape of policy a ruleset is, and therefore which properties apply to it.
+///
+/// The machine shape is the one M1–M7 built: a default-deny output chain, NAT redirects into Tor
+/// and the chokepoint, an input guard, and a default-deny forward chain. The APP shapes are the two
+/// halves of `APP` scope: a host table that only guards the app link and the forward path (it must
+/// **not** acquire an output policy, or APP scope would silently become SYSTEM scope), and the
+/// namespace-local table whose DNAT is the only mechanism that can create a usable path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyShape {
+    /// Machine-wide scope (`SYSTEM`, `USER`, and the DNS-lockdown/fail-closed baselines).
+    Machine,
+    /// The host side of `APP` scope.
+    AppHost,
+    /// The ruleset installed inside one application namespace.
+    AppNamespace,
+}
 
 /// What the checker needs to know about the policy being enforced.
 #[derive(Debug, Clone)]
 pub struct CheckContext<'a> {
+    /// Which shape the ruleset has. Properties are checked per shape, never across them.
+    pub shape: PolicyShape,
     /// The scope the policy is meant to cover. `OutOfScope` rules are only legal for a user-scoped
     /// policy; in any other scope they are a hole.
     pub scope: Scope,
@@ -37,6 +62,14 @@ pub struct CheckContext<'a> {
     pub require_udp_fast_fail: bool,
     /// Whether an exemption must precede the redirects it is protecting from.
     pub require_exemption_before_redirect: bool,
+    /// The host-local APP core address. Required for both APP shapes.
+    pub app_core: Option<std::net::Ipv4Addr>,
+    /// The bridge interface the host APP table admits. Required for [`PolicyShape::AppHost`].
+    pub app_bridge: Option<&'a str>,
+    /// The ports a namespace may reach on the core address (transparent proxy, chokepoint, SOCKS).
+    pub app_core_ports: &'a [u16],
+    /// The chokepoint port, which must be reachable over both UDP and TCP from an app link.
+    pub app_dns_port: Option<u16>,
 }
 
 /// A property of the ruleset that does not hold.
@@ -162,6 +195,49 @@ pub enum ViolationCode {
     /// A DHCP exemption does not match the client's own port as a source, so it permits the
     /// direction a client never sends and drops the one it does.
     DhcpExemptionDirection,
+    /// A chain that must not exist in this policy shape is present. An OUTPUT chain in the APP host
+    /// table would turn app scope into machine scope; a forward chain inside a namespace has no
+    /// traffic to deny.
+    ForbiddenChainPresent,
+    /// An accept from the app link is not bounded to the core address and a core listener port.
+    AppLinkAcceptUnbounded,
+    /// The app link cannot reach a core listener it must be able to reach.
+    AppLinkAcceptMissing,
+    /// Nothing drops the rest of what the app link could send to the host.
+    AppLinkNotClosed,
+    /// A namespace DNAT targets an address or port other than the configured core address and its
+    /// core ports.
+    AppDnatOutsideCore,
+    /// An APP namespace's output chain does not default to deny.
+    AppNamespaceEgressNotDeny,
+    /// An APP namespace output rule accepts a destination that is neither loopback nor the core
+    /// address.
+    AppNamespaceAcceptOutsideCore,
+    /// An APP namespace nat chain contains a verdict or expression it must not (for example a
+    /// `redirect`, which would target the namespace's own loopback, or an interface match).
+    AppNamespaceNatShape,
+    /// An APP namespace's input chain does not default to deny.
+    AppNamespaceInboundNotDeny,
+    /// An APP namespace has no established/related acceptance, so replies to the app's own flows
+    /// would be dropped.
+    AppNamespaceInboundMissingReturn,
+    /// An APP namespace input rule accepts more than loopback or established/related traffic.
+    AppNamespaceInboundUnbounded,
+    /// ICMP and ICMPv6 are not rejected quickly inside a namespace.
+    MissingIcmpFastFail,
+    /// An APP ruleset matches an interface that is neither loopback nor the app bridge, so it would
+    /// break when names change.
+    InterfaceSpecificAppPolicy,
+    /// The host APP table does not guard the core listener ports against non-app interfaces.
+    MissingListenerGuard,
+    /// An APP namespace has no destination rewrite for ordinary TCP, so transparency is broken.
+    AppNamespaceDnatMissing,
+    /// An APP namespace's DNS DNAT appears after the catch-all TCP DNAT, so port 53 would be
+    /// captured by the Tor redirect instead of the chokepoint (the D-15 lesson, namespace edition).
+    AppNamespaceDnsAfterCatchall,
+    /// A filter chain's default verdict is `Return`, `Redirect` or `Dnat`, none of which is a
+    /// terminal verdict a base chain can carry.
+    InvalidChainPolicy,
 }
 
 impl ViolationCode {
@@ -196,6 +272,25 @@ impl ViolationCode {
             ViolationCode::UndeclaredSetReference => "undeclared_set_reference",
             ViolationCode::InvalidRuleShape => "invalid_rule_shape",
             ViolationCode::DhcpExemptionDirection => "dhcp_exemption_direction",
+            ViolationCode::ForbiddenChainPresent => "forbidden_chain_present",
+            ViolationCode::AppLinkAcceptUnbounded => "app_link_accept_unbounded",
+            ViolationCode::AppLinkAcceptMissing => "app_link_accept_missing",
+            ViolationCode::AppLinkNotClosed => "app_link_not_closed",
+            ViolationCode::AppDnatOutsideCore => "app_dnat_outside_core",
+            ViolationCode::AppNamespaceEgressNotDeny => "app_namespace_egress_not_deny",
+            ViolationCode::AppNamespaceAcceptOutsideCore => "app_namespace_accept_outside_core",
+            ViolationCode::AppNamespaceNatShape => "app_namespace_nat_shape",
+            ViolationCode::AppNamespaceInboundNotDeny => "app_namespace_inbound_not_deny",
+            ViolationCode::AppNamespaceInboundMissingReturn => {
+                "app_namespace_inbound_missing_return"
+            }
+            ViolationCode::AppNamespaceInboundUnbounded => "app_namespace_inbound_unbounded",
+            ViolationCode::MissingIcmpFastFail => "missing_icmp_fast_fail",
+            ViolationCode::InterfaceSpecificAppPolicy => "interface_specific_app_policy",
+            ViolationCode::MissingListenerGuard => "missing_listener_guard",
+            ViolationCode::AppNamespaceDnatMissing => "app_namespace_dnat_missing",
+            ViolationCode::AppNamespaceDnsAfterCatchall => "app_namespace_dns_after_catchall",
+            ViolationCode::InvalidChainPolicy => "invalid_chain_policy",
         }
     }
 }
@@ -216,8 +311,17 @@ pub fn check(ruleset: &Ruleset, ctx: &CheckContext<'_>) -> Result<(), Vec<Invari
 
     let set_names: Vec<&str> = table.sets.iter().map(|set| set.name.as_str()).collect();
 
-    for required in REQUIRED_CHAINS {
-        if !table.chains.iter().any(|chain| chain.name == required) {
+    let required: &[&str] = match ctx.shape {
+        PolicyShape::Machine => &REQUIRED_CHAINS,
+        // The host side of APP scope guards the link and the forward path; it has no output policy
+        // at all, so it cannot become a machine-wide policy by accident.
+        PolicyShape::AppHost => &["in_filter", "fwd_filter"],
+        // A namespace needs both halves of the path: the DNAT that creates it, the filter that
+        // enforces it, and an input chain that makes inbound connections impossible.
+        PolicyShape::AppNamespace => &["out_filter", "out_nat", "in_filter"],
+    };
+    for required in required {
+        if !table.chains.iter().any(|chain| chain.name == *required) {
             violations.push(InvariantViolation::global(
                 ViolationCode::MissingChain,
                 format!("required chain '{required}' is absent"),
@@ -225,11 +329,59 @@ pub fn check(ruleset: &Ruleset, ctx: &CheckContext<'_>) -> Result<(), Vec<Invari
         }
     }
 
+    let forbidden: &[(&str, &str)] = match ctx.shape {
+        PolicyShape::Machine => &[],
+        PolicyShape::AppHost => &[
+            (
+                "out_filter",
+                "APP scope protects only the applications in its namespaces; an output policy \
+                 would silently turn it into machine-wide scope",
+            ),
+            (
+                "out_nat",
+                "APP scope must not redirect the machine's own traffic; only the namespace DNAT \
+                 carries application traffic",
+            ),
+        ],
+        PolicyShape::AppNamespace => &[(
+            "fwd_filter",
+            "a namespace has one link and forwards nothing; a forward chain would only hide a \
+             mistake",
+        )],
+    };
+    for (name, why) in forbidden {
+        if table.chains.iter().any(|chain| chain.name == *name) {
+            violations.push(InvariantViolation::global(
+                ViolationCode::ForbiddenChainPresent,
+                format!("chain '{name}' must not exist in this policy shape: {why}"),
+            ));
+        }
+    }
+
+    for chain in &table.chains {
+        if chain.kind == crate::ir::ChainKind::Filter
+            && !matches!(
+                chain.policy,
+                Verdict::Accept | Verdict::Drop | Verdict::Reject { .. }
+            )
+        {
+            violations.push(InvariantViolation::at(
+                chain,
+                ViolationCode::InvalidChainPolicy,
+                "a filter chain's default verdict must be a terminal verdict",
+            ));
+        }
+    }
+
     if let Some(chain) = table.chains.iter().find(|chain| chain.name == "out_filter") {
-        check_egress(chain, ctx, &set_names, &mut violations);
+        if ctx.shape == PolicyShape::Machine {
+            check_egress(chain, ctx, &set_names, &mut violations);
+        }
     }
     if let Some(chain) = table.chains.iter().find(|chain| chain.name == "out_nat") {
-        check_nat(chain, ctx, &set_names, &mut violations);
+        if ctx.shape == PolicyShape::Machine {
+            check_nat(chain, ctx, &set_names, &mut violations);
+        }
     }
     if let Some(chain) = table.chains.iter().find(|chain| chain.name == "fwd_filter") {
         if !is_deny(chain.policy) {
@@ -274,6 +426,12 @@ pub fn check(ruleset: &Ruleset, ctx: &CheckContext<'_>) -> Result<(), Vec<Invari
                 ));
             }
         }
+    }
+
+    match ctx.shape {
+        PolicyShape::Machine => {}
+        PolicyShape::AppHost => check_app_host(table, ctx, &set_names, &mut violations),
+        PolicyShape::AppNamespace => check_app_namespace(table, ctx, &set_names, &mut violations),
     }
 
     if violations.is_empty() {
@@ -596,6 +754,490 @@ fn check_nat(
     }
 }
 
+/// The names of the loopback destination sets, shared with the compiler.
+pub const LOOPBACK4_SET: &str = "loopback4";
+/// The names of the loopback destination sets, shared with the compiler.
+pub const LOOPBACK6_SET: &str = "loopback6";
+
+fn has_proto(rule: &crate::ir::Rule, proto: Proto) -> bool {
+    rule.exprs
+        .iter()
+        .any(|expr| matches!(expr, Expr::L4Proto { proto: p } if *p == proto))
+}
+
+fn dport(rule: &crate::ir::Rule) -> Option<u16> {
+    rule.exprs.iter().find_map(|expr| match expr {
+        Expr::Dport { port } => Some(*port),
+        _ => None,
+    })
+}
+
+fn daddr_set(rule: &crate::ir::Rule) -> Option<&str> {
+    rule.exprs.iter().find_map(|expr| match expr {
+        Expr::DaddrInSet { set } => Some(set.as_str()),
+        _ => None,
+    })
+}
+
+fn is_loopback(rule: &crate::ir::Rule) -> bool {
+    if !matches!(rule.origin, RuleOrigin::Loopback) {
+        return false;
+    }
+    matches!(daddr_set(rule), Some(LOOPBACK4_SET) | Some(LOOPBACK6_SET))
+        || rule.exprs.iter().any(
+            |expr| matches!(expr, Expr::Iifname { name } | Expr::Oifname { name } if name == "lo"),
+        )
+}
+
+fn is_mechanism(rule: &crate::ir::Rule, mechanism: Mechanism) -> bool {
+    matches!(
+        rule.origin,
+        RuleOrigin::Mechanism {
+            mechanism: found
+        } if found == mechanism
+    )
+}
+
+/// Interface matches are only legal when they name loopback or the configured app bridge.
+fn check_app_interfaces(
+    chain: &Chain,
+    index: usize,
+    bridge: Option<&str>,
+    out: &mut Vec<InvariantViolation>,
+) {
+    for expr in &chain.rules[index].exprs {
+        match expr {
+            Expr::Iifname { name } | Expr::Oifname { name } => {
+                let allowed = name == "lo" || bridge.is_some_and(|bridge| name == bridge);
+                if !allowed {
+                    out.push(InvariantViolation::in_rule(
+                        chain,
+                        index,
+                        ViolationCode::InterfaceSpecificAppPolicy,
+                        format!(
+                            "interface '{name}' is neither loopback nor the app bridge; APP policy \
+                             matches addresses, never generated interface names"
+                        ),
+                    ));
+                }
+            }
+            Expr::DaddrInSet { .. } => {}
+            _ => {}
+        }
+    }
+}
+
+/// The core set must exist and must contain exactly the configured core prefix.
+fn check_core_set(
+    table: &crate::ir::Table,
+    ctx: &CheckContext<'_>,
+    out: &mut Vec<InvariantViolation>,
+) {
+    let Some(core) = ctx.app_core else {
+        out.push(InvariantViolation::global(
+            ViolationCode::AppDnatOutsideCore,
+            "an APP ruleset was checked without a configured core address",
+        ));
+        return;
+    };
+    let expected = ghostnector_spec::app::app_core_element(core);
+    let declared = table.sets.iter().find(|set| set.name == APP_CORE_SET);
+    match declared {
+        Some(set) if set.elements.len() == 1 && set.elements[0] == expected => {}
+        Some(set) => out.push(InvariantViolation::global(
+            ViolationCode::AppDnatOutsideCore,
+            format!(
+                "set '{APP_CORE_SET}' must contain exactly '{expected}', but contains {:?}",
+                set.elements
+            ),
+        )),
+        None => out.push(InvariantViolation::global(
+            ViolationCode::UndeclaredSetReference,
+            format!("set '{APP_CORE_SET}' is not declared in the table"),
+        )),
+    }
+}
+
+/// The host side of APP scope: admit the app link to the core listeners, drop everything else from
+/// it, and guard the listeners against every other interface. No output policy exists here.
+fn check_app_host(
+    table: &crate::ir::Table,
+    ctx: &CheckContext<'_>,
+    set_names: &[&str],
+    out: &mut Vec<InvariantViolation>,
+) {
+    check_core_set(table, ctx, out);
+    let Some(chain) = table.chains.iter().find(|chain| chain.name == "in_filter") else {
+        return;
+    };
+    let bridge = ctx.app_bridge;
+
+    let mut covered: Vec<(Proto, u16)> = Vec::new();
+    let mut app_link_drop = false;
+
+    for (index, rule) in chain.rules.iter().enumerate() {
+        check_app_interfaces(chain, index, bridge, out);
+        if let Some(Expr::DaddrInSet { set }) = rule
+            .exprs
+            .iter()
+            .find(|expr| matches!(expr, Expr::DaddrInSet { .. }))
+        {
+            if !set_names.contains(&set.as_str()) {
+                out.push(InvariantViolation::in_rule(
+                    chain,
+                    index,
+                    ViolationCode::UndeclaredSetReference,
+                    format!("set '{set}' is not declared in the table"),
+                ));
+            }
+        }
+
+        let from_bridge = bridge.is_some_and(|bridge| {
+            rule.exprs
+                .iter()
+                .any(|expr| matches!(expr, Expr::Iifname { name } if name == bridge))
+        });
+
+        match rule.verdict {
+            Verdict::Accept => {
+                if rule.is_unconditional() {
+                    out.push(InvariantViolation::in_rule(
+                        chain,
+                        index,
+                        ViolationCode::UnconditionalAccept,
+                        "an unconditional accept would admit every packet",
+                    ));
+                }
+                if !from_bridge {
+                    // The only other accept this shape may carry is loopback delivery.
+                    if !is_loopback(rule) {
+                        out.push(InvariantViolation::in_rule(
+                            chain,
+                            index,
+                            ViolationCode::AppLinkAcceptUnbounded,
+                            "an accept in the APP host table must come from the app bridge, or be \
+                             loopback delivery",
+                        ));
+                    }
+                    continue;
+                }
+                let bound_to_core = daddr_set(rule) == Some(APP_CORE_SET);
+                let proto = if has_proto(rule, Proto::Udp) {
+                    Some(Proto::Udp)
+                } else if has_proto(rule, Proto::Tcp) {
+                    Some(Proto::Tcp)
+                } else {
+                    None
+                };
+                let port = dport(rule);
+                match (proto, port) {
+                    (Some(proto), Some(port))
+                        if bound_to_core
+                            && ctx.app_core_ports.contains(&port)
+                            && is_mechanism(rule, Mechanism::AppLink) =>
+                    {
+                        covered.push((proto, port));
+                    }
+                    _ => out.push(InvariantViolation::in_rule(
+                        chain,
+                        index,
+                        ViolationCode::AppLinkAcceptUnbounded,
+                        "an app-link accept must cite the AppLink mechanism and name the core \
+                         address set with a core listener port",
+                    )),
+                }
+            }
+            Verdict::Drop if from_bridge && is_mechanism(rule, Mechanism::AppLink) => {
+                app_link_drop = true;
+            }
+            _ => {}
+        }
+    }
+
+    // The link must be able to reach every core listener over TCP, and the chokepoint over UDP.
+    for port in ctx.app_core_ports {
+        if !covered.contains(&(Proto::Tcp, *port)) {
+            out.push(InvariantViolation::at(
+                chain,
+                ViolationCode::AppLinkAcceptMissing,
+                format!("the app link cannot reach the core listener on tcp/{port}"),
+            ));
+        }
+    }
+    if let Some(dns) = ctx.app_dns_port {
+        if !covered.contains(&(Proto::Udp, dns)) {
+            out.push(InvariantViolation::at(
+                chain,
+                ViolationCode::AppLinkAcceptMissing,
+                format!("the app link cannot reach the DNS chokepoint on udp/{dns}"),
+            ));
+        }
+    }
+
+    if !app_link_drop {
+        out.push(InvariantViolation::at(
+            chain,
+            ViolationCode::AppLinkNotClosed,
+            "nothing drops the rest of what the app link could send to the host",
+        ));
+    }
+
+    for port in ctx.app_core_ports {
+        let guarded = chain.rules.iter().any(|rule| {
+            matches!(rule.verdict, Verdict::Drop)
+                && dport(rule) == Some(*port)
+                && is_mechanism(rule, Mechanism::ListenerGuard)
+        });
+        if !guarded {
+            out.push(InvariantViolation::at(
+                chain,
+                ViolationCode::MissingListenerGuard,
+                format!(
+                    "the core listener on port {port} is not guarded against non-app interfaces"
+                ),
+            ));
+        }
+    }
+}
+
+/// One application namespace: the DNAT is the only mechanism that creates a usable path, the
+/// output filter admits only the core address, and inbound connections cannot be opened.
+fn check_app_namespace(
+    table: &crate::ir::Table,
+    ctx: &CheckContext<'_>,
+    set_names: &[&str],
+    out: &mut Vec<InvariantViolation>,
+) {
+    check_core_set(table, ctx, out);
+    let Some(core) = ctx.app_core else {
+        return;
+    };
+
+    // Every set a namespace rule names must be declared here; a union of the host's sets would be
+    // an undeclared reference, and nftables would refuse the whole ruleset at apply time.
+    for chain in &table.chains {
+        for (index, rule) in chain.rules.iter().enumerate() {
+            for expr in &rule.exprs {
+                if let Expr::DaddrInSet { set } = expr {
+                    if !set_names.contains(&set.as_str()) {
+                        out.push(InvariantViolation::in_rule(
+                            chain,
+                            index,
+                            ViolationCode::UndeclaredSetReference,
+                            format!("set '{set}' is not declared in the table"),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // --- the DNAT that creates the path -------------------------------------------------------
+    if let Some(chain) = table.chains.iter().find(|chain| chain.name == "out_nat") {
+        let mut dns_udp: Option<usize> = None;
+        let mut dns_tcp: Option<usize> = None;
+        let mut catch_all_tcp: Option<usize> = None;
+
+        for (index, rule) in chain.rules.iter().enumerate() {
+            check_app_interfaces(chain, index, None, out);
+            match rule.verdict {
+                Verdict::Return => {}
+                Verdict::Dnat { addr, port } => {
+                    if addr != core || !ctx.app_core_ports.contains(&port) {
+                        out.push(InvariantViolation::in_rule(
+                            chain,
+                            index,
+                            ViolationCode::AppDnatOutsideCore,
+                            format!(
+                                "a DNAT targets {addr}:{port}; the only permitted target is the \
+                                 core address and a core listener port"
+                            ),
+                        ));
+                    }
+                    if has_proto(rule, Proto::Udp) && dport(rule) == Some(53) {
+                        dns_udp.get_or_insert(index);
+                    }
+                    if has_proto(rule, Proto::Tcp) && dport(rule) == Some(53) {
+                        dns_tcp.get_or_insert(index);
+                    }
+                    if has_proto(rule, Proto::Tcp) && dport(rule).is_none() {
+                        catch_all_tcp.get_or_insert(index);
+                    }
+                }
+                Verdict::Redirect { .. } => out.push(InvariantViolation::in_rule(
+                    chain,
+                    index,
+                    ViolationCode::AppNamespaceNatShape,
+                    "a redirect inside a namespace would target the namespace's own loopback; the \
+                     core address is reached with DNAT",
+                )),
+                _ => out.push(InvariantViolation::in_rule(
+                    chain,
+                    index,
+                    ViolationCode::AppNamespaceNatShape,
+                    "a nat chain may only return or rewrite the destination",
+                )),
+            }
+        }
+
+        if dns_udp.is_none() || dns_tcp.is_none() {
+            out.push(InvariantViolation::at(
+                chain,
+                ViolationCode::MissingDnsRedirect,
+                "DNS must be rewritten to the core chokepoint over both UDP and TCP",
+            ));
+        }
+        if catch_all_tcp.is_none() {
+            out.push(InvariantViolation::at(
+                chain,
+                ViolationCode::AppNamespaceDnatMissing,
+                "ordinary TCP has no destination rewrite, so nothing but DNS could reach the core \
+                 address",
+            ));
+        }
+        if let Some(catch_all) = catch_all_tcp {
+            for dns in [dns_udp, dns_tcp].into_iter().flatten() {
+                if dns > catch_all {
+                    out.push(InvariantViolation::at(
+                        chain,
+                        ViolationCode::AppNamespaceDnsAfterCatchall,
+                        "the DNS rewrite appears after the catch-all TCP rewrite, so port 53 would \
+                         go to Tor instead of the chokepoint",
+                    ));
+                }
+            }
+        }
+    }
+
+    // --- the filter that enforces it ----------------------------------------------------------
+    if let Some(chain) = table.chains.iter().find(|chain| chain.name == "out_filter") {
+        if !is_deny(chain.policy) {
+            out.push(InvariantViolation::at(
+                chain,
+                ViolationCode::AppNamespaceEgressNotDeny,
+                "the namespace output chain must default to deny, or an unmatched packet could \
+                 leave",
+            ));
+        }
+        let mut udp_fast_fail = false;
+        let mut icmp_fast_fail = false;
+        let mut icmpv6_fast_fail = false;
+        for (index, rule) in chain.rules.iter().enumerate() {
+            check_app_interfaces(chain, index, None, out);
+            match rule.verdict {
+                Verdict::Accept => {
+                    if rule.is_unconditional() {
+                        out.push(InvariantViolation::in_rule(
+                            chain,
+                            index,
+                            ViolationCode::UnconditionalAccept,
+                            "an unconditional accept would admit every destination",
+                        ));
+                    }
+                    let loopback = is_loopback(rule);
+                    let core_ok = daddr_set(rule) == Some(APP_CORE_SET)
+                        && dport(rule).is_some_and(|port| ctx.app_core_ports.contains(&port))
+                        && is_mechanism(rule, Mechanism::AppCore);
+                    if !loopback && !core_ok {
+                        out.push(InvariantViolation::in_rule(
+                            chain,
+                            index,
+                            ViolationCode::AppNamespaceAcceptOutsideCore,
+                            "a namespace output accept must be loopback delivery or the core \
+                             address with a core listener port",
+                        ));
+                    }
+                }
+                Verdict::Reject { .. } => {
+                    if has_proto(rule, Proto::Udp) {
+                        udp_fast_fail = true;
+                    }
+                    if has_proto(rule, Proto::Icmp) {
+                        icmp_fast_fail = true;
+                    }
+                    if has_proto(rule, Proto::Icmpv6) {
+                        icmpv6_fast_fail = true;
+                    }
+                }
+                Verdict::Dnat { .. } | Verdict::Redirect { .. } => {
+                    out.push(InvariantViolation::in_rule(
+                        chain,
+                        index,
+                        ViolationCode::InvalidRuleShape,
+                        "a filter chain cannot rewrite the destination",
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if ctx.require_udp_fast_fail && !udp_fast_fail {
+            out.push(InvariantViolation::at(
+                chain,
+                ViolationCode::MissingUdpFastFail,
+                "UDP must be rejected rather than silently dropped, so QUIC and real-time clients \
+                 fall back instead of hanging",
+            ));
+        }
+        if !icmp_fast_fail || !icmpv6_fast_fail {
+            out.push(InvariantViolation::at(
+                chain,
+                ViolationCode::MissingIcmpFastFail,
+                "ICMP and ICMPv6 must be rejected quickly: nothing in a namespace can carry them",
+            ));
+        }
+    }
+
+    // --- inbound: replies to the app's own flows, and nothing else ----------------------------
+    if let Some(chain) = table.chains.iter().find(|chain| chain.name == "in_filter") {
+        if !is_deny(chain.policy) {
+            out.push(InvariantViolation::at(
+                chain,
+                ViolationCode::AppNamespaceInboundNotDeny,
+                "a namespace input chain must default to deny, so no inbound connection can be \
+                 opened through the app path",
+            ));
+        }
+        let mut has_return = false;
+        for (index, rule) in chain.rules.iter().enumerate() {
+            check_app_interfaces(chain, index, None, out);
+            if !matches!(rule.verdict, Verdict::Accept) {
+                continue;
+            }
+            let loopback = is_loopback(rule);
+            let established = rule.exprs.iter().any(|expr| {
+                matches!(
+                    expr,
+                    Expr::CtState {
+                        state: crate::ir::CtState::Established | crate::ir::CtState::Related
+                    }
+                )
+            }) && is_mechanism(rule, Mechanism::AppReturn);
+            if loopback {
+                continue;
+            }
+            if established {
+                has_return = true;
+                continue;
+            }
+            out.push(InvariantViolation::in_rule(
+                chain,
+                index,
+                ViolationCode::AppNamespaceInboundUnbounded,
+                "a namespace input accept must be loopback or the reply to a flow the core already \
+                 accepted",
+            ));
+        }
+        if !has_return {
+            out.push(InvariantViolation::at(
+                chain,
+                ViolationCode::AppNamespaceInboundMissingReturn,
+                "there is no acceptance for replies to the app's own flows, so its connections \
+                 would not work",
+            ));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -737,12 +1379,41 @@ mod tests {
         scope: Scope,
     ) -> CheckContext<'a> {
         CheckContext {
+            shape: PolicyShape::Machine,
             scope,
             exemptions,
             allowed_redirect_ports: ports,
             require_dns_redirect: true,
             require_udp_fast_fail: true,
             require_exemption_before_redirect: true,
+            app_core: Some(ghostnector_spec::app::DEFAULT_APP_CORE_ADDRESS),
+            app_bridge: None,
+            app_core_ports: ports,
+            app_dns_port: None,
+        }
+    }
+
+    /// The ports an APP ruleset may reach, in the test environment.
+    const APP_PORTS: [u16; 3] = [TRANS_PORT, DNS_PORT, 9050];
+
+    fn app_context<'a>(
+        shape: PolicyShape,
+        exemptions: &'a [Exemption],
+        core_ports: &'a [u16],
+        bridge: Option<&'a str>,
+    ) -> CheckContext<'a> {
+        CheckContext {
+            shape,
+            scope: Scope::App,
+            exemptions,
+            allowed_redirect_ports: &[],
+            require_dns_redirect: shape == PolicyShape::AppNamespace,
+            require_udp_fast_fail: true,
+            require_exemption_before_redirect: false,
+            app_core: Some(ghostnector_spec::app::DEFAULT_APP_CORE_ADDRESS),
+            app_bridge: bridge,
+            app_core_ports: core_ports,
+            app_dns_port: Some(DNS_PORT),
         }
     }
 
@@ -1236,5 +1907,261 @@ mod tests {
         assert!(violations
             .iter()
             .any(|v| v.code == ViolationCode::InterfaceSpecificEgressPolicy));
+    }
+
+    // ---------------------------------------------------------------- APP shapes
+
+    fn app_env() -> crate::compile::Environment {
+        crate::compile::Environment {
+            tor_uid: Some(TOR_UID),
+            dnscrypt_uid: None,
+            trans_port: TRANS_PORT,
+            chokepoint_port: DNS_PORT,
+            socks_port: 9050,
+            dhcp_client_port: 68,
+            app_core: ghostnector_spec::app::DEFAULT_APP_CORE_ADDRESS,
+            app_prefix: ghostnector_spec::app::DEFAULT_APP_PREFIX,
+            app_bridge: ghostnector_spec::app::DEFAULT_APP_BRIDGE.to_string(),
+        }
+    }
+
+    fn app_host_ruleset() -> Ruleset {
+        crate::compile::compile(
+            ghostnector_spec::backend::ProfileId::TorApp,
+            &ghostnector_spec::backend::Params::default(),
+            &app_env(),
+        )
+        .expect("the APP host profile compiles")
+        .ruleset
+    }
+
+    fn app_namespace_ruleset() -> Ruleset {
+        crate::compile::compile_app_namespace(&app_env())
+            .expect("the APP namespace profile compiles")
+            .ruleset
+    }
+
+    #[test]
+    fn the_app_host_reference_satisfies_every_property() {
+        let exemptions: [Exemption; 0] = [];
+        assert_eq!(
+            check(
+                &app_host_ruleset(),
+                &app_context(PolicyShape::AppHost, &exemptions, &APP_PORTS, Some("ghbr0")),
+            ),
+            Ok(()),
+            "the compiled APP host table must satisfy its own shape checks"
+        );
+    }
+
+    #[test]
+    fn the_app_namespace_reference_satisfies_every_property() {
+        let exemptions: [Exemption; 0] = [];
+        assert_eq!(
+            check(
+                &app_namespace_ruleset(),
+                &app_context(PolicyShape::AppNamespace, &exemptions, &APP_PORTS, None),
+            ),
+            Ok(()),
+            "the compiled APP namespace must satisfy its own shape checks"
+        );
+    }
+
+    #[test]
+    fn an_app_host_table_that_acquires_an_output_policy_is_caught() {
+        let exemptions: [Exemption; 0] = [];
+        let mut ruleset = app_host_ruleset();
+        ruleset.tables[0].chains.push(Chain {
+            name: "out_filter".to_string(),
+            kind: ChainKind::Filter,
+            hook: Hook::Output,
+            priority: 0,
+            policy: Verdict::Drop,
+            rules: vec![],
+        });
+        let violations = check(
+            &ruleset,
+            &app_context(PolicyShape::AppHost, &exemptions, &APP_PORTS, Some("ghbr0")),
+        )
+        .unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.code == ViolationCode::ForbiddenChainPresent),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_unbounded_app_link_accept_is_caught() {
+        let exemptions: [Exemption; 0] = [];
+        let mut ruleset = app_host_ruleset();
+        {
+            let rules = &mut ruleset.chain_mut("in_filter").expect("in_filter").rules;
+            let accept = rules
+                .iter_mut()
+                .find(|rule| {
+                    matches!(rule.verdict, Verdict::Accept)
+                        && matches!(
+                            rule.origin,
+                            RuleOrigin::Mechanism {
+                                mechanism: Mechanism::AppLink
+                            }
+                        )
+                })
+                .expect("the host table admits the app link");
+            // Drop the core-address bound: now it admits anything the link sends to that port.
+            accept
+                .exprs
+                .retain(|expr| !matches!(expr, Expr::DaddrInSet { .. }));
+        }
+        let violations = check(
+            &ruleset,
+            &app_context(PolicyShape::AppHost, &exemptions, &APP_PORTS, Some("ghbr0")),
+        )
+        .unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.code == ViolationCode::AppLinkAcceptUnbounded),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn an_app_link_that_is_not_closed_is_caught() {
+        let exemptions: [Exemption; 0] = [];
+        let mut ruleset = app_host_ruleset();
+        ruleset
+            .chain_mut("in_filter")
+            .unwrap()
+            .rules
+            .retain(|rule| {
+                !matches!(rule.verdict, Verdict::Drop)
+                    || !matches!(
+                        rule.origin,
+                        RuleOrigin::Mechanism {
+                            mechanism: Mechanism::AppLink
+                        }
+                    )
+            });
+        let violations = check(
+            &ruleset,
+            &app_context(PolicyShape::AppHost, &exemptions, &APP_PORTS, Some("ghbr0")),
+        )
+        .unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.code == ViolationCode::AppLinkNotClosed),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_namespace_dnat_outside_the_core_is_caught() {
+        let exemptions: [Exemption; 0] = [];
+        let mut ruleset = app_namespace_ruleset();
+        {
+            let rules = &mut ruleset.chain_mut("out_nat").unwrap().rules;
+            let dnat = rules
+                .iter_mut()
+                .find(|rule| matches!(rule.verdict, Verdict::Dnat { .. }))
+                .expect("the namespace DNATs");
+            dnat.verdict = Verdict::Dnat {
+                addr: std::net::Ipv4Addr::new(198, 51, 100, 1),
+                port: TRANS_PORT,
+            };
+        }
+        let violations = check(
+            &ruleset,
+            &app_context(PolicyShape::AppNamespace, &exemptions, &APP_PORTS, None),
+        )
+        .unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.code == ViolationCode::AppDnatOutsideCore),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_namespace_accepting_a_foreign_destination_is_caught() {
+        let exemptions: [Exemption; 0] = [];
+        let mut ruleset = app_namespace_ruleset();
+        ruleset.chain_mut("out_filter").unwrap().rules.insert(
+            0,
+            rule(
+                vec![Expr::DaddrInSet {
+                    set: "loopback4".to_string(),
+                }],
+                Verdict::Accept,
+                mechanism(Mechanism::Bootstrap),
+            ),
+        );
+        let violations = check(
+            &ruleset,
+            &app_context(PolicyShape::AppNamespace, &exemptions, &APP_PORTS, None),
+        )
+        .unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.code == ViolationCode::AppNamespaceAcceptOutsideCore),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_redirect_inside_a_namespace_is_caught() {
+        let exemptions: [Exemption; 0] = [];
+        let mut ruleset = app_namespace_ruleset();
+        ruleset.chain_mut("out_nat").unwrap().rules.push(rule(
+            vec![Expr::L4Proto { proto: Proto::Tcp }],
+            Verdict::Redirect { port: TRANS_PORT },
+            mechanism(Mechanism::TorRedirect),
+        ));
+        let violations = check(
+            &ruleset,
+            &app_context(PolicyShape::AppNamespace, &exemptions, &APP_PORTS, None),
+        )
+        .unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.code == ViolationCode::AppNamespaceNatShape),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_namespace_without_an_inbound_deny_is_caught() {
+        let exemptions: [Exemption; 0] = [];
+        let mut ruleset = app_namespace_ruleset();
+        ruleset.chain_mut("in_filter").unwrap().policy = Verdict::Accept;
+        let violations = check(
+            &ruleset,
+            &app_context(PolicyShape::AppNamespace, &exemptions, &APP_PORTS, None),
+        )
+        .unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.code == ViolationCode::AppNamespaceInboundNotDeny),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn a_violation_code_is_stable_for_the_app_shapes_too() {
+        assert_eq!(
+            ViolationCode::AppDnatOutsideCore.as_str(),
+            "app_dnat_outside_core"
+        );
+        assert_eq!(
+            ViolationCode::ForbiddenChainPresent.as_str(),
+            "forbidden_chain_present"
+        );
     }
 }

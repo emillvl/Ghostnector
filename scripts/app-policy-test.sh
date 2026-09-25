@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+#
+# The rendered APP policies, against the real kernel (M8.1).
+#
+#   scripts/app-policy-test.sh
+#
+# Three things are proved here, none of which a unit test can prove:
+#
+#   1. Every golden policy parses and resolves against the kernel that will apply it. The D-20
+#      lesson: a rendered rule can be refused by nftables ("No symbol type information"), and a
+#      policy that cannot be applied protects nothing.
+#   2. The namespace policy carries an application connection to the host-local core address with
+#      the source address preserved, sends DNS to the chokepoint, leaves direct SOCKS alone, and —
+#      when its DNAT is flushed — lets nothing reach the host link. The M8.0 topology test proves
+#      the kernel mechanics with hand-written rules; this proves the rules Ghostnector actually
+#      renders.
+#   3. The host policy admits the app link only to the core listeners: a connection to an
+#      unadmitted port on the core address is dropped, and traffic aimed elsewhere is dropped by
+#      the forward chain. The host table has no output policy, so nothing here claims the
+#      machine is protected.
+#
+# Requires: root, iproute2, nftables, python3, tcpdump.
+
+set -euo pipefail
+
+HOST_NS="gh-app-host"
+LINK_NS="gh-app-link"
+HOST_IF="ghbr0"
+LINK_IF="ghappv0"
+NS_IF="gh-appp-n"
+HOST_VETH="gh-appp-h"
+CORE="10.200.0.1"
+APP="10.200.0.2"
+TRANS_PORT="9040"
+SOCKS_PORT="9050"
+DNS_PORT="53"
+UNADMITTED_PORT="80"
+REMOTE="198.51.100.10"
+WORK="$(mktemp -d /tmp/gh-app-policy.XXXXXX)"
+GOLDEN="crates/ghostnector-policy/golden"
+
+PIDS=()
+
+cleanup() {
+    for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done
+    ip netns del "$HOST_NS" 2>/dev/null || true
+    ip netns del "$LINK_NS" 2>/dev/null || true
+    ip netns del "gh-app-ns" 2>/dev/null || true
+    ip link del "$HOST_VETH" 2>/dev/null || true
+    rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+fail() {
+    echo "FAIL: $*" >&2
+    exit 1
+}
+ok() { echo "  ok: $*"; }
+note() { echo "    $*"; }
+
+[ "$(id -u)" = "0" ] || fail "this test needs root"
+command -v nft >/dev/null || fail "nftables is required"
+command -v tcpdump >/dev/null || fail "tcpdump is required"
+[ -d "$GOLDEN" ] || fail "run this from the repository root"
+
+# ---------------------------------------------------------------- helpers
+
+cat >"$WORK/listener.py" <<'PY'
+import socket, sys
+mode, host, port, log, ready = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5]
+if mode == "tcp":
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((host, port))
+    server.listen(4)
+    server.settimeout(30)
+else:
+    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server.bind((host, port))
+    server.settimeout(30)
+with open(ready, "w") as flag:
+    flag.write("ready\n")
+with open(log, "a") as record:
+    try:
+        while True:
+            if mode == "tcp":
+                connection, peer = server.accept()
+                record.write(f"ACCEPT from {peer[0]}:{peer[1]}\n")
+                record.flush()
+                connection.close()
+            else:
+                data, peer = server.recvfrom(2048)
+                record.write(f"DGRAM from {peer[0]}:{peer[1]}\n")
+                record.flush()
+                server.sendto(b"pong", peer)
+    except OSError:
+        pass
+PY
+
+cat >"$WORK/probe.py" <<'PY'
+import socket, sys
+mode, host, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+if mode == "tcp":
+    sock = socket.socket()
+    sock.settimeout(3)
+    try:
+        sock.connect((host, port))
+        print("connect OK")
+    except Exception as error:
+        print(f"connect {type(error).__name__}: {error}")
+    finally:
+        sock.close()
+else:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(3)
+    sock.sendto(b"ping", (host, port))
+    try:
+        data, peer = sock.recvfrom(64)
+        print(f"reply from {peer[0]}:{peer[1]}")
+    except Exception as error:
+        print(f"no reply: {type(error).__name__}: {error}")
+PY
+
+wait_for_ready() {
+    for _ in $(seq 1 60); do
+        [ -f "$1" ] && return 0
+        sleep 0.05
+    done
+    return 1
+}
+
+start_listener() { # mode host port log
+    local mode="$1" host="$2" port="$3" log="$4"
+    local ready="$log.ready"
+    ip netns exec "$HOST_NS" python3 "$WORK/listener.py" "$mode" "$host" "$port" "$log" "$ready" \
+        >/dev/null 2>&1 &
+    PIDS+=("$!")
+    wait_for_ready "$ready" || fail "the $mode listener on $host:$port did not start"
+}
+
+echo "[1] every rendered policy is accepted by the kernel's own parser"
+ip netns add "gh-app-ns"
+ip netns exec "gh-app-ns" nft -c -f "$GOLDEN/tor_app_host.nft" ||
+    fail "the APP host policy is not applicable"
+ip netns exec "gh-app-ns" nft -c -f "$GOLDEN/tor_app_namespace.nft" ||
+    fail "the APP namespace policy is not applicable"
+for policy in "$GOLDEN"/fail_closed.nft "$GOLDEN"/dns_lockdown.nft "$GOLDEN"/tor_system.nft \
+    "$GOLDEN"/tor_system_lan.nft "$GOLDEN"/tor_user.nft; do
+    ip netns exec "gh-app-ns" nft -c -f "$policy" || fail "$policy is not applicable"
+done
+ip netns del "gh-app-ns"
+ok "all rendered policies parse and resolve against the kernel"
+
+# ---------------------------------------------------------------- the namespace policy
+
+echo "[2] the namespace policy carries traffic to the core and preserves the source"
+ip netns add "$HOST_NS"
+ip netns add "$LINK_NS"
+ip link add "$HOST_VETH" type veth peer name "$NS_IF"
+ip link set "$HOST_VETH" netns "$HOST_NS"
+ip link set "$NS_IF" netns "$LINK_NS"
+ip -n "$HOST_NS" addr add "$CORE/24" dev "$HOST_VETH"
+ip -n "$HOST_NS" link set "$HOST_VETH" up
+ip -n "$HOST_NS" link set lo up
+ip -n "$LINK_NS" addr add "$APP/24" dev "$NS_IF"
+ip -n "$LINK_NS" link set "$NS_IF" up
+ip -n "$LINK_NS" link set lo up
+ip -n "$LINK_NS" link add ghdead type dummy
+ip -n "$LINK_NS" link set ghdead up
+ip -n "$LINK_NS" route add default dev ghdead
+ip netns exec "$LINK_NS" sysctl -qw net.ipv6.conf.all.disable_ipv6=1
+
+start_listener tcp "$CORE" "$TRANS_PORT" "$WORK/trans.log"
+start_listener tcp "$CORE" "$SOCKS_PORT" "$WORK/socks.log"
+start_listener udp "$CORE" "$DNS_PORT" "$WORK/dns.log"
+
+ip netns exec "$LINK_NS" nft -f "$GOLDEN/tor_app_namespace.nft"
+
+ANSWER="$(ip netns exec "$LINK_NS" python3 "$WORK/probe.py" tcp "$REMOTE" 443)"
+note "the probe said '$ANSWER'"
+case "$ANSWER" in
+*"connect OK"*) ok "the namespace DNAT carried the connection to the core address" ;;
+*) fail "the rendered namespace policy did not carry the connection: $ANSWER" ;;
+esac
+grep -q "ACCEPT from $APP:" "$WORK/trans.log" ||
+    fail "the core listener did not see the application's own source address: $(cat "$WORK/trans.log")"
+ok "the source address was preserved ($APP), so the policy does not masquerade"
+
+ANSWER="$(ip netns exec "$LINK_NS" python3 "$WORK/probe.py" udp "$REMOTE" "$DNS_PORT")"
+note "the DNS probe said '$ANSWER'"
+case "$ANSWER" in
+*"reply from"*) ok "DNS was rewritten to the core chokepoint" ;;
+*) fail "the DNS rewrite did not reach the chokepoint: $ANSWER" ;;
+esac
+grep -q "DGRAM from $APP:" "$WORK/dns.log" ||
+    fail "the chokepoint did not see the application's source: $(cat "$WORK/dns.log")"
+ok "the DNS query reached the chokepoint with the source preserved"
+
+ANSWER="$(ip netns exec "$LINK_NS" python3 "$WORK/probe.py" tcp "$CORE" "$SOCKS_PORT")"
+note "the direct-SOCKS probe said '$ANSWER'"
+case "$ANSWER" in
+*"connect OK"*) ok "a direct SOCKS connection is left alone, not DNAT'ed" ;;
+*) fail "the SOCKS return rule did not leave the connection alone: $ANSWER" ;;
+esac
+
+echo "[3] with the DNAT flushed, nothing reaches the host link"
+ip netns exec "$LINK_NS" nft flush chain inet ghostnector out_nat
+ip netns exec "$HOST_NS" ip neigh flush dev "$HOST_VETH" 2>/dev/null || true
+: >"$WORK/crossed.log"
+( ip netns exec "$HOST_NS" timeout 6 tcpdump -n -Q in -i "$HOST_VETH" -c 50 'arp or ip or ip6' \
+    >"$WORK/crossed.log" 2>/dev/null || true ) &
+T=$!
+sleep 0.3
+ANSWER="$(ip netns exec "$LINK_NS" python3 "$WORK/probe.py" tcp "$REMOTE" 443)"
+note "the probe said '$ANSWER'"
+case "$ANSWER" in
+*"connect OK"*) fail "a connection succeeded with the DNAT flushed" ;;
+*) ok "the connection could not be made" ;;
+esac
+wait "$T" 2>/dev/null || true
+CROSSED="$(grep -cE '^(ARP,|IP |IP6 )' "$WORK/crossed.log" 2>/dev/null || true)"
+if [ "$CROSSED" != "0" ]; then
+    echo "  ── what the host veth saw ──"
+    sed 's/^/    /' "$WORK/crossed.log"
+    fail "the host veth saw $CROSSED frame(s) after the DNAT was flushed"
+fi
+ok "no packet and no ARP reached the host link: the flushed policy is a dead end"
+
+# ---------------------------------------------------------------- the host policy
+
+echo "[4] the host policy admits the app link only to the core listeners"
+ip link del "$HOST_VETH" 2>/dev/null || true
+ip netns del "$LINK_NS" 2>/dev/null || true
+ip netns del "$HOST_NS" 2>/dev/null || true
+
+ip netns add "$HOST_NS"
+ip netns add "$LINK_NS"
+ip link add "$HOST_IF" type veth peer name "$LINK_IF"
+ip link set "$HOST_IF" netns "$HOST_NS"
+ip link set "$LINK_IF" netns "$LINK_NS"
+ip -n "$HOST_NS" addr add "$CORE/24" dev "$HOST_IF"
+ip -n "$HOST_NS" link set "$HOST_IF" up
+ip -n "$HOST_NS" link set lo up
+ip -n "$LINK_NS" addr add "$APP/24" dev "$LINK_IF"
+ip -n "$LINK_NS" link set "$LINK_IF" up
+ip -n "$LINK_NS" link set lo up
+ip -n "$LINK_NS" route add "$REMOTE/32" via "$CORE"
+# Forwarding is what makes the forward chain relevant at all: on a machine running containers or
+# virtual machines it is enabled, and the point of `fwd_filter` is that they cannot leak. The host
+# needs a route for the forwarded packet to reach the forward hook at all; a dummy uplink stands in
+# for the real one and, being a dummy, cannot actually carry anything.
+ip netns exec "$HOST_NS" sysctl -qw net.ipv4.ip_forward=1
+ip -n "$HOST_NS" link add ghupl0 type dummy
+ip -n "$HOST_NS" link set ghupl0 up
+ip -n "$HOST_NS" route add default dev ghupl0
+
+start_listener tcp "$CORE" "$TRANS_PORT" "$WORK/trans2.log"
+start_listener tcp "$CORE" "$UNADMITTED_PORT" "$WORK/unadmitted.log"
+ip netns exec "$HOST_NS" nft -f "$GOLDEN/tor_app_host.nft"
+
+ANSWER="$(ip netns exec "$LINK_NS" python3 "$WORK/probe.py" tcp "$CORE" "$TRANS_PORT")"
+note "the admitted probe said '$ANSWER'"
+case "$ANSWER" in
+*"connect OK"*) ok "the app link reached the transparent proxy port" ;;
+*) fail "the app link was not admitted to the core listener: $ANSWER" ;;
+esac
+
+ANSWER="$(ip netns exec "$LINK_NS" python3 "$WORK/probe.py" tcp "$CORE" "$UNADMITTED_PORT")"
+note "the unadmitted probe said '$ANSWER'"
+case "$ANSWER" in
+*"connect OK"*) fail "the app link reached an unadmitted core port" ;;
+*) ok "an unadmitted core port is closed to the app link" ;;
+esac
+[ -s "$WORK/unadmitted.log" ] && fail "the unadmitted listener saw a connection"
+
+BEFORE="$(ip netns exec "$HOST_NS" nft list chain inet ghostnector fwd_filter |
+    awk '/counter packets/ { print $3; exit }')"
+ip netns exec "$LINK_NS" python3 "$WORK/probe.py" tcp "$REMOTE" 443 >/dev/null 2>&1 || true
+sleep 0.5
+AFTER="$(ip netns exec "$HOST_NS" nft list chain inet ghostnector fwd_filter |
+    awk '/counter packets/ { print $3; exit }')"
+note "forward-chain counter: $BEFORE -> $AFTER"
+[ "${AFTER:-0}" -gt "${BEFORE:-0}" ] ||
+    fail "traffic aimed past the core address was not dropped by the forward chain"
+ok "traffic aimed elsewhere was dropped by the forward chain"
+
+echo
+echo "PASS: APP policy (applicable, DNAT with source preserved, dead end, bounded host link)"

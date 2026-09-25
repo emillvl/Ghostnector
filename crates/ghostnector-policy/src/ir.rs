@@ -192,6 +192,18 @@ pub enum Mechanism {
     TorRedirect,
     /// Redirect local DNS into the chokepoint.
     DnsRedirect,
+    /// Rewrite an APP namespace packet's destination to the host-local core address so it can be
+    /// delivered to Tor or the chokepoint. This is the only mechanism that creates a usable path
+    /// out of a dead-end namespace (M8 decision 1).
+    AppDnat,
+    /// Admit the APP link to the core listeners on the host side, and leave direct SOCKS traffic
+    /// to the core address untouched.
+    AppLink,
+    /// Accept a packet whose destination is the host-local core address inside an APP namespace.
+    AppCore,
+    /// Admit the replies of flows the core already accepted, so inbound connections cannot be
+    /// opened through an APP namespace.
+    AppReturn,
     /// The counted default-deny rule at the end of a chain.
     DefaultDeny,
     /// Reject UDP and ICMP quickly so applications fall back instead of hanging.
@@ -222,6 +234,18 @@ pub enum Verdict {
     /// Rewrite the destination to a loopback address and port (transparent proxy capture).
     Redirect {
         /// Destination port.
+        port: u16,
+    },
+    /// Rewrite the destination to a host-local address and port (APP namespace capture).
+    ///
+    /// This is deliberately the *only* rewrite verdict besides [`Verdict::Redirect`]: the IR has no
+    /// source-rewriting verdict at all, so a policy cannot express SNAT or masquerade (M8 decision
+    /// 1, DR-7). The address is a typed [`std::net::Ipv4Addr`], not a string, and the invariant
+    /// checker requires it to be the configured APP core address.
+    Dnat {
+        /// Destination address the packet is rewritten to.
+        addr: std::net::Ipv4Addr,
+        /// Destination port the packet is rewritten to.
         port: u16,
     },
 }

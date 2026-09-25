@@ -44,6 +44,12 @@ pub const DEFAULT_SOCKS_PORT: u16 = 9050;
 /// Default source port of the DHCP client.
 pub const DEFAULT_DHCP_CLIENT_PORT: u16 = 68;
 
+/// Default bridge carrying APP links. The single source of truth lives in the shared vocabulary.
+pub const DEFAULT_APP_BRIDGE: &str = ghostnector_spec::app::DEFAULT_APP_BRIDGE;
+
+/// Default host-local APP core address.
+pub const DEFAULT_APP_CORE: std::net::Ipv4Addr = ghostnector_spec::app::DEFAULT_APP_CORE_ADDRESS;
+
 /// Validated configuration for the helper.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -70,6 +76,10 @@ pub struct Config {
     pub socks_port: u16,
     /// DHCP client source port.
     pub dhcp_client_port: u16,
+    /// The bridge carrying APP links on the host side.
+    pub app_bridge: String,
+    /// The host-local address an APP namespace DNATs to.
+    pub app_core: std::net::Ipv4Addr,
 }
 
 /// What the command line asked for.
@@ -133,6 +143,8 @@ OPTIONS:
                               (must be the port a nameserver line implies)
     --socks-port <PORT>    Tor SOCKS port              [default: 9050]
     --dhcp-client-port <PORT> DHCP client source port  [default: 68]
+    --app-bridge <NAME>    bridge carrying APP links   [default: ghbr0]
+    --app-core <ADDR>      host-local APP core address [default: 10.200.0.1]
     -h, --help             print this text
     -V, --version          print the version";
 
@@ -152,6 +164,8 @@ OPTIONS:
         let mut chokepoint_port = DEFAULT_CHOKEPOINT_PORT;
         let mut socks_port = DEFAULT_SOCKS_PORT;
         let mut dhcp_client_port = DEFAULT_DHCP_CLIENT_PORT;
+        let mut app_bridge = DEFAULT_APP_BRIDGE.to_string();
+        let mut app_core = DEFAULT_APP_CORE;
 
         let mut arguments = args.into_iter().peekable();
         while let Some(option) = arguments.next() {
@@ -215,6 +229,32 @@ OPTIONS:
                 "--chokepoint-port" => chokepoint_port = port(&option, &value()?)?,
                 "--socks-port" => socks_port = port(&option, &value()?)?,
                 "--dhcp-client-port" => dhcp_client_port = port(&option, &value()?)?,
+                "--app-bridge" => {
+                    let name = value()?;
+                    if !ghostnector_spec::app::valid_interface_name(&name) {
+                        return Err(ConfigError::Invalid {
+                            option: option.clone(),
+                            reason: "expected an interface name of up to 15 characters".to_string(),
+                        });
+                    }
+                    app_bridge = name;
+                }
+                "--app-core" => {
+                    let raw = value()?;
+                    let address: std::net::Ipv4Addr =
+                        raw.parse().map_err(|_| ConfigError::Invalid {
+                            option: option.clone(),
+                            reason: "expected an IPv4 address".to_string(),
+                        })?;
+                    if !address.is_private() {
+                        return Err(ConfigError::Invalid {
+                            option: option.clone(),
+                            reason: "the APP core address must be a private (non-routable) address"
+                                .to_string(),
+                        });
+                    }
+                    app_core = address;
+                }
                 other => return Err(ConfigError::Unknown(other.to_string())),
             }
         }
@@ -250,20 +290,25 @@ OPTIONS:
             chokepoint_port,
             socks_port,
             dhcp_client_port,
+            app_bridge,
+            app_core,
         }))
     }
 
     /// A one-line description for the log, containing no paths a listener could not already see.
     pub fn summary(&self) -> String {
         format!(
-            "socket={} peer_uid={} tor_user={} dnscrypt_user={} ports=trans:{}/dns:{}/socks:{}",
+            "socket={} peer_uid={} tor_user={} dnscrypt_user={} ports=trans:{}/dns:{}/socks:{} \
+             app={}/{}",
             self.socket.display(),
             self.peer_uid,
             self.tor_user,
             self.dnscrypt_user,
             self.trans_port,
             self.chokepoint_port,
-            self.socks_port
+            self.socks_port,
+            self.app_bridge,
+            self.app_core,
         )
     }
 }
@@ -343,6 +388,8 @@ mod tests {
         assert_eq!(config.chokepoint_port, 53);
         assert_eq!(config.socks_port, 9050);
         assert_eq!(config.dhcp_client_port, 68);
+        assert_eq!(config.app_bridge, "ghbr0");
+        assert_eq!(config.app_core, std::net::Ipv4Addr::new(10, 200, 0, 1));
     }
 
     #[test]
@@ -520,5 +567,49 @@ mod tests {
         let summary = config.summary();
         assert!(summary.contains("peer_uid=1000"));
         assert!(summary.contains("trans:9040"));
+        assert!(summary.contains("app=ghbr0/10.200.0.1"));
+    }
+
+    #[test]
+    fn the_app_identity_is_validated_rather_than_trusted() {
+        // A bridge name is generated by us and reaches a privileged argv; it must be restrained.
+        for bad in ["", "with space", "with/slash", "waytoolongwaytoolong"] {
+            let error = Config::parse(args(&[
+                "--socket",
+                "/run/x.sock",
+                "--peer-uid",
+                "1",
+                "--app-bridge",
+                bad,
+            ]))
+            .unwrap_err();
+            assert!(matches!(error, ConfigError::Invalid { .. }), "{bad}");
+        }
+        // The core address must be a private, non-routable address: it is a host-local path, not a
+        // destination.
+        let error = Config::parse(args(&[
+            "--socket",
+            "/run/x.sock",
+            "--peer-uid",
+            "1",
+            "--app-core",
+            "198.51.100.1",
+        ]))
+        .unwrap_err();
+        assert!(matches!(error, ConfigError::Invalid { .. }));
+
+        // The APP address-space prefix belongs to the namespace helper, which allocates the
+        // addresses. This helper only names the core address, so it does not accept the option:
+        // minimizing the privileged surface means not carrying a knob that does nothing here.
+        let error = Config::parse(args(&[
+            "--socket",
+            "/run/x.sock",
+            "--peer-uid",
+            "1",
+            "--app-prefix",
+            "24",
+        ]))
+        .unwrap_err();
+        assert_eq!(error, ConfigError::Unknown("--app-prefix".to_string()));
     }
 }

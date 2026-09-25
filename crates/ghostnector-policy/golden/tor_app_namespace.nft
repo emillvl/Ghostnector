@@ -1,0 +1,47 @@
+destroy table inet ghostnector
+table inet ghostnector {
+    set loopback4 {
+        type ipv4_addr
+        flags interval
+        elements = { 127.0.0.0/8 }
+    }
+    set loopback6 {
+        type ipv6_addr
+        flags interval
+        elements = { ::1/128 }
+    }
+    set appcore4 {
+        type ipv4_addr
+        flags interval
+        elements = { 10.200.0.1/32 }
+    }
+    chain out_nat {
+        type nat hook output priority -100; policy accept;
+        ip daddr @loopback4 counter return comment "traffic to a loopback address cannot leave the machine"
+        ip6 daddr @loopback6 counter return comment "traffic to a loopback address cannot leave the machine"
+        ip daddr @appcore4 tcp dport 9050 counter return comment "direct SOCKS keeps its own circuit"
+        udp dport 53 counter dnat ip to 10.200.0.1:53 comment "DNS goes to the chokepoint"
+        tcp dport 53 counter dnat ip to 10.200.0.1:53 comment "DNS goes to the chokepoint"
+        meta l4proto tcp counter dnat ip to 10.200.0.1:9040 comment "transparent Tor for TCP"
+    }
+    chain out_filter {
+        type filter hook output priority 0; policy drop;
+        ip daddr @loopback4 counter accept comment "traffic to a loopback address cannot leave the machine"
+        ip6 daddr @loopback6 counter accept comment "traffic to a loopback address cannot leave the machine"
+        ip daddr @appcore4 tcp dport 9040 counter accept comment "the core listener the DNAT produced"
+        ip daddr @appcore4 tcp dport 53 counter accept comment "the core listener the DNAT produced"
+        ip daddr @appcore4 tcp dport 9050 counter accept comment "the core listener the DNAT produced"
+        ip daddr @appcore4 udp dport 53 counter accept comment "the DNS chokepoint"
+        meta l4proto udp counter reject with icmpx type port-unreachable comment "QUIC and real-time clients must fail in milliseconds, not hang"
+        meta l4proto icmp counter reject with icmpx type admin-prohibited comment "ICMP is not carried by Tor"
+        meta l4proto ipv6-icmp counter reject with icmpx type admin-prohibited comment "IPv6 is denied in every profile"
+        counter drop comment "deny by default"
+    }
+    chain in_filter {
+        type filter hook input priority 0; policy drop;
+        iifname "lo" counter accept comment "loopback delivery"
+        ct state established counter accept comment "replies to flows the core accepted"
+        ct state related counter accept comment "replies to flows the core accepted"
+        counter drop comment "deny by default"
+    }
+}

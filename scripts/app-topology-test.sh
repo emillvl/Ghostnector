@@ -190,7 +190,7 @@ case "$ANSWER" in
 esac
 wait "$HOSTV_PID" 2>/dev/null || true
 HOSTV_PID=""
-CROSSED="$(grep -c . "$WORK/crossed.log" 2>/dev/null || true)"
+CROSSED="$(grep -cE '^(ARP,|IP |IP6 )' "$WORK/crossed.log" 2>/dev/null || true)"
 if [ "$CROSSED" != "0" ]; then
     echo "  ── what the host veth saw ──"
     sed 's/^/    /' "$WORK/crossed.log"

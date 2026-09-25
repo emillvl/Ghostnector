@@ -18,8 +18,12 @@ use ghostnector_spec::exemption::{
 };
 use ghostnector_spec::profile::Scope;
 use serde::{Deserialize, Serialize};
+use std::net::Ipv4Addr;
 
-use crate::invariants::{check, CheckContext, InvariantViolation, TABLE_NAME};
+use crate::invariants::{
+    check, CheckContext, InvariantViolation, PolicyShape, APP_CORE_SET, LOOPBACK4_SET,
+    LOOPBACK6_SET, TABLE_NAME,
+};
 use crate::ir::{
     Chain, ChainKind, Expr, Family, Hook, Mechanism, Proto, RejectKind, Rule, RuleOrigin, Ruleset,
     Set, SetKind, Table, Verdict,
@@ -87,6 +91,24 @@ pub struct Environment {
     pub socks_port: u16,
     /// Port the DHCP client uses as a source, allowed so the link survives.
     pub dhcp_client_port: u16,
+    /// The host-local address an APP namespace's DNAT targets, and the address the app-facing
+    /// listeners bind. Never a routable destination; the helper derives it from its own
+    /// configuration and validates it (M8 decision 1).
+    pub app_core: Ipv4Addr,
+    /// Prefix length of the APP address space. Used by the namespace helper to allocate app
+    /// addresses; the host policy only ever names the core address itself.
+    pub app_prefix: u8,
+    /// The bridge that carries app links on the host side. The helper generates and validates it;
+    /// it is never accepted from a peer.
+    pub app_bridge: String,
+}
+
+impl Environment {
+    /// The APP address space this environment describes, for the namespace helper's address
+    /// allocation. The policy engine itself never needs the prefix: it names the core host address.
+    pub fn app_network(&self) -> (std::net::Ipv4Addr, u8) {
+        (self.app_core, self.app_prefix)
+    }
 }
 
 /// A ruleset that has been compiled and verified.
@@ -135,23 +157,26 @@ pub fn compile(
     params: &Params,
     env: &Environment,
 ) -> Result<CompiledPolicy, PolicyError> {
-    let (scope, chains, sets, require_dns_redirect) = match profile {
+    let (scope, chains, sets, shape, require_dns_redirect) = match profile {
         ProfileId::FailClosed => (
             Scope::System,
             fail_closed_chains(env)?,
             table_sets(params.allow_lan),
+            PolicyShape::Machine,
             false,
         ),
         ProfileId::DnsLockdown => (
             Scope::System,
             dns_lockdown_chains(env, params.allow_lan)?,
             table_sets(params.allow_lan),
+            PolicyShape::Machine,
             true,
         ),
         ProfileId::TorSystem => (
             Scope::System,
             tor_chains(env, Scope::System, None, params.allow_lan)?,
             table_sets(params.allow_lan),
+            PolicyShape::Machine,
             true,
         ),
         ProfileId::TorUser => {
@@ -163,10 +188,27 @@ pub fn compile(
                 Scope::User,
                 tor_chains(env, Scope::User, Some(uid), params.allow_lan)?,
                 table_sets(params.allow_lan),
+                PolicyShape::Machine,
                 true,
             )
         }
-        ProfileId::TorApp | ProfileId::I2pIsolated => {
+        ProfileId::TorApp => {
+            if params.allow_lan {
+                return Err(PolicyError::InvalidParameter(
+                    "allow_lan",
+                    "APP scope preserves source identity and does not use SNAT or masquerade, so \
+                     LAN access is unsupported under the APP architecture",
+                ));
+            }
+            (
+                Scope::App,
+                app_host_chains(env),
+                app_sets(env),
+                PolicyShape::AppHost,
+                false,
+            )
+        }
+        ProfileId::I2pIsolated => {
             return Err(PolicyError::Unsupported(profile));
         }
     };
@@ -182,18 +224,66 @@ pub fn compile(
 
     let exemptions = effective_exemptions(&ruleset)?;
     let allowed_ports = [env.trans_port, env.chokepoint_port];
+    let app_ports = [env.trans_port, env.chokepoint_port, env.socks_port];
     let ctx = CheckContext {
+        shape,
         scope,
         exemptions: &exemptions,
         allowed_redirect_ports: &allowed_ports,
         require_dns_redirect,
         require_udp_fast_fail: true,
         require_exemption_before_redirect: true,
+        app_core: Some(env.app_core),
+        app_bridge: (shape == PolicyShape::AppHost).then_some(env.app_bridge.as_str()),
+        app_core_ports: &app_ports,
+        app_dns_port: Some(env.chokepoint_port),
     };
     check(&ruleset, &ctx)?;
 
     Ok(CompiledPolicy {
         profile,
+        ruleset,
+        exemptions,
+    })
+}
+
+/// Compile the ruleset that lives *inside* one APP namespace.
+///
+/// This is the other half of `APP` scope. It has no exemptions and no output interface: its whole
+/// job is to rewrite every application connection to the host-local core address and to deny
+/// everything that is not either loopback or a reply to a flow the core already accepted. A
+/// separate entry point, rather than a `ProfileId`, keeps the helper's closed verb set closed: the
+/// namespace helper renders this from its own configuration, never from a client request.
+pub fn compile_app_namespace(env: &Environment) -> Result<CompiledPolicy, PolicyError> {
+    let ruleset = Ruleset {
+        tables: vec![Table {
+            family: Family::Inet,
+            name: TABLE_NAME.to_string(),
+            sets: app_sets(env),
+            chains: app_namespace_chains(env),
+        }],
+    };
+
+    let exemptions = effective_exemptions(&ruleset)?;
+    let allowed_ports = [env.trans_port, env.chokepoint_port];
+    let app_ports = [env.trans_port, env.chokepoint_port, env.socks_port];
+    let ctx = CheckContext {
+        shape: PolicyShape::AppNamespace,
+        scope: Scope::App,
+        exemptions: &exemptions,
+        allowed_redirect_ports: &allowed_ports,
+        require_dns_redirect: true,
+        require_udp_fast_fail: true,
+        require_exemption_before_redirect: false,
+        app_core: Some(env.app_core),
+        app_bridge: None,
+        app_core_ports: &app_ports,
+        app_dns_port: Some(env.chokepoint_port),
+    };
+    check(&ruleset, &ctx)?;
+
+    Ok(CompiledPolicy {
+        profile: ProfileId::TorApp,
         ruleset,
         exemptions,
     })
@@ -321,18 +411,249 @@ fn loopback_address_rules(verdict: Verdict) -> Vec<Rule> {
 fn table_sets(allow_lan: bool) -> Vec<Set> {
     let mut sets = vec![
         Set {
-            name: "loopback4".to_string(),
+            name: LOOPBACK4_SET.to_string(),
             kind: SetKind::Ipv4Addr,
             elements: LOOPBACK4.iter().map(|cidr| cidr.to_string()).collect(),
         },
         Set {
-            name: "loopback6".to_string(),
+            name: LOOPBACK6_SET.to_string(),
             kind: SetKind::Ipv6Addr,
             elements: LOOPBACK6.iter().map(|cidr| cidr.to_string()).collect(),
         },
     ];
     sets.extend(lan_sets(allow_lan));
     sets
+}
+
+/// The sets an APP ruleset declares: loopback, and the host-local core address.
+///
+/// The core set is a single host prefix, not the whole APP subnet: the only address an APP packet
+/// may legitimately reach is the core itself.
+fn app_sets(env: &Environment) -> Vec<Set> {
+    vec![
+        Set {
+            name: LOOPBACK4_SET.to_string(),
+            kind: SetKind::Ipv4Addr,
+            elements: LOOPBACK4.iter().map(|cidr| cidr.to_string()).collect(),
+        },
+        Set {
+            name: LOOPBACK6_SET.to_string(),
+            kind: SetKind::Ipv6Addr,
+            elements: LOOPBACK6.iter().map(|cidr| cidr.to_string()).collect(),
+        },
+        Set {
+            name: APP_CORE_SET.to_string(),
+            kind: SetKind::Ipv4Addr,
+            elements: vec![ghostnector_spec::app::app_core_element(env.app_core)],
+        },
+    ]
+}
+
+/// The host side of `APP` scope: everything is input or forward. There is deliberately no output
+/// chain, so activating APP scope can never change what the machine's own processes may do.
+fn app_host_chains(env: &Environment) -> Vec<Chain> {
+    let bridge = || Expr::Iifname {
+        name: env.app_bridge.clone(),
+    };
+    let core = || Expr::DaddrInSet {
+        set: APP_CORE_SET.to_string(),
+    };
+
+    let mut rules = vec![rule(
+        vec![Expr::Iifname {
+            name: "lo".to_string(),
+        }],
+        Verdict::Accept,
+        RuleOrigin::Loopback,
+        "loopback delivery",
+    )];
+
+    // The app link reaches exactly the core listeners the namespace DNAT targets.
+    for port in [env.trans_port, env.chokepoint_port, env.socks_port] {
+        rules.push(rule(
+            vec![
+                bridge(),
+                core(),
+                Expr::L4Proto { proto: Proto::Tcp },
+                Expr::Dport { port },
+            ],
+            Verdict::Accept,
+            mechanism(Mechanism::AppLink),
+            "the app link reaches this core listener",
+        ));
+    }
+    rules.push(rule(
+        vec![
+            bridge(),
+            core(),
+            Expr::L4Proto { proto: Proto::Udp },
+            Expr::Dport {
+                port: env.chokepoint_port,
+            },
+        ],
+        Verdict::Accept,
+        mechanism(Mechanism::AppLink),
+        "the app link reaches the DNS chokepoint",
+    ));
+
+    // Anything else from the app link is closed here, before it can reach a host service.
+    rules.push(rule(
+        vec![bridge()],
+        Verdict::Drop,
+        mechanism(Mechanism::AppLink),
+        "nothing else from the app link",
+    ));
+
+    // Second line of defence: the core listeners are never for any other interface.
+    for port in [env.trans_port, env.chokepoint_port, env.socks_port] {
+        rules.push(rule(
+            vec![Expr::L4Proto { proto: Proto::Tcp }, Expr::Dport { port }],
+            Verdict::Drop,
+            mechanism(Mechanism::ListenerGuard),
+            "the transparent proxies are not for the network",
+        ));
+    }
+    rules.push(rule(
+        vec![
+            Expr::L4Proto { proto: Proto::Udp },
+            Expr::Dport {
+                port: env.chokepoint_port,
+            },
+        ],
+        Verdict::Drop,
+        mechanism(Mechanism::ListenerGuard),
+        "the DNS chokepoint is not for the network",
+    ));
+
+    vec![
+        Chain {
+            name: "in_filter".to_string(),
+            kind: ChainKind::Filter,
+            hook: Hook::Input,
+            priority: FILTER_PRIORITY,
+            policy: Verdict::Accept,
+            rules,
+        },
+        forward_chain(),
+    ]
+}
+
+/// The ruleset inside one APP namespace. This is the only place a DNAT verdict appears.
+fn app_namespace_chains(env: &Environment) -> Vec<Chain> {
+    let core = || Expr::DaddrInSet {
+        set: APP_CORE_SET.to_string(),
+    };
+    let dnat_to = |port: u16| Verdict::Dnat {
+        addr: env.app_core,
+        port,
+    };
+
+    let mut nat_rules = loopback_address_rules(Verdict::Return);
+    // Direct SOCKS is deliberately left untouched: an app that speaks SOCKS keeps its own
+    // credential-based isolation, and the source address already separates groups.
+    nat_rules.push(rule(
+        vec![
+            core(),
+            Expr::L4Proto { proto: Proto::Tcp },
+            Expr::Dport {
+                port: env.socks_port,
+            },
+        ],
+        Verdict::Return,
+        mechanism(Mechanism::AppCore),
+        "direct SOCKS keeps its own circuit",
+    ));
+    // DNS before the catch-all, or port 53 would be carried by Tor instead of the chokepoint.
+    for proto in [Proto::Udp, Proto::Tcp] {
+        nat_rules.push(rule(
+            vec![Expr::L4Proto { proto }, Expr::Dport { port: 53 }],
+            dnat_to(env.chokepoint_port),
+            mechanism(Mechanism::DnsRedirect),
+            "DNS goes to the chokepoint",
+        ));
+    }
+    nat_rules.push(rule(
+        vec![Expr::L4Proto { proto: Proto::Tcp }],
+        dnat_to(env.trans_port),
+        mechanism(Mechanism::TorRedirect),
+        "transparent Tor for TCP",
+    ));
+
+    let mut egress_rules = loopback_address_rules(Verdict::Accept);
+    for port in [env.trans_port, env.chokepoint_port, env.socks_port] {
+        egress_rules.push(rule(
+            vec![
+                core(),
+                Expr::L4Proto { proto: Proto::Tcp },
+                Expr::Dport { port },
+            ],
+            Verdict::Accept,
+            mechanism(Mechanism::AppCore),
+            "the core listener the DNAT produced",
+        ));
+    }
+    egress_rules.push(rule(
+        vec![
+            core(),
+            Expr::L4Proto { proto: Proto::Udp },
+            Expr::Dport {
+                port: env.chokepoint_port,
+            },
+        ],
+        Verdict::Accept,
+        mechanism(Mechanism::AppCore),
+        "the DNS chokepoint",
+    ));
+    egress_rules.extend(fast_fail_rules());
+    egress_rules.push(default_deny_rule());
+
+    // Inbound: replies to the app's own flows, and nothing else. Without this, a one-line change on
+    // the host side could open the app to the host or the bridge.
+    let return_mechanism = mechanism(Mechanism::AppReturn);
+    let mut input_rules = vec![rule(
+        vec![Expr::Iifname {
+            name: "lo".to_string(),
+        }],
+        Verdict::Accept,
+        RuleOrigin::Loopback,
+        "loopback delivery",
+    )];
+    for state in [crate::ir::CtState::Established, crate::ir::CtState::Related] {
+        input_rules.push(rule(
+            vec![Expr::CtState { state }],
+            Verdict::Accept,
+            return_mechanism.clone(),
+            "replies to flows the core accepted",
+        ));
+    }
+    input_rules.push(default_deny_rule());
+
+    vec![
+        Chain {
+            name: "out_nat".to_string(),
+            kind: ChainKind::Nat,
+            hook: Hook::Output,
+            priority: NAT_PRIORITY,
+            policy: Verdict::Accept,
+            rules: nat_rules,
+        },
+        Chain {
+            name: "out_filter".to_string(),
+            kind: ChainKind::Filter,
+            hook: Hook::Output,
+            priority: FILTER_PRIORITY,
+            policy: Verdict::Drop,
+            rules: egress_rules,
+        },
+        Chain {
+            name: "in_filter".to_string(),
+            kind: ChainKind::Filter,
+            hook: Hook::Input,
+            priority: FILTER_PRIORITY,
+            policy: Verdict::Drop,
+            rules: input_rules,
+        },
+    ]
 }
 
 /// Port a DHCP server listens on, which is where a client's request goes.
@@ -666,6 +987,9 @@ mod tests {
             chokepoint_port: 53,
             socks_port: 9050,
             dhcp_client_port: 68,
+            app_core: ghostnector_spec::app::DEFAULT_APP_CORE_ADDRESS,
+            app_prefix: ghostnector_spec::app::DEFAULT_APP_PREFIX,
+            app_bridge: ghostnector_spec::app::DEFAULT_APP_BRIDGE.to_string(),
         }
     }
 
@@ -891,9 +1215,84 @@ mod tests {
 
     #[test]
     fn profiles_without_an_implementation_are_rejected_rather_than_approximated() {
-        for profile in [ProfileId::TorApp, ProfileId::I2pIsolated] {
-            let error = compile(profile, &Params::default(), &env()).unwrap_err();
-            assert!(matches!(error, PolicyError::Unsupported(_)));
+        let error = compile(ProfileId::I2pIsolated, &Params::default(), &env()).unwrap_err();
+        assert!(matches!(error, PolicyError::Unsupported(_)));
+    }
+
+    #[test]
+    fn the_app_host_table_has_no_output_policy_and_bounds_the_link() {
+        let policy = compile(ProfileId::TorApp, &Params::default(), &env()).unwrap();
+        assert_eq!(
+            policy.ruleset.chain_names(),
+            vec!["in_filter", "fwd_filter"],
+            "APP scope protects its applications; it must not acquire an output policy"
+        );
+        assert!(
+            policy.exemptions.is_empty(),
+            "the APP host table grants no identity a path: {:?}",
+            subjects(&policy)
+        );
+
+        let rendered = render_table(&policy.ruleset);
+        assert!(
+            rendered.contains("iifname \"ghbr0\""),
+            "the app link must be admitted by name: {rendered}"
+        );
+        assert!(
+            rendered.contains("ip daddr @appcore4 tcp dport 9040 counter accept"),
+            "the app link reaches the transparent proxy: {rendered}"
+        );
+        assert!(
+            rendered.contains("ip daddr @appcore4 udp dport 53 counter accept"),
+            "the app link reaches the chokepoint: {rendered}"
+        );
+        assert!(
+            !rendered.contains("redirect to"),
+            "an APP host table must not redirect anything: {rendered}"
+        );
+    }
+
+    #[test]
+    fn app_scope_refuses_lan_access_rather_than_weakening_source_identity() {
+        let params = Params {
+            allow_lan: true,
+            ..Params::default()
+        };
+        let error = compile(ProfileId::TorApp, &params, &env()).unwrap_err();
+        match error {
+            PolicyError::InvalidParameter("allow_lan", reason) => {
+                assert!(reason.contains("unsupported"), "{reason}");
+            }
+            other => panic!("expected the LAN parameter to be refused, got {other}"),
+        }
+    }
+
+    #[test]
+    fn the_app_namespace_dnats_only_to_the_core_and_denies_everything_else() {
+        let policy = compile_app_namespace(&env()).unwrap();
+        assert_eq!(
+            policy.ruleset.chain_names(),
+            vec!["out_nat", "out_filter", "in_filter"],
+            "a namespace has one output path and no forwarding"
+        );
+        let rendered = render_table(&policy.ruleset);
+        for expected in [
+            "udp dport 53 counter dnat ip to 10.200.0.1:53",
+            "tcp dport 53 counter dnat ip to 10.200.0.1:53",
+            "meta l4proto tcp counter dnat ip to 10.200.0.1:9040",
+            "ct state established counter accept",
+            "ct state related counter accept",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing '{expected}' in:\n{rendered}"
+            );
+        }
+        for forbidden in ["masquerade", "snat", "redirect to"] {
+            assert!(
+                !rendered.contains(forbidden),
+                "a namespace ruleset must not contain '{forbidden}':\n{rendered}"
+            );
         }
     }
 
@@ -904,6 +1303,7 @@ mod tests {
             (ProfileId::FailClosed, Params::default()),
             (ProfileId::DnsLockdown, Params::default()),
             (ProfileId::TorSystem, Params::default()),
+            (ProfileId::TorApp, Params::default()),
             (
                 ProfileId::TorSystem,
                 Params {
