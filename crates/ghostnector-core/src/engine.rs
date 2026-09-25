@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use ghostnector_spec::appd::{
     AppResponse, AppVerb, CanaryCheck, HttpCheck, ProbeConfig, ProbeOutcome,
 };
-use ghostnector_spec::backend::{Params, Ports, ProfileId, Report, Verb};
+use ghostnector_spec::backend::{I2pPorts, Params, Ports, ProfileId, Report, Verb};
 use ghostnector_spec::ipc::HelperResponse;
 use ghostnector_spec::state::AppStatus;
 use ghostnector_spec::{
@@ -645,7 +645,7 @@ impl Engine {
 
         // The ports come from the helper, so Tor is configured with the same numbers the firewall
         // redirects into. Two sources for one port is how DNS silently stops working.
-        let ports = self.helper_ports()?;
+        let (ports, i2p_ports) = self.helper_ports()?;
         if target == ProfileId::TorApp {
             // The bridge is created only after the host table exists: deny first, then the path.
             self.ensure_app_bridge(ports)?;
@@ -654,6 +654,7 @@ impl Engine {
             target,
             ports,
             (target == ProfileId::TorApp).then_some(self.config.app_core),
+            i2p_ports,
         )?;
 
         let report = self.apply(target, params)?;
@@ -681,9 +682,10 @@ impl Engine {
         self.app_helper.invoke(verb)
     }
 
-    /// Ask the helper which ports its policy redirects into.
-    fn helper_ports(&self) -> Result<Ports, EngineError> {
-        Ok(report_from(self.helper.invoke(Verb::Report)?)?.ports)
+    /// Ask the helper which ports its policy redirects into and which proxy ports it guards.
+    fn helper_ports(&self) -> Result<(Ports, I2pPorts), EngineError> {
+        let report = report_from(self.helper.invoke(Verb::Report)?)?;
+        Ok((report.ports, report.i2p_ports))
     }
 
     /// Start the DNS chokepoint on the port the policy redirects into, and point the machine's own

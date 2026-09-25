@@ -305,6 +305,7 @@ impl MockHelper {
                 uid: Some(987),
             }],
             ports: Ports::default(),
+            i2p_ports: ghostnector_spec::backend::I2pPorts::default(),
             notes: Vec::new(),
         }
     }
@@ -421,6 +422,7 @@ impl Services for MockServices {
         profile: ProfileId,
         _ports: Ports,
         _app_core: Option<std::net::Ipv4Addr>,
+        _i2p_ports: ghostnector_spec::backend::I2pPorts,
     ) -> Result<(), ServiceError> {
         if let Some(message) = self.fail_bring_up.lock().expect("mock lock").clone() {
             return Err(ServiceError::Config(message));

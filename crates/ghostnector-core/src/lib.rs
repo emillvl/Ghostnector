@@ -22,7 +22,11 @@ pub mod chokepoint;
 pub mod engine;
 pub mod fsutil;
 pub mod helper;
+pub mod i2pdconf;
 pub mod journal;
+
+#[cfg(test)]
+pub mod hardening;
 pub mod resolver;
 pub mod server;
 pub mod services;
@@ -40,13 +44,14 @@ pub use apphelper::{AppHelper, AppHelperLink};
 pub use chokepoint::{ChildRelay, ChokepointError, DnsRelay};
 pub use engine::{Engine, EngineConfig, EngineError};
 pub use helper::{Helper, HelperError, HelperLink};
+pub use i2pdconf::I2pSettings;
 pub use journal::{Intent, Journal, JournalError};
 pub use resolver::{
     Baseline, BaselineStore, CommandError, CommandRunner, Environment, Layout, Resolver,
     ResolverError, RestoreOutcome, SystemCommands,
 };
 pub use server::{bind_socket, Server, ServerError};
-pub use services::{ExternalServices, ServiceError, Services, SystemdServices};
+pub use services::{ExternalServices, I2pSupervision, ServiceError, Services, SystemdServices};
 pub use state::{Cause, Machine, TransitionError};
 pub use supervisor::{ServiceState, Supervisor, SupervisorError, SystemdUnits};
 pub use torcontrol::{Bootstrap, TorControl, TorControlError};

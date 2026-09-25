@@ -25,7 +25,9 @@ use std::time::Duration;
 use ghostnector_policy::{
     canonical_kernel_ruleset, compile, render_replace_script, render_revert_script, Environment,
 };
-use ghostnector_spec::backend::{Params, Ports, ProfileId, Report, ResolvedIdentity, Verb};
+use ghostnector_spec::backend::{
+    I2pPorts, Params, Ports, ProfileId, Report, ResolvedIdentity, Verb,
+};
 use ghostnector_spec::exemption::Exemption;
 use ghostnector_spec::ipc::{ErrorBody, ErrorCode, HelperResponse, PROTOCOL_VERSION};
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
@@ -120,6 +122,11 @@ impl<B: Backend + 'static, I: Identities + 'static> Server<B, I> {
                 trans: self.config.trans_port,
                 chokepoint: self.config.chokepoint_port,
                 socks: self.config.socks_port,
+            },
+            // And the router with the same proxy ports the policy guards.
+            i2p_ports: I2pPorts {
+                http: self.config.i2p_http_port,
+                socks: self.config.i2p_socks_port,
             },
             notes: guard.notes.clone(),
         }

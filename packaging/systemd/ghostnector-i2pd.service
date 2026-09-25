@@ -1,0 +1,34 @@
+[Unit]
+Description=I2P router for Ghostnector (a client of the I2P network, configured by Ghostnector)
+Documentation=man:i2pd(1)
+# Started and stopped by the control plane, not at boot: the router has no business running when
+# nothing is being protected, and the control plane writes its configuration before starting it.
+After=ghostnector-netd.service
+
+[Service]
+Type=exec
+User=i2pd
+Group=i2pd
+ExecStart=/usr/bin/i2pd --conf=/run/ghostnector/i2pd.conf
+# The configuration is written by the control plane, which is why this unit does not own it.
+ReadOnlyPaths=/run/ghostnector/i2pd.conf
+
+# The router needs no capabilities at all. It is an ordinary unprivileged process; the policy is
+# what confines everything else, and the router's own egress is the one exemption that makes the
+# network reachable.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+# Its own data directory, and the configuration the control plane writes.
+ReadWritePaths=/var/lib/ghostnector-i2pd /run/ghostnector
+StateDirectory=ghostnector-i2pd
+Restart=on-failure
+RestartSec=3
+
+[Install]
+# Not enabled: only the control plane starts it.
+WantedBy=multi-user.target

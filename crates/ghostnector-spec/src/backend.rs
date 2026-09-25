@@ -159,6 +159,8 @@ pub struct Report {
     pub resolved: Vec<ResolvedIdentity>,
     /// The ports the policy redirects into, so services can be configured to match.
     pub ports: Ports,
+    /// I2P's local proxy ports, so the router and the policy cannot disagree.
+    pub i2p_ports: I2pPorts,
     /// Operational notes that are not failures, for example a skipped conntrack flush.
     pub notes: Vec<String>,
 }

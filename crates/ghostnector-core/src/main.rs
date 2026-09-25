@@ -14,9 +14,9 @@ mod inner {
     use ghostnector_core::{
         apphelper::{AppHelper, AppHelperLink},
         bind_socket, Canary, ChildRelay, CommandRunner, DnsRelay, Engine, EngineConfig,
-        ExternalServices, Helper, HttpEndpoint, NetworkProbes, Server, Services, SystemCommands,
-        SystemdServices, SystemdUnits, TorControl, TorSettings, Verification, VerificationConfig,
-        Verifier, VERSION,
+        ExternalServices, Helper, HttpEndpoint, I2pSettings, I2pSupervision, NetworkProbes, Server,
+        Services, SystemCommands, SystemdServices, SystemdUnits, TorControl, TorSettings,
+        Verification, VerificationConfig, Verifier, VERSION,
     };
 
     const DEFAULT_HELPER: &str = "/run/ghostnector/netd.sock";
@@ -31,6 +31,10 @@ mod inner {
     const DEFAULT_TOR_CONTROL_PORT: u16 = 9051;
     const DEFAULT_TOR_DNS_PORT: u16 = 9053;
     const DEFAULT_TOR_BUDGET_SECONDS: u64 = 120;
+    const DEFAULT_I2P_UNIT: &str = "ghostnector-i2pd.service";
+    const DEFAULT_I2PD_CONFIG: &str = "/run/ghostnector/i2pd.conf";
+    const DEFAULT_I2P_DATA: &str = "/var/lib/ghostnector-i2pd";
+    const DEFAULT_I2P_BUDGET_SECONDS: u64 = 60;
     const DEFAULT_DNS_HELPER: &str = "/usr/libexec/ghostnector-dns";
     const DEFAULT_RESOLVER_STATE: &str = "/var/lib/ghostnector/resolver.json";
     const DEFAULT_RESOLVE_CONF_ROOT: &str = "/";
@@ -71,6 +75,14 @@ OPTIONS:
     --tor-dns-port <PORT>       Tor's DNS listener, which the DNS chokepoint
                                 forwards to                      [default: 9053]
     --tor-bootstrap-seconds <SECONDS>   how long to wait for Tor [default: 120]
+
+  I2P supervision (used only by the I2P network):
+    --i2p-unit <NAME>   the unit that runs the router [default: ghostnector-i2pd.service]
+    --i2pd-config <PATH>  where the router's configuration is written
+                                              [default: /run/ghostnector/i2pd.conf]
+    --i2p-data-dir <PATH>  the router's data directory
+                                              [default: /var/lib/ghostnector-i2pd]
+    --i2p-ready-seconds <SECONDS>  how long to wait for its proxy [default: 60]
 
   DNS:
     --dns-helper <PATH>     the DNS relay that every query passes through
@@ -125,6 +137,10 @@ OPTIONS:
         tor_control_port: u16,
         tor_dns_port: u16,
         tor_budget: Duration,
+        i2p_unit: String,
+        i2pd_config: PathBuf,
+        i2p_data: PathBuf,
+        i2p_budget: Duration,
         dns_helper: PathBuf,
         resolver_state: PathBuf,
         resolver_port: u16,
@@ -269,16 +285,29 @@ OPTIONS:
             ServicesMode::Systemd => {
                 let supervisor = SystemdUnits::new(config.systemctl.clone())
                     .map_err(|error| error.to_string())?;
-                Ok(Arc::new(SystemdServices::new(
-                    Arc::new(supervisor),
-                    tor,
-                    config.tor_unit.clone(),
-                    config.torrc.clone(),
-                    settings,
-                    config.tor_budget,
-                )))
+                Ok(Arc::new(
+                    SystemdServices::new(
+                        Arc::new(supervisor),
+                        tor,
+                        config.tor_unit.clone(),
+                        config.torrc.clone(),
+                        settings,
+                        config.tor_budget,
+                    )
+                    .with_i2p(I2pSupervision {
+                        unit: config.i2p_unit.clone(),
+                        config_path: config.i2pd_config.clone(),
+                        settings: I2pSettings {
+                            data_directory: config.i2p_data.clone(),
+                            ..I2pSettings::default()
+                        },
+                        budget: config.i2p_budget,
+                    }),
+                ))
             }
-            ServicesMode::External => Ok(Arc::new(ExternalServices::new(tor, config.tor_budget))),
+            ServicesMode::External => Ok(Arc::new(
+                ExternalServices::new(tor, config.tor_budget).with_i2p_budget(config.i2p_budget),
+            )),
         }
     }
 
@@ -299,6 +328,10 @@ OPTIONS:
         let mut tor_control_port = DEFAULT_TOR_CONTROL_PORT;
         let mut tor_dns_port = DEFAULT_TOR_DNS_PORT;
         let mut tor_budget = Duration::from_secs(DEFAULT_TOR_BUDGET_SECONDS);
+        let mut i2p_unit = DEFAULT_I2P_UNIT.to_string();
+        let mut i2pd_config = PathBuf::from(DEFAULT_I2PD_CONFIG);
+        let mut i2p_data = PathBuf::from(DEFAULT_I2P_DATA);
+        let mut i2p_budget = Duration::from_secs(DEFAULT_I2P_BUDGET_SECONDS);
         let mut dns_helper = PathBuf::from(DEFAULT_DNS_HELPER);
         let mut resolver_state = PathBuf::from(DEFAULT_RESOLVER_STATE);
         let mut resolver_port = DEFAULT_RESOLVER_PORT;
@@ -364,6 +397,32 @@ OPTIONS:
                 }
                 "--tor-control-port" => tor_control_port = port(&option, &value()?)?,
                 "--tor-dns-port" => tor_dns_port = port(&option, &value()?)?,
+                "--i2p-unit" => {
+                    let unit = value()?;
+                    if unit.is_empty()
+                        || unit.starts_with('-')
+                        || !unit.chars().all(|c| {
+                            c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '@')
+                        })
+                    {
+                        return Err(format!("value for '{option}' is not usable: bad unit name"));
+                    }
+                    i2p_unit = unit;
+                }
+                "--i2pd-config" => i2pd_config = absolute(&option, value()?)?,
+                "--i2p-data-dir" => i2p_data = absolute(&option, value()?)?,
+                "--i2p-ready-seconds" => {
+                    let raw = value()?;
+                    let seconds: u64 = raw.parse().map_err(|_| {
+                        format!("value for '{option}' is not usable: expected seconds")
+                    })?;
+                    if seconds == 0 || seconds > 3600 {
+                        return Err(format!(
+                            "value for '{option}' is not usable: expected 1 to 3600 seconds"
+                        ));
+                    }
+                    i2p_budget = Duration::from_secs(seconds);
+                }
                 "--resolver-port" => resolver_port = port(&option, &value()?)?,
                 "--dns-helper" => dns_helper = absolute(&option, value()?)?,
                 "--resolver-state" => resolver_state = absolute(&option, value()?)?,
@@ -412,6 +471,10 @@ OPTIONS:
             tor_control_port,
             tor_dns_port,
             tor_budget,
+            i2p_unit,
+            i2pd_config,
+            i2p_data,
+            i2p_budget,
             dns_helper,
             resolver_state,
             resolver_port,
