@@ -36,6 +36,7 @@ pub mod tools;
 pub mod torcontrol;
 pub mod torrc;
 pub mod verify;
+pub mod verify_i2p;
 
 #[cfg(test)]
 pub mod testing;
@@ -59,6 +60,10 @@ pub use torrc::TorSettings;
 pub use verify::{
     Canary, HttpEndpoint, NetworkProbes, Outcome, ProbeResult, Probes,
     Report as VerificationReport, Verification, VerificationConfig, Verifier,
+};
+pub use verify_i2p::{
+    I2pCanary, I2pProbes, I2pVerification, I2pVerificationConfig, I2pVerifier, NetworkI2pProbes,
+    NoI2pEvidence,
 };
 
 /// The package version.

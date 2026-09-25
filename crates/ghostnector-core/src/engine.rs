@@ -156,6 +156,9 @@ pub struct Engine {
     notes: Mutex<Vec<Reason>>,
     subscribers: Mutex<Vec<Sender<Event>>>,
     verification: Arc<dyn VerificationRuns>,
+    /// I2P's own evidence. Without a configured verifier this can never pass, so an I2P profile
+    /// stays `Degraded` until something really checked it (M9 decision 4).
+    i2p_verification: Arc<dyn crate::verify_i2p::I2pVerification>,
     last_verification: Mutex<VerificationState>,
     apps: Mutex<Vec<AppStatus>>,
     verify_soon: AtomicBool,
@@ -207,10 +210,23 @@ impl Engine {
             notes: Mutex::new(Vec::new()),
             subscribers: Mutex::new(Vec::new()),
             verification,
+            i2p_verification: Arc::new(crate::verify_i2p::NoI2pEvidence),
             last_verification: Mutex::new(VerificationState::default()),
             apps: Mutex::new(Vec::new()),
             verify_soon: AtomicBool::new(false),
         }
+    }
+
+    /// Give the engine the I2P verifier, built from the operator's configuration.
+    ///
+    /// Without one, an I2P profile can never become `Protected`: there is no evidence, so it stays
+    /// `Degraded` (M9 decision 4).
+    pub fn with_i2p_verification(
+        mut self,
+        verification: Arc<dyn crate::verify_i2p::I2pVerification>,
+    ) -> Self {
+        self.i2p_verification = verification;
+        self
     }
 
     /// Ask for a check as soon as the next tick allows, rather than waiting a whole interval.
@@ -660,8 +676,11 @@ impl Engine {
         let report = self.apply(target, params)?;
 
         // DNS last: the policy is already redirecting port 53 at this point, so a relay started any
-        // earlier would have been serving queries under the previous rules.
-        self.bring_up_dns(target, ports)?;
+        // earlier would have been serving queries under the previous rules. I2P has no chokepoint:
+        // its naming is the router's address book, and clearnet DNS is denied with everything else.
+        if target != ProfileId::I2pSystem {
+            self.bring_up_dns(target, ports)?;
+        }
         Ok(report)
     }
 
@@ -814,9 +833,13 @@ impl Engine {
             };
         }
 
-        let app_scope = self.lock_report().profile == Some(ProfileId::TorApp);
+        let profile = self.lock_report().profile;
+        let app_scope = profile == Some(ProfileId::TorApp);
+        let i2p_scope = profile == Some(ProfileId::I2pSystem);
         let mut report = if app_scope {
             self.verify_apps()
+        } else if i2p_scope {
+            self.i2p_verification.run_once(self.lock_report().i2p_ports)
         } else {
             self.verification.run_once()
         };
@@ -873,13 +896,16 @@ impl Engine {
         match &report.outcome {
             Outcome::Passed => {
                 if self.lock_machine().state() == ProtectionState::Degraded {
+                    let reason = if i2p_scope {
+                        "the I2P path has been verified: the router answered and clearnet egress \
+                         was denied"
+                    } else {
+                        "the policy has been verified: traffic left only through the protected path"
+                    };
                     let _ = self.set_state(
                         ProtectionState::Protected,
                         Cause::Verified,
-                        vec![Reason::new(
-                            "the policy has been verified: traffic left only through the protected \
-                             path",
-                        )],
+                        vec![Reason::new(reason)],
                     );
                 }
             }
@@ -1326,13 +1352,12 @@ fn plan(valid: &ValidProfile, requester_uid: u32) -> Result<(ProfileId, Params),
             ProfileId::TorApp
         }
         (Scope::Dns, false, false) | (Scope::System, false, false) => ProfileId::DnsLockdown,
+        (Scope::System, false, true) => ProfileId::I2pSystem,
         (_, _, true) => {
-            // I2P is machine-wide only (validation enforces it). Its policy and router arrive in
-            // the next M9 increments; refusing here means nothing is touched before they exist.
+            // Validation refuses I2P outside the machine scope, so this arm is only reachable if a
+            // caller bypassed it; refuse rather than approximate.
             return Err(EngineError::NotSupported(
-                "I2P is machine-wide, and its policy is not in this build yet; refusing rather \
-                 than approximating"
-                    .to_string(),
+                "I2P is machine-wide only".to_string(),
             ));
         }
         (Scope::Off, _, _) => {
@@ -1369,7 +1394,9 @@ fn profile_of(id: ProfileId) -> Option<Profile> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{MockAppHelper, MockHelper, MockRelay, MockServices, MockVerification};
+    use crate::testing::{
+        MockAppHelper, MockHelper, MockI2pVerification, MockRelay, MockServices, MockVerification,
+    };
     use std::time::Duration;
 
     const USER_UID: u32 = 1000;
@@ -1474,6 +1501,42 @@ mod tests {
             VerificationConfig::default(),
         );
         (helper, relay, engine, directory)
+    }
+
+    /// The engine with the I2P verifier a test can script, plus every piece a test may want to
+    /// observe.
+    fn engine_and_i2p() -> (
+        Arc<MockHelper>,
+        Arc<MockServices>,
+        Arc<MockRelay>,
+        Arc<MockI2pVerification>,
+        Engine,
+        PathBuf,
+    ) {
+        let helper = Arc::new(MockHelper::new());
+        let services = Arc::new(MockServices::new());
+        let relay = Arc::new(MockRelay::new());
+        let verification = Arc::new(MockVerification::new());
+        let i2p = Arc::new(MockI2pVerification::new());
+        let (engine, directory) = engine_with_app(
+            Arc::clone(&helper),
+            Arc::clone(&services),
+            Arc::clone(&relay),
+            Arc::clone(&verification),
+            VerificationConfig::default(),
+            Arc::new(MockAppHelper::new()),
+        );
+        let i2p_verifier: Arc<dyn crate::verify_i2p::I2pVerification> = i2p.clone();
+        let engine = engine.with_i2p_verification(i2p_verifier);
+        (helper, services, relay, i2p, engine, directory)
+    }
+
+    fn i2p_profile() -> Profile {
+        Profile {
+            scope: Scope::System,
+            networks: ghostnector_spec::Networks::i2p(),
+            ..Profile::default()
+        }
     }
 
     fn engine_and_verification() -> (Arc<MockVerification>, Engine, PathBuf) {
@@ -1765,11 +1828,6 @@ mod tests {
                 scope: Scope::App,
                 networks: ghostnector_spec::Networks::tor(),
                 allow_lan: true,
-                ..Profile::default()
-            },
-            Profile {
-                scope: Scope::System,
-                networks: ghostnector_spec::Networks::i2p(),
                 ..Profile::default()
             },
             Profile {
@@ -2423,5 +2481,78 @@ mod tests {
         );
         assert!(snapshot.apps.is_empty(), "no namespace may remain");
         assert!(!app_helper.bridge_ready());
+    }
+
+    #[test]
+    fn i2p_connect_applies_the_router_profile_and_skips_the_relay() {
+        let (helper, services, relay, _i2p, engine, _dir) = engine_and_i2p();
+        engine.connect(i2p_profile(), USER_UID).expect("connect");
+
+        assert!(
+            services.brought_up().contains(&ProfileId::I2pSystem),
+            "the router service must be brought up: {:?}",
+            services.brought_up()
+        );
+        assert!(
+            relay.started().is_empty(),
+            "I2P has no DNS chokepoint, so the relay must not start: {:?}",
+            relay.started()
+        );
+        assert_eq!(helper.current(), Some(ProfileId::I2pSystem));
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.state, ProtectionState::Degraded);
+        let profile = snapshot.profile.expect("a profile is in force");
+        assert!(profile.networks.i2p, "{profile:?}");
+        assert!(!profile.networks.tor, "{profile:?}");
+    }
+
+    #[test]
+    fn i2p_is_protected_only_from_i2p_evidence() {
+        let (_helper, _services, _relay, i2p, engine, _dir) = engine_and_i2p();
+        engine.connect(i2p_profile(), USER_UID).expect("connect");
+
+        // The mock starts with no evidence, so nothing may claim protection.
+        engine.verify_once();
+        assert_eq!(engine.snapshot().state, ProtectionState::Degraded);
+
+        i2p.set_outcome(Outcome::Passed);
+        let report = engine.verify_once();
+        assert_eq!(report.outcome, Outcome::Passed, "{:?}", report.details);
+        assert_eq!(engine.snapshot().state, ProtectionState::Protected);
+        assert!(
+            engine
+                .snapshot()
+                .reasons
+                .iter()
+                .any(|reason| reason.as_str().contains("I2P path")),
+            "{:?}",
+            engine.snapshot().reasons
+        );
+    }
+
+    #[test]
+    fn an_i2p_contradiction_blocks_the_machine() {
+        let (helper, _services, _relay, i2p, engine, _dir) = engine_and_i2p();
+        engine.connect(i2p_profile(), USER_UID).expect("connect");
+        i2p.set_outcome(Outcome::Failed {
+            reason: "a clearnet TCP connection was carried".to_string(),
+        });
+        engine.verify_once();
+
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.state, ProtectionState::Blocked);
+        assert_eq!(
+            helper.current(),
+            Some(ProfileId::FailClosed),
+            "the fail-closed baseline must replace the I2P policy"
+        );
+        assert!(
+            snapshot
+                .reasons
+                .iter()
+                .any(|reason| reason.as_str().contains("fail-closed baseline")),
+            "{:?}",
+            snapshot.reasons
+        );
     }
 }

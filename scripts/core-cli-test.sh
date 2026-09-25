@@ -257,6 +257,7 @@ start_stack() {
         --dns-helper "$BINDIR/ghostnector-dns" --tor-dns-port "$DNS_UPSTREAM_PORT" \
         --resolv-conf-root "$RESOLV_ROOT" --resolver-state "$WORKDIR/resolver.json" \
         --udp-check "$OUTSIDE_ADDR:$UDP_CHECK_PORT" \
+        --i2p-ready-seconds 1 \
         --verify-interval 5 --verify-stale-after 120 --verify-timeout 3 \
         >/tmp/gh-core.log 2>&1 &
     CORE_PID=$!
@@ -289,22 +290,23 @@ case "$STATUS" in
 *) fail "unexpected initial state: $STATUS" ;;
 esac
 
-# ---------------------------------------------------------------- I2P is refused, not approximated
-# This build has no I2P policy yet. The refusal must happen before anything is touched, and the
-# state must be exactly what it was.
+# ---------------------------------------------------------------- I2P fails closed without a router
+# I2P is a real profile now. With no router answering on its proxy, the connect must be refused with
+# an explanation, and nothing may be left applied: protection was never established, so the
+# documented rollback applies.
 if I2P="$(cli connect --network i2p 2>&1)"; then
-    fail "I2P was accepted although this build has no I2P policy: $I2P"
+    fail "I2P was accepted although no router answers: $I2P"
 fi
 case "$I2P" in
-*"I2P is machine-wide"*) ok "I2P is refused with an explanation" ;;
+*"I2P router is not usable"*) ok "I2P is refused with an explanation when no router answers" ;;
 *) fail "the I2P refusal was not explained: $I2P" ;;
 esac
 case "$(cli status)" in
-*"traffic is not protected"*) ok "the refused I2P connect changed nothing" ;;
-*) fail "the refused I2P connect changed the state: $(cli status)" ;;
+*"traffic is not protected"*) ok "the failed I2P connect left nothing applied" ;;
+*) fail "the failed I2P connect left something behind: $(cli status)" ;;
 esac
 in_ns nft list tables 2>/dev/null | grep -q ghostnector &&
-    fail "the refused I2P connect touched the kernel"
+    fail "the failed I2P connect left a policy behind"
 
 if ! CONNECTED="$(cli connect 2>&1)"; then
     echo "$CONNECTED"

@@ -14,9 +14,10 @@ mod inner {
     use ghostnector_core::{
         apphelper::{AppHelper, AppHelperLink},
         bind_socket, Canary, ChildRelay, CommandRunner, DnsRelay, Engine, EngineConfig,
-        ExternalServices, Helper, HttpEndpoint, I2pSettings, I2pSupervision, NetworkProbes, Server,
-        Services, SystemCommands, SystemdServices, SystemdUnits, TorControl, TorSettings,
-        Verification, VerificationConfig, Verifier, VERSION,
+        ExternalServices, Helper, HttpEndpoint, I2pCanary, I2pSettings, I2pSupervision,
+        I2pVerificationConfig, I2pVerifier, NetworkI2pProbes, NetworkProbes, Server, Services,
+        SystemCommands, SystemdServices, SystemdUnits, TorControl, TorSettings, Verification,
+        VerificationConfig, Verifier, VERSION,
     };
 
     const DEFAULT_HELPER: &str = "/run/ghostnector/netd.sock";
@@ -35,6 +36,7 @@ mod inner {
     const DEFAULT_I2PD_CONFIG: &str = "/run/ghostnector/i2pd.conf";
     const DEFAULT_I2P_DATA: &str = "/var/lib/ghostnector-i2pd";
     const DEFAULT_I2P_BUDGET_SECONDS: u64 = 60;
+    const DEFAULT_I2P_CANARY_PATH: &str = "/";
     const DEFAULT_DNS_HELPER: &str = "/usr/libexec/ghostnector-dns";
     const DEFAULT_RESOLVER_STATE: &str = "/var/lib/ghostnector/resolver.json";
     const DEFAULT_RESOLVE_CONF_ROOT: &str = "/";
@@ -83,6 +85,11 @@ OPTIONS:
     --i2p-data-dir <PATH>  the router's data directory
                                               [default: /var/lib/ghostnector-i2pd]
     --i2p-ready-seconds <SECONDS>  how long to wait for its proxy [default: 60]
+    --i2p-canary <HOST>    an .i2p destination fetched through the router's proxy;
+                           without it an I2P profile can never become Protected
+    --i2p-canary-path <PATH>    what to request from the canary [default: /]
+    --i2p-canary-expect <TEXT>  a marker the canary's answer must contain
+    --i2p-clearnet-check <ADDR:PORT>  a clearnet endpoint that must be unreachable
 
   DNS:
     --dns-helper <PATH>     the DNS relay that every query passes through
@@ -141,6 +148,10 @@ OPTIONS:
         i2pd_config: PathBuf,
         i2p_data: PathBuf,
         i2p_budget: Duration,
+        i2p_canary: Option<String>,
+        i2p_canary_path: String,
+        i2p_canary_expect: Option<String>,
+        i2p_clearnet: Option<SocketAddr>,
         dns_helper: PathBuf,
         resolver_state: PathBuf,
         resolver_port: u16,
@@ -202,25 +213,39 @@ OPTIONS:
         let verification: Arc<dyn Verification> = Arc::new(Verifier::new(NetworkProbes::new(
             config.verification.clone(),
         )));
-        let engine = Arc::new(Engine::new(
-            EngineConfig {
-                journal_path: config.journal.clone(),
-                resolver_state_path: config.resolver_state.clone(),
-                tor_dns_port: config.tor_dns_port,
-                resolver_port: config.resolver_port,
-                resolver_root: config.resolver_root.clone(),
-                resolvectl: config.resolvectl.clone(),
-                app_socket: config.app_socket.clone(),
-                app_core: config.app_core,
-                verification: config.verification.clone(),
-            },
-            Arc::new(helper),
-            services,
-            relay,
-            commands,
-            verification,
-            app_helper,
-        ));
+        let i2p_verification: Arc<dyn ghostnector_core::I2pVerification> = Arc::new(
+            I2pVerifier::new(NetworkI2pProbes::new(I2pVerificationConfig {
+                timeout: config.verification.timeout,
+                clearnet: config.i2p_clearnet,
+                canary: config.i2p_canary.as_ref().map(|host| I2pCanary {
+                    host: host.clone(),
+                    path: config.i2p_canary_path.clone(),
+                    expect: config.i2p_canary_expect.clone(),
+                }),
+            })),
+        );
+        let engine = Arc::new(
+            Engine::new(
+                EngineConfig {
+                    journal_path: config.journal.clone(),
+                    resolver_state_path: config.resolver_state.clone(),
+                    tor_dns_port: config.tor_dns_port,
+                    resolver_port: config.resolver_port,
+                    resolver_root: config.resolver_root.clone(),
+                    resolvectl: config.resolvectl.clone(),
+                    app_socket: config.app_socket.clone(),
+                    app_core: config.app_core,
+                    verification: config.verification.clone(),
+                },
+                Arc::new(helper),
+                services,
+                relay,
+                commands,
+                verification,
+                app_helper,
+            )
+            .with_i2p_verification(i2p_verification),
+        );
 
         // Verification runs on its own thread, so a slow check can never hold up the interface, and
         // a check that stops running shows up as stale rather than as a stale claim of protection.
@@ -332,6 +357,10 @@ OPTIONS:
         let mut i2pd_config = PathBuf::from(DEFAULT_I2PD_CONFIG);
         let mut i2p_data = PathBuf::from(DEFAULT_I2P_DATA);
         let mut i2p_budget = Duration::from_secs(DEFAULT_I2P_BUDGET_SECONDS);
+        let mut i2p_canary: Option<String> = None;
+        let mut i2p_canary_path = DEFAULT_I2P_CANARY_PATH.to_string();
+        let mut i2p_canary_expect: Option<String> = None;
+        let mut i2p_clearnet: Option<SocketAddr> = None;
         let mut dns_helper = PathBuf::from(DEFAULT_DNS_HELPER);
         let mut resolver_state = PathBuf::from(DEFAULT_RESOLVER_STATE);
         let mut resolver_port = DEFAULT_RESOLVER_PORT;
@@ -423,6 +452,42 @@ OPTIONS:
                     }
                     i2p_budget = Duration::from_secs(seconds);
                 }
+                "--i2p-canary" => {
+                    let host = value()?;
+                    if host.is_empty()
+                        || host.len() > 253
+                        || !host
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+                    {
+                        return Err(format!(
+                            "value for '{option}' is not usable: expected an .i2p host name"
+                        ));
+                    }
+                    i2p_canary = Some(host);
+                }
+                "--i2p-canary-path" => {
+                    let path = value()?;
+                    if !path.starts_with('/')
+                        || path.len() > 512
+                        || path.chars().any(char::is_control)
+                    {
+                        return Err(format!(
+                            "value for '{option}' is not usable: expected an absolute path"
+                        ));
+                    }
+                    i2p_canary_path = path;
+                }
+                "--i2p-canary-expect" => {
+                    let marker = value()?;
+                    if marker.is_empty() || marker.len() > 256 {
+                        return Err(format!(
+                            "value for '{option}' is not usable: expected a short marker"
+                        ));
+                    }
+                    i2p_canary_expect = Some(marker);
+                }
+                "--i2p-clearnet-check" => i2p_clearnet = Some(address(&option, &value()?)?),
                 "--resolver-port" => resolver_port = port(&option, &value()?)?,
                 "--dns-helper" => dns_helper = absolute(&option, value()?)?,
                 "--resolver-state" => resolver_state = absolute(&option, value()?)?,
@@ -475,6 +540,10 @@ OPTIONS:
             i2pd_config,
             i2p_data,
             i2p_budget,
+            i2p_canary,
+            i2p_canary_path,
+            i2p_canary_expect,
+            i2p_clearnet,
             dns_helper,
             resolver_state,
             resolver_port,

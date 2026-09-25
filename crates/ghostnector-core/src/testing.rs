@@ -286,7 +286,8 @@ impl MockHelper {
             .collect()
     }
 
-    fn current(&self) -> Option<ProfileId> {
+    /// The profile currently applied, as the mock remembers it.
+    pub fn current(&self) -> Option<ProfileId> {
         *self.applied.lock().expect("mock lock")
     }
 
@@ -482,6 +483,42 @@ impl crate::verify::Verification for MockVerification {
                     reason: "no checks are configured".to_string(),
                 });
         let details = vec![format!("mock: {outcome:?}")];
+        crate::verify::Report { outcome, details }
+    }
+}
+
+/// An I2P verifier whose answer the test decides.
+///
+/// The default is "no evidence": like the real `NoI2pEvidence`, a mock that was not told otherwise
+/// can never pass.
+#[derive(Debug, Default)]
+pub struct MockI2pVerification {
+    outcome: Mutex<Option<Outcome>>,
+}
+
+impl MockI2pVerification {
+    /// A verifier with no evidence yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Script what the next run concludes.
+    pub fn set_outcome(&self, outcome: Outcome) {
+        *self.outcome.lock().expect("mock lock") = Some(outcome);
+    }
+}
+
+impl crate::verify_i2p::I2pVerification for MockI2pVerification {
+    fn run_once(&self, _ports: ghostnector_spec::backend::I2pPorts) -> crate::verify::Report {
+        let outcome =
+            self.outcome
+                .lock()
+                .expect("mock lock")
+                .clone()
+                .unwrap_or(Outcome::Inconclusive {
+                    reason: "no I2P evidence".to_string(),
+                });
+        let details = vec![format!("mock I2P: {outcome:?}")];
         crate::verify::Report { outcome, details }
     }
 }
