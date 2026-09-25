@@ -25,7 +25,8 @@ USAGE:
 
 COMMANDS:
     status                       show the current state and why it is that way
-    connect [--scope <SCOPE>]    protect this machine (default scope: system)
+    connect [--network <NET>]    protect this machine (default network: tor)
+            [--scope <SCOPE>]    (default scope: system)
             [--lan]              also allow reaching the local network
     disconnect                   return to the network as it was before
     panic                        deny everything now, leaving services running
@@ -34,6 +35,10 @@ COMMANDS:
     apps                         list the protected applications
     stop-app <ID>                stop one protected application
     watch                        follow state changes until interrupted
+
+NETWORKS:
+    tor      through the Tor network (default)
+    i2p      through the I2P network (whole system only)
 
 SCOPES:
     system   every process on the machine (default)
@@ -49,13 +54,29 @@ OPTIONS:
 
     enum Command {
         Status,
-        Connect { scope: Scope, lan: bool },
+        Connect {
+            scope: Scope,
+            network: Network,
+            lan: bool,
+        },
         Disconnect,
         Panic,
-        Run { command: Option<String> },
+        Run {
+            command: Option<String>,
+        },
         Apps,
-        StopApp { id: u32 },
+        StopApp {
+            id: u32,
+        },
         Watch,
+    }
+
+    /// The overlay network a connect asks for. The daemon validates the combination; this is just
+    /// the user's choice.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Network {
+        Tor,
+        I2p,
     }
 
     pub fn main() -> ExitCode {
@@ -95,14 +116,19 @@ OPTIONS:
                 }
                 other => Err(unexpected(other)),
             },
-            Command::Connect { scope, lan } => {
+            Command::Connect {
+                scope,
+                network,
+                lan,
+            } => {
+                let networks = match (scope, network) {
+                    (Scope::Dns, _) => Networks::none(),
+                    (_, Network::I2p) => Networks::i2p(),
+                    _ => Networks::tor(),
+                };
                 let profile = Profile {
                     scope,
-                    networks: if scope == Scope::Dns {
-                        Networks::none()
-                    } else {
-                        Networks::tor()
-                    },
+                    networks,
                     allow_lan: lan,
                     ..Profile::default()
                 };
@@ -433,6 +459,7 @@ OPTIONS:
         let mut socket = PathBuf::from(DEFAULT_SOCKET);
         let mut command: Option<Command> = None;
         let mut scope = Scope::System;
+        let mut network = Network::Tor;
         let mut lan = false;
 
         let mut arguments = arguments.peekable();
@@ -454,6 +481,7 @@ OPTIONS:
                 "connect" => {
                     command = Some(Command::Connect {
                         scope: Scope::System,
+                        network: Network::Tor,
                         lan: false,
                     })
                 }
@@ -486,6 +514,20 @@ OPTIONS:
                     command = Some(Command::StopApp { id });
                 }
                 "watch" => command = Some(Command::Watch),
+                "--network" => {
+                    network = match value()?.as_str() {
+                        "tor" => Network::Tor,
+                        "i2p" => Network::I2p,
+                        other => {
+                            return Err(format!("unknown network '{other}'; expected tor or i2p"))
+                        }
+                    };
+                    command = Some(Command::Connect {
+                        scope,
+                        network,
+                        lan,
+                    });
+                }
                 "--scope" => {
                     scope = match value()?.as_str() {
                         "system" => Scope::System,
@@ -498,19 +540,31 @@ OPTIONS:
                             ))
                         }
                     };
-                    command = Some(Command::Connect { scope, lan: false });
+                    command = Some(Command::Connect {
+                        scope,
+                        network,
+                        lan,
+                    });
                 }
                 "--lan" => {
                     lan = true;
-                    command = Some(Command::Connect { scope, lan });
+                    command = Some(Command::Connect {
+                        scope,
+                        network,
+                        lan,
+                    });
                 }
                 other => return Err(format!("unknown argument '{other}'\n\n{USAGE}")),
             }
         }
 
-        // `--scope` and `--lan` may arrive in either order, so apply what was collected last.
+        // `--network`, `--scope` and `--lan` may arrive in any order, so apply what was collected.
         if let Some(Command::Connect { .. }) = command {
-            command = Some(Command::Connect { scope, lan });
+            command = Some(Command::Connect {
+                scope,
+                network,
+                lan,
+            });
         }
 
         match command {
@@ -541,12 +595,37 @@ OPTIONS:
         fn connect_defaults_to_the_whole_system_over_tor() {
             let (_, command) = parse(args(&["connect"])).expect("parse");
             match command {
-                Command::Connect { scope, lan } => {
+                Command::Connect {
+                    scope,
+                    network,
+                    lan,
+                } => {
                     assert_eq!(scope, Scope::System);
+                    assert_eq!(network, Network::Tor);
                     assert!(!lan);
                 }
                 _ => panic!("expected a connect"),
             }
+        }
+
+        #[test]
+        fn i2p_is_selectable_and_an_unknown_network_is_refused() {
+            match parse(args(&["connect", "--network", "i2p"]))
+                .expect("parse")
+                .1
+            {
+                Command::Connect {
+                    scope,
+                    network,
+                    lan,
+                } => {
+                    assert_eq!(scope, Scope::System);
+                    assert_eq!(network, Network::I2p);
+                    assert!(!lan);
+                }
+                _ => panic!("expected a connect"),
+            }
+            assert!(parse(args(&["connect", "--network", "galaxy"])).is_err());
         }
 
         #[test]
@@ -556,7 +635,7 @@ OPTIONS:
                 args(&["connect", "--lan", "--scope", "user"]),
             ] {
                 match parse(list).expect("parse").1 {
-                    Command::Connect { scope, lan } => {
+                    Command::Connect { scope, lan, .. } => {
                         assert_eq!(scope, Scope::User);
                         assert!(lan);
                     }
@@ -581,7 +660,7 @@ OPTIONS:
                 .expect("parse")
                 .1
             {
-                Command::Connect { scope, lan } => {
+                Command::Connect { scope, lan, .. } => {
                     assert_eq!(scope, Scope::App);
                     assert!(!lan);
                 }

@@ -56,13 +56,17 @@ impl Scope {
     }
 }
 
-/// Destination planes that can be enabled together.
+/// Destination planes a caller may request.
+///
+/// They are **alternatives, never layers**: validation refuses a request that enables both at once.
+/// The raw shape keeps both flags so the refusal is a decision the validator makes, not a value a
+/// malformed message can smuggle past it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Networks {
     /// Route supported traffic through Tor.
     pub tor: bool,
-    /// Run an isolated I2P router beside Tor rather than through it.
+    /// Run the I2P router as the machine's only overlay.
     pub i2p: bool,
 }
 
@@ -91,7 +95,8 @@ impl Networks {
         }
     }
 
-    /// Tor and I2P, kept in separate compartments.
+    /// Tor and I2P requested together. Kept as a constructor so tests can prove the refusal, but
+    /// validation never accepts it: the two networks are independent and are never enabled together.
     pub const fn both() -> Self {
         Self {
             tor: true,
@@ -132,8 +137,6 @@ pub enum Warning {
     I2pExposesHostIp,
     /// System scope also covers other logged-in users and system services.
     SystemScopeCoversAllUsers,
-    /// I2P and Tor traffic share the same physical uplink.
-    I2pSharesUplinkWithTor,
     /// Allowing LAN egress widens what protected applications can reach.
     LanExceptionWidensExposure,
     /// Authenticated DNS over Tor adds latency to every uncached lookup.
@@ -159,6 +162,20 @@ pub enum ProfileError {
     /// Bridges are a Tor mechanism.
     #[error("bridges require tor")]
     BridgesWithoutTor,
+    /// Tor and I2P are independent networks and are never enabled together.
+    #[error("tor and i2p are independent networks and are never enabled together; choose one")]
+    MixedNetworks,
+    /// I2P is machine-wide in this version.
+    #[error(
+        "i2p is available as a whole-system network only; per-application and per-user i2p are not \
+         supported"
+    )]
+    I2pNeedsSystemScope,
+    /// I2P has no local-network exception.
+    #[error(
+        "i2p has no local-network exception: every flow that is not the router's own is denied"
+    )]
+    I2pWithLan,
 }
 
 /// A profile that has passed [`Profile::validate`].
@@ -248,15 +265,28 @@ impl Profile {
             return Err(ProfileError::BridgesWithoutTor);
         }
 
+        // The two overlay networks are independent: they are alternatives, never layers, and are
+        // never enabled together (M9 decision 5).
+        if nets.tor && nets.i2p {
+            return Err(ProfileError::MixedNetworks);
+        }
+        // I2P is machine-wide in this version: the APP conduit carries Tor, and per-user I2P needs a
+        // different exemption model than the one this version proves (M9 decision 5).
+        if nets.i2p && scope != Scope::System {
+            return Err(ProfileError::I2pNeedsSystemScope);
+        }
+        // The whole point of I2P scope is that the router's own egress is the only one; a LAN
+        // exception would open a second path for every other process.
+        if nets.i2p && self.allow_lan {
+            return Err(ProfileError::I2pWithLan);
+        }
+
         let mut warnings = BTreeSet::new();
         if nets.i2p {
             warnings.insert(Warning::I2pExposesHostIp);
         }
         if scope.is_machine_wide() {
             warnings.insert(Warning::SystemScopeCoversAllUsers);
-        }
-        if nets.tor && nets.i2p {
-            warnings.insert(Warning::I2pSharesUplinkWithTor);
         }
         if self.allow_lan {
             warnings.insert(Warning::LanExceptionWidensExposure);
@@ -309,12 +339,19 @@ mod tests {
         assert!(profile(Scope::Dns, Networks::none()).validate().is_ok());
     }
 
-    /// The full validity matrix from the review (Appendix B).
+    /// The full validity matrix from the review (Appendix B), as amended by M9: the networks are
+    /// alternatives, and I2P is machine-wide only.
     #[test]
     fn validity_matrix_is_exhaustive() {
         let expected_valid = |scope: Scope, nets: Networks| -> bool {
+            if nets.tor && nets.i2p {
+                return false;
+            }
             if nets.is_empty() {
                 return true;
+            }
+            if nets.i2p {
+                return scope == Scope::System;
             }
             matches!(scope, Scope::App | Scope::User | Scope::System)
         };
@@ -371,19 +408,54 @@ mod tests {
 
     #[test]
     fn warnings_are_disclosed_not_hidden() {
-        let valid = profile(Scope::System, Networks::both()).validate().unwrap();
+        let valid = profile(Scope::System, Networks::i2p()).validate().unwrap();
         let warnings: Vec<_> = valid.warnings().collect();
         assert!(warnings.contains(&Warning::I2pExposesHostIp));
         assert!(warnings.contains(&Warning::SystemScopeCoversAllUsers));
-        assert!(warnings.contains(&Warning::I2pSharesUplinkWithTor));
         assert!(!warnings.contains(&Warning::LanExceptionWidensExposure));
         assert!(!warnings.contains(&Warning::BridgesCostLatency));
     }
 
     #[test]
+    fn independent_networks_are_never_combined() {
+        // A raw request may still carry both flags; validation is what refuses it.
+        for scope in [Scope::App, Scope::User, Scope::System] {
+            assert_eq!(
+                profile(scope, Networks::both()).validate(),
+                Err(ProfileError::MixedNetworks),
+                "{scope:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn i2p_is_machine_wide_only() {
+        for scope in [Scope::App, Scope::User, Scope::Dns] {
+            let error = profile(scope, Networks::i2p()).validate().unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    ProfileError::I2pNeedsSystemScope | ProfileError::DnsScopeWithOverlay
+                ),
+                "{scope:?}: {error}"
+            );
+        }
+        let valid = profile(Scope::System, Networks::i2p()).validate().unwrap();
+        assert!(valid.i2p());
+        assert!(!valid.tor());
+    }
+
+    #[test]
+    fn i2p_has_no_lan_exception() {
+        let mut with_lan = profile(Scope::System, Networks::i2p());
+        with_lan.allow_lan = true;
+        assert_eq!(with_lan.validate(), Err(ProfileError::I2pWithLan));
+    }
+
+    #[test]
     fn raw_profile_round_trips_over_the_wire_but_valid_profile_does_not() {
         // The raw profile is what travels over IPC; core validates it on receipt.
-        let raw = profile(Scope::System, Networks::both());
+        let raw = profile(Scope::System, Networks::tor());
         let json = serde_json::to_string(&raw).unwrap();
         let decoded: Profile = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, raw);

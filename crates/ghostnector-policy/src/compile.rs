@@ -208,7 +208,7 @@ pub fn compile(
                 false,
             )
         }
-        ProfileId::I2pIsolated => {
+        ProfileId::I2pSystem => {
             return Err(PolicyError::Unsupported(profile));
         }
     };
@@ -1215,7 +1215,7 @@ mod tests {
 
     #[test]
     fn profiles_without_an_implementation_are_rejected_rather_than_approximated() {
-        let error = compile(ProfileId::I2pIsolated, &Params::default(), &env()).unwrap_err();
+        let error = compile(ProfileId::I2pSystem, &Params::default(), &env()).unwrap_err();
         assert!(matches!(error, PolicyError::Unsupported(_)));
     }
 

@@ -289,6 +289,23 @@ case "$STATUS" in
 *) fail "unexpected initial state: $STATUS" ;;
 esac
 
+# ---------------------------------------------------------------- I2P is refused, not approximated
+# This build has no I2P policy yet. The refusal must happen before anything is touched, and the
+# state must be exactly what it was.
+if I2P="$(cli connect --network i2p 2>&1)"; then
+    fail "I2P was accepted although this build has no I2P policy: $I2P"
+fi
+case "$I2P" in
+*"I2P is machine-wide"*) ok "I2P is refused with an explanation" ;;
+*) fail "the I2P refusal was not explained: $I2P" ;;
+esac
+case "$(cli status)" in
+*"traffic is not protected"*) ok "the refused I2P connect changed nothing" ;;
+*) fail "the refused I2P connect changed the state: $(cli status)" ;;
+esac
+in_ns nft list tables 2>/dev/null | grep -q ghostnector &&
+    fail "the refused I2P connect touched the kernel"
+
 if ! CONNECTED="$(cli connect 2>&1)"; then
     echo "$CONNECTED"
     fail "connect failed"

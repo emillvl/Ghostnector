@@ -23,8 +23,8 @@ pub enum ProfileId {
     TorUser,
     /// Transparent Tor inside one route-less namespace.
     TorApp,
-    /// I2P router isolated in its own namespace.
-    I2pIsolated,
+    /// I2P for the whole machine: the router's own egress is the only exemption.
+    I2pSystem,
 }
 
 /// Bounded, typed parameters accepted alongside a [`ProfileId`].
@@ -33,7 +33,7 @@ pub enum ProfileId {
 pub struct Params {
     /// The uid a `TorUser` profile applies to.
     pub user_uid: Option<u32>,
-    /// A namespace identifier from the helper's own registry (`TorApp`, `I2pIsolated`).
+    /// A namespace identifier from the helper's own registry (`TorApp`).
     pub netns_id: Option<u32>,
     /// Whether the local network is reachable from the protected scope.
     pub allow_lan: bool,
@@ -170,7 +170,7 @@ mod tests {
             (ProfileId::TorSystem, "tor_system"),
             (ProfileId::TorUser, "tor_user"),
             (ProfileId::TorApp, "tor_app"),
-            (ProfileId::I2pIsolated, "i2p_isolated"),
+            (ProfileId::I2pSystem, "i2p_system"),
         ] {
             let json = serde_json::to_string(&profile).unwrap();
             assert_eq!(json, format!("\"{tag}\""));

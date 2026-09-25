@@ -831,7 +831,7 @@ mod tests {
     fn unsupported_profiles_are_refused_rather_than_approximated() {
         let (backend, server) = server();
         let request = Verb::ApplyProfile {
-            profile: ProfileId::I2pIsolated,
+            profile: ProfileId::I2pSystem,
             params: Params::default(),
         };
         let mut out = Vec::new();

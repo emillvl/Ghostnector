@@ -291,7 +291,7 @@ mod tests {
         for profile in [
             ProfileId::FailClosed,
             ProfileId::DnsLockdown,
-            ProfileId::I2pIsolated,
+            ProfileId::I2pSystem,
         ] {
             assert!(!needs_tor(profile), "{profile:?}");
         }

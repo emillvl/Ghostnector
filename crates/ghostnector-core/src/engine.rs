@@ -1325,9 +1325,13 @@ fn plan(valid: &ValidProfile, requester_uid: u32) -> Result<(ProfileId, Params),
         }
         (Scope::Dns, false, false) | (Scope::System, false, false) => ProfileId::DnsLockdown,
         (_, _, true) => {
+            // I2P is machine-wide only (validation enforces it). Its policy and router arrive in
+            // the next M9 increments; refusing here means nothing is touched before they exist.
             return Err(EngineError::NotSupported(
-                "I2P arrives in a later milestone".to_string(),
-            ))
+                "I2P is machine-wide, and its policy is not in this build yet; refusing rather \
+                 than approximating"
+                    .to_string(),
+            ));
         }
         (Scope::Off, _, _) => {
             return Err(EngineError::NotSupported(
@@ -1345,20 +1349,17 @@ fn plan(valid: &ValidProfile, requester_uid: u32) -> Result<(ProfileId, Params),
 
 /// A best-effort profile for display when all that is known is the helper's profile id.
 fn profile_of(id: ProfileId) -> Option<Profile> {
-    let (scope, tor) = match id {
-        ProfileId::DnsLockdown => (Scope::Dns, false),
-        ProfileId::TorSystem => (Scope::System, true),
-        ProfileId::TorUser => (Scope::User, true),
-        // The baseline is not something the user asked for, and the others are unimplemented.
-        ProfileId::FailClosed | ProfileId::TorApp | ProfileId::I2pIsolated => return None,
+    let (scope, networks) = match id {
+        ProfileId::DnsLockdown => (Scope::Dns, ghostnector_spec::Networks::none()),
+        ProfileId::TorSystem => (Scope::System, ghostnector_spec::Networks::tor()),
+        ProfileId::TorUser => (Scope::User, ghostnector_spec::Networks::tor()),
+        ProfileId::I2pSystem => (Scope::System, ghostnector_spec::Networks::i2p()),
+        // The baseline is not something the user asked for, and APP scope carries its own profile.
+        ProfileId::FailClosed | ProfileId::TorApp => return None,
     };
     Some(Profile {
         scope,
-        networks: if tor {
-            ghostnector_spec::Networks::tor()
-        } else {
-            ghostnector_spec::Networks::none()
-        },
+        networks,
         ..Profile::default()
     })
 }
