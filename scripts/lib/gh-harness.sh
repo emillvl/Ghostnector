@@ -208,7 +208,7 @@ def control_server():
 
 def control_session(conn, ready):
     try:
-        conn.sendall(b"250 OK\r\n")
+        # Real Tor does not greet first: the client authenticates before it reads.
         pending = b""
         while True:
             chunk = conn.recv(4096)

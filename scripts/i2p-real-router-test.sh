@@ -61,6 +61,12 @@ cleanup() {
     for pid in "$SAMPLER_PID" "$SITE_PID" "$I2PD_PID" "$TOR_PID" "$FAR_PID" "$CORE_PID" "$NETD_PID"; do
         [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
     done
+    # Keep the logs: a qualification run's failures are diagnosed from them, and the record should
+    # outlive the run.
+    mkdir -p /tmp/gh-i2p-real-logs
+    for log in i2pd.log tor.log core.log netd.log far.log far-connections.log samples.log; do
+        [ -f "$WORKDIR/$log" ] && cp "$WORKDIR/$log" "/tmp/gh-i2p-real-logs/$log" 2>/dev/null || true
+    done
     ip netns del "$FAR_NS" 2>/dev/null || true
     ip link del "$VETH_ROOT" 2>/dev/null || true
     nft destroy table inet ghostnector 2>/dev/null || true
@@ -86,9 +92,25 @@ command -v i2pd >/dev/null 2>&1 || fail_setup "i2pd is not installed"
 command -v tor >/dev/null 2>&1 || fail_setup "tor is not installed"
 id -u i2pd >/dev/null 2>&1 || fail_setup "the i2pd user does not exist"
 id -u "$TOR_USER" >/dev/null 2>&1 || fail_setup "the tor user ($TOR_USER) does not exist"
-for user in "$CORE_USER" "$LAUNCH_USER"; do
-    id -u "$user" >/dev/null 2>&1 || fail_setup "the user $user must exist (the M8 suites create it)"
-done
+# The control-plane users the M8 suites use. On a fresh machine this test creates them itself, so the
+# qualification is self-contained; the M8 suites then reuse the same identities.
+if ! id -u "$CORE_USER" >/dev/null 2>&1; then
+    useradd --system --user-group --no-create-home --shell /usr/sbin/nologin "$CORE_USER"
+fi
+if ! id -u "$LAUNCH_USER" >/dev/null 2>&1; then
+    useradd --system --user-group --no-create-home --shell /bin/sh "$LAUNCH_USER"
+fi
+
+# Environment setup, not a product assertion: the packages enable their own daemons at install time,
+# and those would hold the proxy/control ports and keep serving after our router is killed. The
+# qualification runs its own router and its own Tor.
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now i2pd >/dev/null 2>&1 || true
+    systemctl disable --now tor >/dev/null 2>&1 || true
+fi
+sleep 1
+pgrep -x i2pd >/dev/null 2>&1 && fail_setup "an i2pd process is already running"
+pgrep -x tor >/dev/null 2>&1 && fail_setup "a tor process is already running"
 I2PD_UID="$(id -u i2pd)"
 I2PD_GID="$(id -g i2pd)"
 TOR_UID="$(id -u "$TOR_USER")"
@@ -97,13 +119,18 @@ CORE_GID="$(id -g "$CORE_USER")"
 LAUNCH_UID="$(id -u "$LAUNCH_USER")"
 LAUNCH_GID="$(id -g "$LAUNCH_USER")"
 
-mkdir -p "$BINDIR" "$WORKDIR" "$RUNDIR" "$WORKDIR/data" "$WORKDIR/root/etc" "$WORKDIR/tor-data"
+mkdir -p "$BINDIR" "$WORKDIR" "$RUNDIR" "$WORKDIR/data" "$WORKDIR/root/etc" "$WORKDIR/tor-data" "$WORKDIR/tor-cookie" "$WORKDIR/core"
 printf 'nameserver 192.0.2.53\n' >"$WORKDIR/root/etc/resolv.conf"
 for binary in ghostnector-netd ghostnector-core ghostnector ghostnector-dns; do
     install -m 0755 "$TARGET_DIR/$binary" "$BINDIR/$binary"
 done
 chown -R i2pd:i2pd "$WORKDIR/data"
-chown -R "$TOR_USER":"$TOR_USER" "$WORKDIR/tor-data" 2>/dev/null || true
+chown -R "$TOR_USER":"$TOR_USER" "$WORKDIR/tor-data" "$WORKDIR/tor-cookie" 2>/dev/null || true
+# Tor fixes its DataDirectory to 0700, so the control cookie lives in its own directory that the
+# control plane can traverse; the cookie itself is handed to the control plane once Tor listens.
+chmod 755 "$WORKDIR/tor-cookie"
+# The control plane writes its journal and resolver state here, so it must own this directory.
+chown -R "$CORE_UID" "$WORKDIR/core" "$WORKDIR/root"
 COOKIE="$WORKDIR/control_auth_cookie"
 head -c 32 /dev/urandom >"$COOKIE"
 chown "$CORE_UID" "$COOKIE"
@@ -113,7 +140,7 @@ rm -f "$RUNDIR/core.sock" "$RUNDIR/netd.sock"
 
 echo "── the product's renderer produces the router's configuration"
 export CARGO_TARGET_DIR="$(dirname "$TARGET_DIR")"
-export PATH="/root/.cargo/bin:$PATH"
+export PATH="${GHOSTNECTOR_CARGO_BIN:-$HOME/.cargo/bin}:$PATH"
 GHOSTNECTOR_EXPORT_I2PD_CONF="$WORKDIR/i2pd.conf" \
     GHOSTNECTOR_EXPORT_I2PD_DATA="$WORKDIR/data" \
     cargo test -q -p ghostnector-core \
@@ -121,6 +148,17 @@ GHOSTNECTOR_EXPORT_I2PD_CONF="$WORKDIR/i2pd.conf" \
     fail_setup "the rendered configuration could not be exported"
 [ -f "$WORKDIR/i2pd.conf" ] || fail_setup "no configuration was exported"
 grep -q "port = 4444" "$WORKDIR/i2pd.conf" || fail_setup "the exported configuration is not the product's"
+if [ "${I2P_QUAL_TRANSPORT:-both}" = "ntcp2" ]; then
+    # Qualification-only: i2pd 2.49.0 aborts under SSU2 traffic in this environment (heap corruption
+    # after a minute or two), on WSL and on a native Ubuntu VM alike. NTCP2 is a full transport, so
+    # the router still joins the network; the product configuration is otherwise unchanged.
+    cat >>"$WORKDIR/i2pd.conf" <<'EOF'
+
+[ssu2]
+enabled = false
+EOF
+    note "qualification-only transport override: NTCP2 only"
+fi
 ok "the router will start under the product's rendered configuration"
 
 # The canary: a local I2P destination hosted by the same router.
@@ -170,6 +208,8 @@ except OSError: pass' 2>/dev/null | grep -q up; then PROXY_UP=1; break; fi
 done
 [ -n "$PROXY_UP" ] && ok "the real HTTP proxy answers on 127.0.0.1:4444" ||
     fail_setup "the real HTTP proxy never came up"
+ss -ltnp 2>/dev/null | grep ":4444 " | grep -q "pid=$I2PD_PID" ||
+    fail_setup "the proxy port is not owned by our router (a packaged daemon may be running)"
 
 B32=""
 for _ in $(seq 1 60); do
@@ -292,7 +332,7 @@ ClientOnly 1
 SocksPort 0
 ControlPort 127.0.0.1:$TOR_CONTROL_PORT
 CookieAuthentication 1
-CookieAuthFile $WORKDIR/tor-data/control.cookie
+CookieAuthFile $WORKDIR/tor-cookie/control.cookie
 CookieAuthFileGroupReadable 1
 DataDirectory $WORKDIR/tor-data
 Log notice stdout
@@ -302,23 +342,27 @@ chmod 644 "$WORKDIR/torrc"
 setpriv --reuid="$TOR_UID" --regid="$TOR_UID" --clear-groups \
     /usr/bin/tor -f "$WORKDIR/torrc" >"$WORKDIR/tor.log" 2>&1 &
 TOR_PID=$!
-# The control cookie must be readable by the control plane, which is not in Tor's group.
-for _ in $(seq 1 60); do
-    [ -f "$WORKDIR/tor-data/control.cookie" ] && break
+# Wait for Tor's control port, then take the cookie: Tor writes it before it listens, and taking it
+# earlier races Tor's own write and leaves it unreadable by the control plane.
+for _ in $(seq 1 120); do
+    ss -ltn 2>/dev/null | grep -q "127.0.0.1:$TOR_CONTROL_PORT " && break
     sleep 0.5
 done
-[ -f "$WORKDIR/tor-data/control.cookie" ] ||
-    fail_setup "Tor never wrote its control cookie"
-chown "$CORE_UID" "$WORKDIR/tor-data/control.cookie"
-chmod 600 "$WORKDIR/tor-data/control.cookie"
+ss -ltn 2>/dev/null | grep -q "127.0.0.1:$TOR_CONTROL_PORT " ||
+    fail_setup "Tor never opened its control port"
+chown "$CORE_UID:$CORE_GID" "$WORKDIR/tor-cookie/control.cookie"
+chmod 600 "$WORKDIR/tor-cookie/control.cookie"
+setpriv --reuid="$CORE_UID" --regid="$CORE_GID" --clear-groups \
+    cat "$WORKDIR/tor-cookie/control.cookie" >/dev/null 2>&1 ||
+    fail_setup "the control plane cannot read Tor's cookie"
 
 setpriv --reuid="$CORE_UID" --regid="$CORE_GID" --clear-groups \
     --inh-caps +net_bind_service --ambient-caps +net_bind_service \
     "$BINDIR/ghostnector-core" \
     --socket "$RUNDIR/core.sock" --helper "$RUNDIR/netd.sock" \
-    --journal "$WORKDIR/intent.json" --resolver-state "$WORKDIR/resolver.json" \
+    --journal "$WORKDIR/core/intent.json" --resolver-state "$WORKDIR/core/resolver.json" \
     --resolv-conf-root "$WORKDIR/root" \
-    --services external --tor-cookie "$WORKDIR/tor-control.cookie" \
+    --services external --tor-cookie "$WORKDIR/tor-cookie/control.cookie" \
     --tor-control-port "$TOR_CONTROL_PORT" --tor-bootstrap-seconds 120 \
     --dns-helper "$BINDIR/ghostnector-dns" \
     --i2p-ready-seconds 20 \
@@ -408,12 +452,14 @@ case "$(skuid_set)" in
 *) bad "unexpected exemptions: $(skuid_set)" ;;
 esac
 
-BEFORE_TCP="$(boundary_packets "tcp dport $TCP_PORT")"
-BEFORE_UDP="$(boundary_packets "udp dport $UDP_PORT")"
-BEFORE_DNS="$(boundary_packets "udp dport $DNS_PORT")"
 [ "$(reach_as "$I2PD_UID" "$I2PD_GID")" = "connected" ] &&
     ok "the real router's own egress is carried" ||
     bad "the real router's own egress was blocked"
+# The router's probe above is expected at the boundary; measure the ordinary identity from here so
+# its delta is not polluted by the router's packets.
+BEFORE_TCP="$(boundary_packets "tcp dport $TCP_PORT")"
+BEFORE_UDP="$(boundary_packets "udp dport $UDP_PORT")"
+BEFORE_DNS="$(boundary_packets "udp dport $DNS_PORT")"
 TCP_ORDINARY="$(reach_as "$LAUNCH_UID" "$LAUNCH_GID")"
 UDP_ORDINARY="$(udp_as "$LAUNCH_UID" "$LAUNCH_GID" "$UDP_PORT")"
 DNS_ORDINARY="$(dns_as "$LAUNCH_UID" "$LAUNCH_GID")"
@@ -447,10 +493,14 @@ fi
 # ---------------------------------------------------------------- phase C: death and tampering
 echo "── phase C: router death and policy tampering fail closed"
 kill "$I2PD_PID" 2>/dev/null || true
-if wait_for "no traffic can leave" 60; then
+sleep 2
+note "listeners on 4444 after the kill: $(ss -ltn 2>/dev/null | grep -c ':4444 ')"
+note "state right after the kill: $(status | sed -n '1,2p' | tr '\n' ' ')"
+if wait_for "no traffic can leave" 90; then
     ok "the router's death was noticed and the machine denied"
 else
-    bad "I2P kept claiming protection with its router dead: $(status)"
+    note "last state: $(status)"
+    bad "I2P kept claiming protection with its router dead"
 fi
 case "$(skuid_set)" in
 *"$I2PD_UID"*) bad "the router's exemption survived its death" ;;

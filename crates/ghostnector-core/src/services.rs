@@ -365,9 +365,7 @@ mod tests {
                     };
                     let mut reader = BufReader::new(reading);
                     let mut writer = stream;
-                    if writer.write_all(b"250 OK\r\n").is_err() {
-                        return;
-                    }
+                    // Real Tor does not greet first: wait for the client's command.
                     let mut line = String::new();
                     while reader.read_line(&mut line).unwrap_or(0) > 0 {
                         let reply = if line.starts_with("AUTHENTICATE") {

@@ -159,7 +159,7 @@ READY = (
 
 def handle(connection):
     try:
-        connection.sendall(b"250 OK\r\n")
+        # Real Tor does not greet first: the client authenticates before it reads.
         pending = b""
         while True:
             chunk = connection.recv(4096)

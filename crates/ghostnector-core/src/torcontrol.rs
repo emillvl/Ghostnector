@@ -144,8 +144,9 @@ impl TorControl {
             .map_err(|error| TorControlError::Protocol(error.to_string()))?;
         let mut reader = BufReader::new(stream);
 
-        // Tor greets first, so a port that accepts connections but says nothing is not Tor.
-        read_reply(&mut reader)?;
+        // Tor does not greet first: the control protocol is command and response, so the client
+        // speaks first. (An earlier version read a greeting, which only a permissive test double
+        // sent; real Tor stays silent and the read timed out. The native qualification caught it.)
         send(&mut writer, &format!("AUTHENTICATE {cookie}"))?;
         read_reply(&mut reader)?;
         send(&mut writer, "GETINFO status/bootstrap-phase")?;
@@ -399,9 +400,8 @@ mod tests {
         };
         let mut reader = BufReader::new(reading);
         let mut writer = stream;
-        if writer.write_all(b"250 OK\r\n").is_err() {
-            return;
-        }
+        // Real Tor says nothing until the client sends a command; this double does the same, so the
+        // client cannot pass by reading a greeting that Tor never sends.
         let mut line = String::new();
         loop {
             line.clear();
@@ -442,6 +442,36 @@ mod tests {
         let (address, _) = tor_saying("NOTICE BOOTSTRAP PROGRESS=100 TAG=done SUMMARY=\"Done\"");
         let control = client(address, dir.cookie(&[7u8; 32]));
         assert_eq!(control.bootstrap().expect("bootstrap"), Bootstrap::Done);
+    }
+
+    #[test]
+    fn the_client_speaks_first_because_real_tor_does_not_greet() {
+        // Regression for the defect the native qualification exposed: the client used to wait for a
+        // greeting that real Tor never sends. This double only answers commands, exactly like Tor.
+        let dir = TempDir::new("speaks-first");
+        let authenticated = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&authenticated);
+        let (address, _) = fake_control(move |command| {
+            if command.starts_with("AUTHENTICATE") {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Some("250 OK\r\n".to_string())
+            } else if command.starts_with("GETINFO status/bootstrap-phase") {
+                Some(
+                    "250-status/bootstrap-phase=NOTICE BOOTSTRAP PROGRESS=100 TAG=done \
+                     SUMMARY=\"Done\"\r\n250 OK\r\n"
+                        .to_string(),
+                )
+            } else {
+                None
+            }
+        });
+        let control = client(address, dir.cookie(&[9u8; 32]));
+        assert_eq!(control.bootstrap().expect("bootstrap"), Bootstrap::Done);
+        assert_eq!(
+            authenticated.load(Ordering::SeqCst),
+            1,
+            "the client must authenticate before it reads anything"
+        );
     }
 
     #[test]

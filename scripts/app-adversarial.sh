@@ -111,7 +111,7 @@ def control_server():
 
     def handle(connection):
         try:
-            connection.sendall(b"250 OK\r\n")
+            # Real Tor does not greet first: the client authenticates before it reads.
             while True:
                 line = b""
                 while not line.endswith(b"\r\n"):
