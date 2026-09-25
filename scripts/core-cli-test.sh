@@ -31,7 +31,9 @@ CORE_USER="ghostnector-core"
 OUTSIDER="ghostnector-outsider"
 CONTROL_PORT="9051"
 DNS_UPSTREAM_PORT="9053"
-CHOKEPOINT_PORT="9054"
+# The chokepoint listens on the port a `nameserver` line implies, because that line cannot carry a
+# port (D-22). The probe below checks the address the resolver was actually given against this.
+CHOKEPOINT_PORT="53"
 UDP_CHECK_PORT="9999"
 OUTSIDE_NS="gh-outside"
 OUTSIDE_ADDR="10.77.0.1"
@@ -203,13 +205,13 @@ PY
 cat >"$DNS_PROBE" <<'PY'
 import socket, sys
 
-port = int(sys.argv[1])
+host, port = sys.argv[1], int(sys.argv[2])
 client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 client.settimeout(4)
 # The relay passes messages through unchanged, so this only has to look like a query: id 0x1234,
 # QR clear.
 query = bytes([0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-client.sendto(query, ("127.0.0.1", port))
+client.sendto(query, (host, port))
 try:
     data, _ = client.recvfrom(4096)
 except socket.timeout:
@@ -243,7 +245,12 @@ start_stack() {
     NETD_PID=$!
     wait_for_socket "$RUNDIR/netd.sock" || fail "the helper did not start"
 
-    as_user "$CORE_UID" "$CORE_GID" "$BINDIR/ghostnector-core" \
+    # The relay core starts listens on port 53, so core needs exactly the capability the packaged
+    # unit grants it: CAP_NET_BIND_SERVICE, inherited by the child (D-22).
+    ip netns exec "$NS" setpriv \
+        --reuid="$CORE_UID" --regid="$CORE_GID" --clear-groups \
+        --inh-caps +net_bind_service --ambient-caps +net_bind_service \
+        "$BINDIR/ghostnector-core" \
         --socket "$RUNDIR/core.sock" --helper "$RUNDIR/netd.sock" --journal "$JOURNAL" \
         --services external --tor-cookie "$COOKIE" --tor-control-port "$CONTROL_PORT" \
         --tor-bootstrap-seconds 10 \
@@ -302,15 +309,26 @@ esac
 in_ns nft list tables | grep -q ghostnector || fail "the kernel has no policy after connect"
 ok "the kernel really has the policy"
 
-ANSWER="$(in_ns python3 "$DNS_PROBE" "$CHOKEPOINT_PORT" 2>&1)" ||
-    fail "nothing answered on the chokepoint: $ANSWER"
-case "$ANSWER" in
-*"upstream-saw-it"*) ok "a query reached the configured upstream through the relay" ;;
-*) fail "the answer did not come from the upstream: $ANSWER" ;;
-esac
 case "$(cat "$RESOLV_CONF")" in
 *"nameserver 127.0.0.1"*) ok "the machine's own resolver points at the chokepoint" ;;
 *) fail "the resolver was not repointed: $(cat "$RESOLV_CONF")" ;;
+esac
+
+# D-22: the resolver line names an address and no port, so it means port 53. Query the address core
+# actually wrote, on that implied port: if the relay listened anywhere else, this is where the
+# default install would break.
+RESOLVER_ADDR="$(awk '$1 == "nameserver" { print $2; exit }' "$RESOLV_CONF")"
+[ "$RESOLVER_ADDR" = "127.0.0.1" ] ||
+    fail "the resolver line does not name loopback: $(cat "$RESOLV_CONF")"
+[ "$CHOKEPOINT_PORT" = "53" ] ||
+    fail "the test's chokepoint port no longer matches what a nameserver line implies"
+ANSWER="$(in_ns python3 "$DNS_PROBE" "$RESOLVER_ADDR" "$CHOKEPOINT_PORT" 2>&1)" ||
+    fail "nothing answered at the resolver's own address and implied port: $ANSWER"
+case "$ANSWER" in
+*"upstream-saw-it"*)
+    ok "the resolver's own address and implied port answered through the relay (D-22)"
+    ;;
+*) fail "the answer did not come from the upstream: $ANSWER" ;;
 esac
 
 echo "[4d] the checks turn an applied policy into a proven one"

@@ -43,7 +43,7 @@ SOCKS support required from the app.
 | DR-3 | Validated **mode × scope** state machine instead of three independent component toggles. |
 | DR-4 | **Deny-first bootstrap:** fail-closed baseline applied before any service starts; holes opened only after Tor reaches 100%. |
 | DR-5 | Local TCP/DNS redirected to loopback-bound `TransPort`/`DNSPort`. No TUN, no userspace forwarding in v1. |
-| DR-6 | **Route-less app namespace** mode: protected apps live in a netns with **no default route**; only a netns-local DNAT to a host-local core address exists. |
+| DR-6 | **Dead-end app namespace** mode: protected apps live in a netns whose default route terminates on a dead-end local `dummy` device; only a netns-local DNAT to a host-local core address can make a destination reachable. Corrected in M8.0 from the original "no default route" wording, which cannot support transparent interception (see §3.4). |
 | DR-7 | Source addresses are preserved across the namespace boundary (never masqueraded) so per-app Tor circuit isolation is recovered. |
 | DR-8 | UDP denied by default and **rejected, not dropped**, so QUIC/RTC fall back in milliseconds instead of hanging. |
 | DR-9 | IPv6 egress denied host-wide; **absent by construction** inside app namespaces. |
@@ -217,7 +217,7 @@ one is an unusually mature design goal and it shapes §12.
 
 ```
         ┌──────────────────────── CONTROL PLANE (unprivileged) ────────────────────────┐
-        │  ghostnector-gui        ghostnector-core                ghostnector-verify  │
+        │  ghostnector-gui        ghostnector-core          (verification in core)  │
         │  (session user)         (system user, no caps)          (blocked-by-policy) │
         │  displays state,        state machine, journal,         periodic probes:   │
         │  requests transitions   IPC, health, orchestration      "can I escape?"    │
@@ -286,11 +286,13 @@ namespaces", "2 blocked egress attempts"), never a bare "Anonymous" badge.
    denied. Rationale: kernel-path forwarding, no userspace copy, no MTU/MSS pathology, no TUN
    device, and the policy is transport-based (uid/proto/port) rather than interface-based — which
    turns out to matter against escape attempts (§7.7).
-2. **`APP` scope → route-less namespace (DR-6).** Each protected app gets a netns whose only
-   reachable address is a host-local "core" address; inside the netns, a netns-local nat chain DNATs
-   TCP and :53 to that address. The app namespace **has no default route at all**. Leaks are not
-   prevented by rules; they are prevented by the absence of a path. IPv6 is disabled inside the
-   namespace (a per-netns sysctl, zero host impact).
+2. **`APP` scope → dead-end namespace (DR-6).** Each protected app gets a netns whose default route
+   terminates on a dead-end local `dummy` device and whose only *usable* off-namespace destination is
+   a host-local "core" address; inside the netns, a netns-local nat chain DNATs TCP and :53 to that
+   address. Leaks are not prevented by rules; they are prevented by the absence of a usable path — a
+   flushed ruleset routes into the dead end. IPv6 is disabled inside the namespace (a per-netns
+   sysctl, zero host impact). §3.4 records the M8.0 correction of the original "no default route"
+   wording.
 
 `USER` scope is the `SYSTEM` mechanism with the redirect/deny rules scoped to one uid, plus
 loopback exemption for the rest of the machine. It is strictly weaker than `SYSTEM` (root daemons
@@ -298,29 +300,54 @@ still talk to the clearnet) and must be described that way in the UI.
 
 **Rejected for v1** (kept in §16 as benchmark candidates): TUN/tun2socks-style userspace forwarding
 (copy cost, MTU pathologies, and a userspace TCP stack in the trust path), TPROXY (needed only for
-*forwarded* traffic; the route-less namespace removes the need), and per-app Tor instances (multiplies
+*forwarded* traffic; the dead-end namespace removes the need), and per-app Tor instances (multiplies
 guards, memory, and your network footprint for no gain over source-address isolation).
 
-### 3.4 Why the route-less namespace is the strongest mode
+### 3.4 Why the dead-end app namespace is the strongest mode
 
-- **Fail-closed by construction.** No default route ⇒ a newly installed app, a new protocol, a
-  forgotten UDP port, or a stale firewall rule cannot leak. The failure mode of a broken rule is
-  "no connectivity", not "clearnet connectivity".
+> **M8.0 correction (executed 2026-09-25).** The original formulation — "no default route" — cannot
+> support transparent interception, and the experiment that showed it is committed as
+> `scripts/app-topology-test.sh`. For locally generated packets the kernel resolves the output route
+> *before* the `LOCAL_OUT` netfilter hook, so a namespace with no route to a destination refuses
+> `connect()` with `ENETUNREACH` and the netns-local DNAT never runs. The property that matters is
+> not the absence of a route entry, it is the **absence of a route capable of carrying a packet**.
+> The implemented shape is:
+>
+> > The APP namespace has no route capable of carrying application traffic to an external network.
+> > Its default route terminates on a dead-end local dummy interface. Netns-local DNAT is the only
+> > mechanism that turns an application connection into a reachable Ghostnector core destination.
+>
+> and the required failure property is:
+>
+> > If the APP DNAT/ruleset disappears or is invalid, application traffic dies locally without
+> > reaching the host veth, ARP/NDP, the host forwarding path, or an external network.
+>
+> The test observes all three: literal route-lessness refuses the connection; the dead-end route plus
+> DNAT carries it with the source address preserved; with the DNAT removed the connection dies
+> locally and the host veth sees nothing at all — not even an ARP request. The scope-link
+> default-route variant is deliberately not used: its failure mode depends on host ARP behaviour
+> (`proxy_arp`) rather than on a device with no peer.
+
+- **Fail-closed by construction.** No usable route ⇒ a newly installed app, a new protocol, a
+  forgotten UDP port, or a flushed firewall rule cannot leak. The failure mode of a broken rule is
+  "no connectivity", not "clearnet connectivity", and the dead end is inside the namespace: the
+  host is not involved even as a witness.
 - **IPv6 leak impossible.** No IPv6 address/route in the namespace (and IPv6 disabled there).
 - **Per-app Tor circuit isolation for free (DR-7).** Tor's isolation profile includes the
   **Application Address** — the source address of the connection as Tor sees it. Host-wide
   `REDIRECT` makes every app appear as `127.0.0.1` (or the host's address), so *all* host traffic
   shares circuits. Preserving the namespace's distinct source address across the veth means each app
-  has a different Application Address ⇒ different isolation profile ⇒ different circuits, with **no
-  SOCKS support required from the app** and no masquerade. This is the single highest-value
-  architectural move in this review.
+  supplies a different Application Address to Tor. Whether that yields different *circuits* is Tor's
+  own property and is claimed separately (see `PROTECTION-CLAIMS.md`); what Ghostnector supplies and
+  can prove is the distinct source identity, with **no SOCKS support required from the app** and no
+  masquerade. This is the single highest-value architectural move in this review.
 - **Container-like cleanup.** Deleting the namespace deletes the policy. Restoration is trivial
   (§12) and cannot leave stale rules behind.
 
 Costs, stated honestly: apps needing LAN discovery, inbound connections, or multicast will not work
-unless the user opts into a LAN exception; the launcher is a small extra UX step; and it requires the
-`netd` capability set to include `CAP_SYS_ADMIN` for namespace wiring (hence: keep `netd` tiny, and
-ship `SYSTEM` mode first).
+in APP scope (LAN access is unsupported while source identity is preserved and no SNAT is done);
+the launcher is a small extra UX step; and namespace wiring needs `CAP_SYS_ADMIN`, which M8 confines
+to a separate small helper (`ghostnector-appd`), **not** to `netd` (risk R7).
 
 ---
 
@@ -336,18 +363,19 @@ ship `SYSTEM` mode first).
                           │  ordinary sockets (any destination)
    ┌──────────────────────▼──────────────────────────────────────────────────────┐
    │ nftables `inet ghostnector`                                                 │
-   │  nat/output    tcp                    → 127.0.0.7:9040   (TransPort)        │
-   │  nat/output    udp/tcp dport 53       → 127.0.0.7:9053   (DNSPort)          │
+   │  nat/output    tcp                    → 127.0.0.1:9040   (TransPort)        │
+   │  nat/output    udp/tcp dport 53       → 127.0.0.1:53     (chokepoint)       │
+   │                                       → 127.0.0.1:9053   (Tor DNSPort)      │
    │  filter/output skuid tor → accept     (bootstrap + relay traffic only)      │
-   │  filter/output udp dport 68 → accept  (DHCP, so the link stays up)          │
+   │  filter/output udp sport 68 udp dport 67 → accept  (DHCP, link stays up)    │
    │  filter/output LAN set → policy       (default: reject)                     │
    │  filter/output udp/icmp               → reject            (fast QUIC fallback)│
    │  filter/output everything else        → drop, counted                       │
    │  filter/forward everything            → drop, counted (containers/VMs)      │
    └──────┬────────────────────────────────────────────────┬─────────────────────┘
-          │ 127.0.0.7:9040                                 │ 127.0.0.7:9053
+          │ 127.0.0.1:9040                                 │ 127.0.0.1:53 → 127.0.0.1:9053
    ┌──────▼─────────┐                            ┌─────────▼──────────┐
-   │ tor TransPort  │                            │ tor DNSPort        │
+   │ tor TransPort  │                            │ chokepoint         │
    │ (loopback only)│                            │ (loopback only)    │
    └──────┬─────────┘                            └─────────┬──────────┘
           └──────────────────┬─────────────────────────────┘
@@ -365,10 +393,10 @@ ship `SYSTEM` mode first).
 ```
   DNS-LOCKDOWN (clearnet)                    TOR (any scope)
   ─────────────────────────                  ────────────────────────────────
-  app ─► 127.0.0.9:9053 (stub)               app ─► (redirect/DNAT) ─► chokepoint
+  app ─► 127.0.0.1:53 (chokepoint)           app ─► (redirect/DNAT) ─► chokepoint
         │                                          │
         │ only dnscrypt-proxy uid may reach        │ chokepoint forwards to
-        │ 53/853/443 outbound; everyone else        │ Tor DNSPort
+        │ 53/853/443 outbound; everyone else        │ Tor DNSPort (127.0.0.1:9053)
         │ is dropped/rejected at the kernel         │
         ▼                                          ▼
    dnscrypt-proxy ── ODoH / anonymized       DNSPort ── Tor circuit ── exit ──► resolver
@@ -377,32 +405,41 @@ ship `SYSTEM` mode first).
          requires relay not colluding)
 
   ADVANCED (opt-in): authenticated DNS over Tor
-  app ─► chokepoint ─► dnscrypt-proxy ──[egress firewalled to 127.0.0.7:9050 ONLY]──►
+  app ─► chokepoint ─► dnscrypt-proxy ──[egress firewalled to 127.0.0.1:9050 ONLY]──►
                                           Tor SOCKS ──► resolver
                                           (authenticated answers; slow; must not fall back)
 ```
 
-### D3 — `APP` scope: route-less namespace
+### D3 — `APP` scope: dead-end namespace
 
 ```
- ┌──────────────────────── app namespace N (one per app / identity group) ──────────────┐
- │  app, uid 1000, source address 10.200.N.2                                            │
- │  connect("93.184.216.34", 443)                                                       │
- │      │                                                                               │
- │      ▼  netns-local nftables                                                          │
- │  nat/output   tcp              → dnat 10.200.N.1:9040   (SOURCE PRESERVED)            │
- │  nat/output   udp/tcp dport 53 → dnat 10.200.N.1:9053                                 │
- │  filter/output udp, icmp       → reject (ICMP so the app fails fast)                  │
- │  routing: NO DEFAULT ROUTE. Only 10.200.N.0/30 on veth. IPv6 disabled in-netns.       │
- └───────────────────────────────────────┬──────────────────────────────────────────────┘
-                                         │ veth, no masquerade, no forwarding rewrite
- ┌───────────────────────────────────────▼──────────────────────────────────────────────┐
- │ host: 10.200.N.1 is a host-local address, so the packet is delivered locally          │
- │   tor TransPort bound to the core address (or wildcard + input rules)                 │
- │     → Tor sees "Application Address = 10.200.N.2"  ⇒ per-app circuits                 │
- │   DNS chokepoint bound per app, upstream bound to the same source ⇒ per-app DNS too   │
- └───────────────────────────────────────────────────────────────────────────────────────┘
+ ┌──────────────── app namespace N (one per app / isolation group) ─────────────────────┐
+ │  app, invoking uid, source address 10.200.0.N/32                                      │
+ │  connect("93.184.216.34", 443)                                                        │
+ │      │                                                                                │
+ │      ▼  netns-local nftables (its own table, not the host's)                          │
+ │  nat/output   udp/tcp dport 53 → dnat 10.200.0.1:53   (chokepoint, same port)         │
+ │  nat/output   tcp dport 9050 to the core → return (direct SOCKS: credential isolation) │
+ │  nat/output   tcp              → dnat 10.200.0.1:9040 (TransPort; SOURCE PRESERVED)   │
+ │  filter/output udp, icmp       → reject (so the app fails fast)                       │
+ │  routing: default dev ghdead (dummy, no peer) + 10.200.0.1/32 via the veth            │
+ │           IPv6 disabled in-netns. A flushed ruleset routes into the dead end: no      │
+ │           packet, no ARP/NDP, no host involvement.                                    │
+ └───────────────────────────────────────┬───────────────────────────────────────────────┘
+                                         │ veth into an isolated bridge port; no masquerade
+ ┌───────────────────────────────────────▼───────────────────────────────────────────────┐
+ │ host: ghbr0 10.200.0.1/24, ports isolated; the destination is host-local              │
+ │   tor TransPort 10.200.0.1:9040 · chokepoint 10.200.0.1:53                            │
+ │     → Tor sees "Application Address = 10.200.0.N": the source identity is preserved   │
+ │   host input accepts only those ports from ghbr0; fwd_filter stays default-drop       │
+ └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+The APP host table has **no OUTPUT chain**: APP scope protects the applications inside the
+namespaces and must never become a machine-wide policy. The bridge has no uplink port, so it cannot
+become a forwarding path. Namespace identity, the DNAT ruleset, and the namespace shape are checked
+by the helper on every verification pass, so a changed namespace is an alarm even though no probe
+traverses the change.
 
 ### D4 — I2P as an independent plane
 
@@ -466,7 +503,7 @@ established** (DR-15). Failures in 7 never roll back to clearnet; they escalate 
 | `ghostnector-core` | Mode state machine, journal, orchestration, health, IPC, resolver-layer coordination, verification scheduling | Apply kernel policy itself; run as root; read user files | System user, no capabilities |
 | `ghostnector-netd` | Atomic ruleset application, sets/maps, netns+veth wiring, conntrack flush, whitelisted sysctls | Accept arbitrary rulesets/commands/paths; parse user input; network I/O | System user, `CAP_NET_ADMIN` (+`CAP_SYS_ADMIN` only in ns mode) |
 | `ghostnector-boot-guard` | Early fail-closed baseline if intent=protected | Start Tor, resolve anything, reach the network | Same caps as netd, separate unit |
-| `ghostnector-verify` | Continuous escape/identity/DNS-canary checks; emits verdicts | Be exempted from policy; log destinations persistently | System user, **inside** the protected set |
+| verification (in `ghostnector-core`) | Continuous escape/identity/DNS-canary checks; emits verdicts | Be exempted from policy; log destinations persistently | System user, **inside** the protected set |
 | `tor` | Tor client: TransPort, DNSPort, SOCKSPort, bridges, bootstrap | Be a relay/exit/HS host by default; be reachable from LAN | `debian-tor` (static), sandboxed |
 | `dnscrypt-proxy` | Clearnet-mode encrypted resolver; ODoH/anonymized-relay capable; DNSSEC hard-fail | Talk to anything except its resolvers and (in advanced mode) the Tor SOCKS port | `ghostnector-dns` (static) |
 | `i2pd` | I2P router (client-only), HTTP/SOCKS/SAM listeners | Have an outproxy; be reachable outside its namespace; be joined to Tor | `i2pd` (static) |
@@ -485,7 +522,7 @@ established** (DR-15). Failures in 7 never roll back to clearnet; they escalate 
 | Flush conntrack | `CAP_NET_ADMIN` | Needed on transitions so pre-existing flows cannot survive |
 | Net policies (`net.ipv4.conf.*`, per-netns `disable_ipv6`) | `CAP_NET_ADMIN` (in the owning netns) | Journal every key/value written |
 | Create/move netns, veth, move devices into netns | `CAP_SYS_ADMIN` (+`CAP_NET_ADMIN`) | Confine to `netd`; consider making an unprivileged-userns variant only as an experiment |
-| Bind a privileged port | not needed here | The DNS chokepoint uses a high port and is reached by DNAT — drop `CAP_NET_BIND_SERVICE` |
+| Bind a privileged port | `CAP_NET_BIND_SERVICE` for the child relay only | A `nameserver` line cannot express a port, so the chokepoint must listen where an address-only line points: port 53 (D-22). `core` holds exactly this one capability, inherited by its tethered relay child; `netd` does not need it |
 | Start/stop services | systemd D-Bus + polkit policy | `core` gets a narrow polkit rule for its own units only |
 | Write `/etc/resolv.conf` | root, or `resolvectl` via polkit | Prefer the systemd-resolved cooperation path (§8.6) |
 | Read Tor's control port | cookie readable by `core`'s group | Control port is loopback-only, cookie auth, `core`-only |
@@ -565,7 +602,7 @@ Ghostnector-specific name and priority; uninstall removes exactly our tables.
 | `out_filter` | `filter output` | exemptions (tor, DHCP), LAN policy, UDP/ICMP reject, default drop, counters |
 | `in_filter` | `filter input` | block LAN → proxy ports; allow only core-veth sources to the chokepoints; keep loopback services private |
 | `fwd_filter` | `filter forward` | **default drop** so containers/VMs cannot bypass `OUTPUT`-only policy |
-| `pre_nat` | `nat prerouting` | only if the benchmarked TPROXY variant is adopted; not needed for the route-less namespace |
+| `pre_nat` | `nat prerouting` | only if the benchmarked TPROXY variant is adopted; not needed for the dead-end namespace |
 
 **Sharp edges that must be handled explicitly:**
 
@@ -580,14 +617,15 @@ Ghostnector-specific name and priority; uninstall removes exactly our tables.
 - Interface-agnostic rules are mandatory: match on `skuid`, protocol, port, and address sets — not on
   `oifname`. This survives Wi-Fi↔Ethernet switches and VPN bring-up without re-application, and (see
   §7.7) it also defeats userspace-NAT escape attempts.
-- Allow DHCP explicitly (`udp dport 68`) so the link does not die, and count it so it is visible.
+- Allow DHCP explicitly (`udp sport 68 udp dport 67`, the direction a client sends) so the link does
+  not die, and count it so it is visible.
 
 ### 7.3 Exemptions — the whole list, always visible
 
 | Exemption | Scope | Why it is necessary | Risk if abused |
 |---|---|---|---|
 | `skuid tor` (all) | Outbound TCP/53 to relays/authorities/DNSPort consumers | Tor cannot bootstrap without a direct path | A compromised Tor = unrestricted egress. Mitigate with Tor's own sandbox, dedicated uid, no extra services on that uid |
-| DHCP (`udp dport 68`) | Outbound | Link maintenance | Reveals presence on the LAN (already known) |
+| DHCP (`udp sport 68 udp dport 67`) | Outbound | Link maintenance | Reveals presence on the LAN (already known) |
 | `dnscrypt-proxy` uid → 53/853/443 | Clearnet/DNS-lockdown only | Its resolution path | None in Tor modes: it is not started/its uid is not exempted there |
 | `dnscrypt-proxy` uid → Tor SOCKS only | Advanced "authenticated DNS over Tor" | Its resolution path | Prevents the real-IP DNS leak; failure = DNS stops |
 | LAN/loopback exception | Per-app, opt-in | Printers, discovery, dev servers, localhost services | Reveals you to the LAN only; never enables clearnet |
@@ -709,7 +747,7 @@ than a controlled exception). Provide a first-class flow: detect the portal, sho
 
 | Listener | Binding | Consumers | Notes |
 |---|---|---|---|
-| `TransPort` | loopback address distinct from the system's (e.g. `127.0.0.7`) and/or the core namespace address | Redirected local TCP; DNAT'ed namespace TCP | Never a wildcard bind in `SYSTEM` scope unless `in_filter` blocks LAN access |
+| `TransPort` | loopback `127.0.0.1`, and the host-local core address when APP scope is active | Redirected local TCP; DNAT'ed namespace TCP | Never a wildcard bind: `SYSTEM` scope binds loopback only, and the APP listener exists on a private bridge address with input rules that admit only the app link |
 | `DNSPort` | same loopback family | Chokepoint | Accepts UDP and TCP (verify on your Tor version; if TCP is unsupported, keep the TCP redirect so it fails closed) |
 | `SOCKSPort` | loopback | Apps that want per-destination isolation, browsers via PAC, the advanced DNS feature | `IsolateSOCKSAuth` enabled; credential-per-profile from the GUI |
 | Control port | loopback, cookie auth, `core`-readable cookie only | Health/stats | Never exposed; never used by the GUI |
@@ -719,7 +757,7 @@ than a controlled exception). Provide a first-class flow: detect the portal, sho
 
 - Tor's own egress is exempt by `skuid`; the exemption is ordered before the redirect rules.
 - The redirect rules must not capture the proxy ports themselves (a rule that redirects traffic
-  *to* `127.0.0.7:9040` back into `TransPort` is a loop). Bound the redirect by "not already destined
+  *to* `127.0.0.1:9040` back into `TransPort` is a loop). Bound the redirect by "not already destined
   to the loopback proxy address", and keep the loopback shortcut before it.
 - Bootstrap ordering is the security property (§4 D5): deny first, then bootstrap, then open.
 - `--verify-config` before start; rollback on non-100% bootstrap with a timeout; never a "connect
@@ -835,7 +873,9 @@ Design specifics:
 
 Two layers, and the stronger one does not depend on rules being present and correct:
 
-1. **Structural (APP scope):** no route, no IPv6, no multicast. A flushed rule cannot create a path.
+1. **Structural (APP scope):** the default route is a dead end, IPv6 is absent, and DNAT is the only
+   way a packet can reach the host core address. A flushed rule cannot create a path (M8.0; see
+   §3.4 and `scripts/app-topology-test.sh`).
 2. **Policy (SYSTEM/USER scope):** explicit default-deny with a short, enumerated allow list, applied
    atomically, living in the kernel independent of any daemon.
 
@@ -1160,7 +1200,7 @@ variants, onion-service hosting, relays/exits, VPN integration, multi-host routi
 Build the smallest thing that makes leaks structurally impossible: kernel-enforced, uid- and
 transport-scoped default-deny; DNS inside Tor; Tor's own traffic as the single exemption; a
 privileged helper too small to be interesting; a state machine that never has a clearnet fallback
-once protection exists; and a second, stronger mode — the route-less app namespace — for users who
+once protection exists; and a second, stronger mode — the dead-end app namespace — for users who
 need per-app circuit isolation and cannot tolerate a single rule being wrong. Add I2P beside it, as
 its own network, with its own honest warning label. Refuse every feature that trades an anonymity
 property for a benchmark number.
@@ -1176,7 +1216,7 @@ property for a benchmark number.
 | DR-3 | Mode × scope state machine | Removes incoherent combinations | ++ | Neutral | Invalid states unrepresentable |
 | DR-4 | Deny-first bootstrap | Eliminates the opening window | ++ | Neutral | Abort + rollback |
 | DR-5 | Kernel redirect, no userspace forwarding | Fewer copies, no MTU pathology | Neutral | + | Fail-closed |
-| DR-6 | Route-less app namespaces | Leaks impossible by construction | ++ | − (cold circuits) | No path = no leak |
+| DR-6 | Dead-end app namespaces (default route into a `dummy` with no peer; DNAT is the only usable path) | Leaks impossible by construction | ++ | − (cold circuits) | No usable path = no leak |
 | DR-7 | Preserve source addresses across veth | Recovers per-app Tor isolation | ++ | − (more circuits) | Isolation lost if NAT added — test for it |
 | DR-8 | Reject UDP/ICMP instead of dropping | Fast fallback; no silent blackhole | + | + | Instant failure, counted |
 | DR-9 | IPv6 denied host-wide, absent in namespaces | Dual-stack leaks are a classic failure | ++ | Neutral | v6 apps fail visibly |
@@ -1198,7 +1238,7 @@ property for a benchmark number.
 |---|---|---|---|
 | `OFF` | all direct, no policy | — | — |
 | `DNS` | encrypted DNS + port-53 lockdown | **invalid** (use a Tor scope) | I2P + encrypted clearnet DNS, both allowed, no linkage |
-| `APP` | per-app DNS only | per-app route-less namespaces | apps launched into the I2P container |
+| `APP` | per-app DNS only | per-app dead-end namespaces | apps launched into the I2P container |
 | `USER` | per-user DNS only | redirect/deny scoped to one uid | I2P as a separate user-scope network |
 | `SYSTEM` | system-wide encrypted DNS | system-wide transparent Tor | system-wide I2P (not recommended; explicit warning) |
 
@@ -1227,7 +1267,7 @@ property for a benchmark number.
 | Chokepoint | The single DNS listener that the protected scopes are redirected to; forwards to `DNSPort` or to the authenticated resolver |
 | Deny-first | Applying the fail-closed policy before any service starts |
 | `DNSPort` / `TransPort` | Tor's DNS and transparent-proxy listeners |
-| Route-less namespace | A namespace with no default route whose only reachable address is a host-local core address |
+| Dead-end namespace | A namespace whose default route terminates on a local `dummy` device with no peer, so the netns-local DNAT to the host-local core address is the only usable path |
 | Scope | How much of the machine is covered (`APP`, `USER`, `SYSTEM`) |
 | Exemption | A uid/protocol/target that is allowed to leave the protected policy; always enumerated and visible |
 | Intent | Persisted record that the user wants protection, used by the boot path |

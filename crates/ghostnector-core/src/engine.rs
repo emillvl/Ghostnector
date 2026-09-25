@@ -1506,8 +1506,9 @@ mod tests {
             .expect("connect");
         assert_eq!(
             relay.started(),
-            vec!["127.0.0.1:9054 -> 127.0.0.1:9053".to_string()],
-            "the relay listens where the policy sends DNS and forwards to Tor's own DNS port"
+            vec!["127.0.0.1:53 -> 127.0.0.1:9053".to_string()],
+            "the relay listens where the policy sends DNS and forwards to Tor's own DNS port; \
+             the port is 53 because that is what the address-only resolver line means (D-22)"
         );
         assert!(relay.is_running());
     }
@@ -1526,7 +1527,7 @@ mod tests {
             .expect("connect");
         assert_eq!(
             relay.started(),
-            vec!["127.0.0.1:9054 -> 127.0.0.1:5353".to_string()],
+            vec!["127.0.0.1:53 -> 127.0.0.1:5353".to_string()],
             "DNS-only mode has no Tor to forward to"
         );
     }

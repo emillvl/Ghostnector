@@ -234,6 +234,35 @@ Defects this campaign found and fixed: **D-15, D-16** (which falsified PC-03 and
 **D-17, D-18, D-19** and **D-20** (a fix that rendered a policy nftables refuses, hidden by a harness
 that ignored the connect result). Each has a regression test that fails on the old behaviour.
 
+## 12. M8 APP scope (planned): the AA class
+
+The APP scope brings a new enforcement surface — namespaces, a host-side APP table with input/forward
+guards only, a bridge, and a launcher — and the M7 lesson applies unchanged: an untested surface is
+not protected. The M8 campaign extends the observation points and adds the `AA` class. The topology
+assumption itself is already pinned by `scripts/app-topology-test.sh`.
+
+Planned cases, to be implemented in M8.6 against the real components:
+
+| ID | Injected action | Expected | Falsifier |
+|---|---|---|---|
+| AA-1 | Remove a protected namespace by hand | the app loses its path; the helper notices on the next check; state says so | the app still reaches anything, or the state keeps claiming APP protection |
+| AA-2 | Inject a `masquerade`/`snat` rule in the host or namespace ruleset | refused by the invariant before it can be applied, or alarmed and replaced if it appears in the kernel | two protected groups present the same source identity to Tor; the rule survives a check |
+| AA-3 | Inject a route inside an APP namespace (root scenario) | nothing reaches the host veth or a boundary: the host does not answer ARP for the destination and `fwd_filter` drops anything that arrives | one packet from the application address at the host link or a boundary |
+| AA-4 | Set `proxy_arp=1` on the host side of an app link | detected by the namespace-shape check; no packet leaves in the meantime | an un-DNAT'ed application packet is forwarded or delivered while APP protection is reported |
+| AA-5 | Create a second path/interface inside the namespace (the AN-5 trick, app edition) | the new path is subject to the same dead end; nothing from the application address uses it | a packet from the application address over the new path |
+| AA-6 | Launch/stop/reconnect storm with two apps running | no prohibited crossing at any point; no stale namespace or veth afterwards | one prohibited packet, or a leftover namespace/veth/rule |
+| AA-7 | `panic` while apps run | apps lose the path; the state and wording are APP-scoped; the machine-wide policy is untouched | an app still reaches the network, or a machine-wide claim appears that is not true |
+| AA-8 | Reboot/reconcile with APP intent persisted | the conservative machine-wide boot baseline is applied; nothing is claimed about app protection until it is re-established and verified | an application reaches the network while protection is claimed, or the state reports `Protected` with no apps |
+| AA-9 | Two apps in separate namespaces, and a masquerade control | the harness observes two distinct Application Addresses at Tor, and no SNAT anywhere | identical source identities, or a rewrite visible at the boundary |
+| AA-10 | DNS from inside an app namespace to a foreign resolver | answered only through the chokepoint; no port-53 packet at a boundary | a port-53 datagram from the application address at a boundary |
+| AA-11 | IPv6 attempt from inside an app namespace | fails; no IPv6 packet anywhere | one IPv6 packet from an application address |
+| AA-12 | Change the namespace ruleset/shape without removing it | detected by the shape/ruleset comparison within the bound | the change survives a check while APP protection is reported |
+| AA-13 | Kill `appd`, then `core`; leave a stale registry entry | existing namespaces keep their protection; nothing opens; reconciliation is honest | a loosening coincident with the death, or a state that invents protection |
+| AA-14 | Read the `Snapshot` while apps run | only ids/counts and evidence flow to the interface | a destination, query, or per-flow record appears |
+
+Regression: every M1–M7 case runs unchanged against an APP build with APP scope inactive, and the
+SYSTEM goldens stay byte-identical.
+
 ## Appendix A — defects found so far, and their regression tests
 
 Recorded because the same classes of mistake will recur.
@@ -261,6 +290,7 @@ Recorded because the same classes of mistake will recur.
 | D-19 | A disconnect removed the policy **before** the state stopped reporting protection, so for a few hundred microseconds a caller would have been told "protected" while the kernel had no policy. Found by the transition oracle, not by a counter: "crossed while reporting protection" is the property, and a before/after count cannot see it. | `ghostnector-core` (engine) | the transition is announced (`Applying`) before the policy is touched; a machine already `Off` announces nothing | `a_disconnect_reports_a_transition_before_it_removes_anything` |
 | D-20 | The first fix for D-18 rendered `udp sport 68 dport 67`, which nftables refuses ("No symbol type information"), so every `connect` failed and every adversarial case was silently observing an **open** machine. Caught because the connect result was ignored by the harness. | `ghostnector-policy` (render) and the harness | second port match is qualified (`udp sport 68 udp dport 67`); the renderer folds the protocol only for a single port match | `a_second_port_match_in_a_rule_is_qualified_by_its_protocol`; `connect_or_fail_setup` now refuses to run a case on top of a failed connect |
 | D-21 | The independent capture was started before the interface it watches existed, so tcpdump exited immediately and every failure diagnosis printed "(no capture)". Detection was unaffected (counters and the sampling oracle were working), but the evidence that classifies a finding was missing exactly when it was needed. | `scripts/lib/gh-harness.sh` | the capture starts after the veth is up, and a capture that exits immediately says so | the failure dump in `scripts/adversarial.sh` now prints the capture, the timeline, the state and both component logs |
+| D-22 | **The chokepoint port and the resolver line disagreed on a default install.** `netd` defaulted the chokepoint to `9054` and core started the relay there, but the resolver configuration can only name an address (`nameserver 127.0.0.1`), which means port 53; loopback destinations return before the DNS redirect, so the machine's own resolver was pointed at a closed port. Foreign queries were still redirected, so this was breakage rather than a leak — and the integration harness masked it by passing `--chokepoint-port 53`. Found in the M8.0 review, fixed before APP scope depended on the DNS path. | `ghostnector-spec` (`Ports`), `ghostnector-netd` (config), the goldens, the integration scripts | one canonical port defined once in the shared vocabulary (`DEFAULT_CHOKEPOINT_PORT = 53`), used by the helper defaults, the redirect rules, the resolver line and the tests; `core-cli-test.sh` now queries the address the resolver was actually given, on the port a `nameserver` line implies | `the_chokepoint_port_is_the_one_a_nameserver_line_implies` (spec); the updated defaults and port-collision tests (netd); the updated relay-address engine tests; the regenerated goldens; and the core+cli run's "the resolver's own address and implied port answered through the relay (D-22)" |
 
 D-02 is the one to keep in mind while reading this plan: a leak test that cannot tell "the policy
 failed" from "the link was noisy" trains its reader to ignore failures.

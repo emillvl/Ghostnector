@@ -663,7 +663,7 @@ mod tests {
             tor_uid: Some(987),
             dnscrypt_uid: Some(988),
             trans_port: 9040,
-            chokepoint_port: 9054,
+            chokepoint_port: 53,
             socks_port: 9050,
             dhcp_client_port: 68,
         }

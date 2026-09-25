@@ -723,9 +723,11 @@ gh_start_stack() {
     # see what the previous run left behind, which is the whole point of several cases.
     [ -f "$H_JOURNAL" ] || printf '{"version":1,"protected":false,"generation":0}' >"$H_JOURNAL"
 
+    # No port overrides: this runs the packaged defaults, including the chokepoint port that a
+    # `nameserver` line implies (D-22).
     ip netns exec "$H_MUT" "$H_BIN/ghostnector-netd" \
         --socket "$H_RUNDIR/netd.sock" --peer-uid "$(id -u ghostnector-core)" \
-        --chokepoint-port 53 --fallback-path "$H_STATE/fail-closed.nft" \
+        --fallback-path "$H_STATE/fail-closed.nft" \
         --tor-user "$H_TOR_USER" >"$H_LOG/netd.log" 2>&1 &
     H_NETD_PID=$!
     gh_wait_socket "$H_RUNDIR/netd.sock" || { cat "$H_LOG/netd.log"; return 1; }

@@ -28,8 +28,8 @@ table inet ghostnector {
         meta skuid 987 counter return comment "Tor's own egress must not be captured"
         ip daddr @lan4 counter return comment "the local network is opted in"
         ip6 daddr @lan6 counter return comment "the local network is opted in"
-        udp dport 53 counter redirect to :9054 comment "DNS goes to the chokepoint"
-        tcp dport 53 counter redirect to :9054 comment "DNS goes to the chokepoint"
+        udp dport 53 counter redirect to :53 comment "DNS goes to the chokepoint"
+        tcp dport 53 counter redirect to :53 comment "DNS goes to the chokepoint"
         meta l4proto tcp counter redirect to :9040 comment "transparent Tor for TCP"
     }
     chain out_filter {
@@ -54,7 +54,7 @@ table inet ghostnector {
         type filter hook input priority 0; policy accept;
         iifname "lo" counter accept comment "loopback delivery of redirected traffic"
         tcp dport 9040 counter drop comment "the transparent proxies are not for the network"
-        tcp dport 9054 counter drop comment "the transparent proxies are not for the network"
+        tcp dport 53 counter drop comment "the transparent proxies are not for the network"
         tcp dport 9050 counter drop comment "the transparent proxies are not for the network"
     }
 }

@@ -231,7 +231,7 @@ mod tests {
             tor_uid: Some(987),
             dnscrypt_uid: Some(988),
             trans_port: 9040,
-            chokepoint_port: 9054,
+            chokepoint_port: 53,
             socks_port: 9050,
             dhcp_client_port: 68,
         }
@@ -299,7 +299,7 @@ mod tests {
         let policy = compile(ProfileId::TorSystem, &Params::default(), &env()).unwrap();
         let rendered = render_replace_script(&policy.ruleset);
         let dns = rendered
-            .find("udp dport 53 counter redirect to :9054")
+            .find("udp dport 53 counter redirect to :53")
             .expect("the DNS redirect must be rendered");
         let catch_all = rendered
             .find("redirect to :9040")
@@ -308,10 +308,14 @@ mod tests {
     }
 
     #[test]
-    fn redirects_never_target_a_privileged_port_and_are_loopback_ports() {
-        // The rendered redirects are the ports the compiler declared; nothing else can appear.
+    fn redirects_target_the_configured_ports_and_nothing_else() {
+        // The rendered redirects are exactly the ports the compiler declared (the transparent proxy
+        // and the chokepoint); nothing else can appear. The chokepoint port is 53 by construction,
+        // because that is the port an address-only `nameserver` line implies (D-22), so this test
+        // deliberately does not require an unprivileged port.
+        let environment = env();
         for (name, profile, params) in cases() {
-            let policy = compile(profile, &params, &env()).unwrap();
+            let policy = compile(profile, &params, &environment).unwrap();
             for line in render_replace_script(&policy.ruleset).lines() {
                 if let Some(rest) = line.split("redirect to :").nth(1) {
                     let port: u16 = rest
@@ -320,8 +324,8 @@ mod tests {
                         .and_then(|value| value.parse().ok())
                         .unwrap_or_else(|| panic!("{name} has an unparseable redirect: {line}"));
                     assert!(
-                        port == 9040 || port == 9054,
-                        "{name} redirected to {port}, which is not a Ghostnector port"
+                        port == environment.trans_port || port == environment.chokepoint_port,
+                        "{name} redirected to {port}, which is not one of the configured ports"
                     );
                 }
             }

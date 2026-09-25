@@ -81,6 +81,16 @@ pub struct ResolvedIdentity {
     pub uid: Option<u32>,
 }
 
+/// The port the DNS chokepoint listens on, and therefore the port the machine's resolver is pointed
+/// at.
+///
+/// This is the one port that cannot be chosen freely. A `nameserver` line and `resolvectl dns` both
+/// take an address without a port, so `nameserver 127.0.0.1` means port 53; the chokepoint must
+/// listen there or the machine's own lookup path is pointed at a closed port (defect D-22). That is
+/// why the control plane's unit grants its child relay `CAP_NET_BIND_SERVICE`. The redirect rules
+/// use the same constant, so the firewall and the resolver cannot disagree.
+pub const DEFAULT_CHOKEPOINT_PORT: u16 = 53;
+
 /// The ports the policy redirects into.
 ///
 /// Reported by the helper so that the control plane can configure the services it supervises with
@@ -100,7 +110,7 @@ impl Default for Ports {
     fn default() -> Self {
         Self {
             trans: 9040,
-            chokepoint: 9054,
+            chokepoint: DEFAULT_CHOKEPOINT_PORT,
             socks: 9050,
         }
     }
@@ -181,6 +191,16 @@ mod tests {
             serde_json::to_string(&params).unwrap(),
             r#"{"user_uid":1000,"netns_id":null,"allow_lan":true}"#
         );
+    }
+
+    #[test]
+    fn the_chokepoint_port_is_the_one_a_nameserver_line_implies() {
+        // Regression for D-22: the resolver configuration cannot express a port, so the port the
+        // relay listens on must be the port an address-only `nameserver` line means. Changing this
+        // without changing how the resolver is pointed at the chokepoint breaks every lookup on a
+        // default install while the policy keeps claiming to carry DNS.
+        assert_eq!(DEFAULT_CHOKEPOINT_PORT, 53);
+        assert_eq!(Ports::default().chokepoint, DEFAULT_CHOKEPOINT_PORT);
     }
 
     #[test]

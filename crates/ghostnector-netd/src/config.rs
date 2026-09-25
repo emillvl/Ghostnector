@@ -32,7 +32,11 @@ pub const DEFAULT_DNSCRYPT_USER: &str = "dnscrypt-proxy";
 pub const DEFAULT_TRANS_PORT: u16 = 9040;
 
 /// Default port the DNS chokepoint listens on.
-pub const DEFAULT_CHOKEPOINT_PORT: u16 = 9054;
+///
+/// The single source of truth lives in the shared vocabulary: the resolver configuration can only
+/// name an address, so a `nameserver` line means port 53, and the relay must listen exactly there
+/// (D-22). This is an alias, not a second copy.
+pub const DEFAULT_CHOKEPOINT_PORT: u16 = ghostnector_spec::backend::DEFAULT_CHOKEPOINT_PORT;
 
 /// Default port Tor's SOCKS proxy listens on.
 pub const DEFAULT_SOCKS_PORT: u16 = 9050;
@@ -125,7 +129,8 @@ OPTIONS:
     --dnscrypt-user <NAME> system user the resolver runs as
                                                       [default: dnscrypt-proxy]
     --trans-port <PORT>    Tor transparent proxy port  [default: 9040]
-    --chokepoint-port <PORT>  DNS chokepoint port      [default: 9054]
+    --chokepoint-port <PORT>  DNS chokepoint port      [default: 53]
+                              (must be the port a nameserver line implies)
     --socks-port <PORT>    Tor SOCKS port              [default: 9050]
     --dhcp-client-port <PORT> DHCP client source port  [default: 68]
     -h, --help             print this text
@@ -335,7 +340,7 @@ mod tests {
         assert_eq!(config.nft, PathBuf::from("/usr/sbin/nft"));
         assert_eq!(config.tor_user, "debian-tor");
         assert_eq!(config.trans_port, 9040);
-        assert_eq!(config.chokepoint_port, 9054);
+        assert_eq!(config.chokepoint_port, 53);
         assert_eq!(config.socks_port, 9050);
         assert_eq!(config.dhcp_client_port, 68);
     }
@@ -474,7 +479,7 @@ mod tests {
             "--peer-uid",
             "1",
             "--trans-port",
-            "9054",
+            "53",
         ]))
         .unwrap_err();
         assert!(
