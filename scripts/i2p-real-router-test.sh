@@ -4,19 +4,21 @@
 #
 #   scripts/i2p-real-router-test.sh <target/debug directory>
 #
-# This is not part of the hermetic gate: it needs the real `i2pd` package. It proves what the fake
-# router cannot:
+# This is not part of the hermetic gate: it needs the real `i2pd` package and, for the canary, the
+# public I2P network. It proves what the fake router cannot:
 #
 #   * the real router starts, as the real `i2pd` uid, under the configuration the product's own
-#     renderer produces;
+#     renderer produces, bootstraps to the public network, and stays stable;
+#   * the real HTTP proxy carries the canary, and only that evidence may produce `Protected`;
 #   * the policy resolves that real uid and exempts exactly it, with every other identity denied at
-#     the far-side boundary;
-#   * the real HTTP proxy answers, and — when the environment lets the router live long enough — the
-#     canary is fetched through it.
+#     the far-side boundary (TCP, UDP, and DNS);
+#   * the proxy is not exposed off-host;
+#   * router death and policy tampering fail closed;
+#   * Tor → I2P → Tor transitions never leave both exemptions in force, sampled from the kernel's own
+#     table rather than from interface byte counters.
 #
-# The environment matters and is recorded: in this WSL instance i2pd 2.49.0 aborts after a minute or
-# two under load, so the canary result is classified honestly (held or inconclusive) and never
-# counted as a pass when it did not happen.
+# In WSL this run stops at the bootstrap gate and is recorded as environment-inconclusive; the WSL
+# record is preserved in the docs. On native Ubuntu it is expected to complete.
 #
 # Classifications: ok / FAIL / inconclusive.
 
@@ -29,25 +31,34 @@ BINDIR="/tmp/gh-i2p-real-bin"
 WORKDIR="/tmp/gh-i2p-real"
 CORE_USER="ghostnector-core"
 LAUNCH_USER="ghostnector-launch-test"
+TOR_USER="debian-tor"
 FAR_NS="gh-i2p-rfar"
 VETH_ROOT="i2pr0"
 VETH_FAR="i2pr1"
 ROOT_ADDR="10.91.0.1"
 FAR_ADDR="10.91.0.2"
 BOUNDARY_ADDR="203.0.113.10"
-BOUNDARY_PORT="8080"
+TCP_PORT="8080"
+UDP_PORT="8081"
+DNS_PORT="53"
+TOR_CONTROL_PORT="9051"
+STABILITY_SECONDS="${STABILITY_SECONDS:-120}"
+BOOTSTRAP_SECONDS="${BOOTSTRAP_SECONDS:-600}"
+CANARY_SECONDS="${CANARY_SECONDS:-600}"
 NETD_PID=""
 CORE_PID=""
 I2PD_PID=""
+TOR_PID=""
 FAR_PID=""
 SITE_PID=""
+SAMPLER_PID=""
 
 PASSED=0
 FAILED=0
 INCONCLUSIVE=0
 
 cleanup() {
-    for pid in "$SITE_PID" "$I2PD_PID" "$FAR_PID" "$CORE_PID" "$NETD_PID"; do
+    for pid in "$SAMPLER_PID" "$SITE_PID" "$I2PD_PID" "$TOR_PID" "$FAR_PID" "$CORE_PID" "$NETD_PID"; do
         [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
     done
     ip netns del "$FAR_NS" 2>/dev/null || true
@@ -64,7 +75,7 @@ note() { echo "    $*"; }
 
 fail_setup() {
     echo "FAIL(setup): $*" >&2
-    for log in "$WORKDIR/i2pd.log" "$WORKDIR/core.log" "$WORKDIR/netd.log"; do
+    for log in "$WORKDIR/i2pd.log" "$WORKDIR/tor.log" "$WORKDIR/core.log" "$WORKDIR/netd.log"; do
         [ -f "$log" ] && { echo "--- $log (tail) ---"; tail -25 "$log"; }
     done
     exit 2
@@ -72,23 +83,27 @@ fail_setup() {
 
 [ "$(id -u)" = "0" ] || fail_setup "this test needs root"
 command -v i2pd >/dev/null 2>&1 || fail_setup "i2pd is not installed"
+command -v tor >/dev/null 2>&1 || fail_setup "tor is not installed"
 id -u i2pd >/dev/null 2>&1 || fail_setup "the i2pd user does not exist"
+id -u "$TOR_USER" >/dev/null 2>&1 || fail_setup "the tor user ($TOR_USER) does not exist"
 for user in "$CORE_USER" "$LAUNCH_USER"; do
     id -u "$user" >/dev/null 2>&1 || fail_setup "the user $user must exist (the M8 suites create it)"
 done
 I2PD_UID="$(id -u i2pd)"
 I2PD_GID="$(id -g i2pd)"
+TOR_UID="$(id -u "$TOR_USER")"
 CORE_UID="$(id -u "$CORE_USER")"
 CORE_GID="$(id -g "$CORE_USER")"
 LAUNCH_UID="$(id -u "$LAUNCH_USER")"
 LAUNCH_GID="$(id -g "$LAUNCH_USER")"
 
-mkdir -p "$BINDIR" "$WORKDIR" "$RUNDIR" "$WORKDIR/data" "$WORKDIR/root/etc"
+mkdir -p "$BINDIR" "$WORKDIR" "$RUNDIR" "$WORKDIR/data" "$WORKDIR/root/etc" "$WORKDIR/tor-data"
 printf 'nameserver 192.0.2.53\n' >"$WORKDIR/root/etc/resolv.conf"
 for binary in ghostnector-netd ghostnector-core ghostnector ghostnector-dns; do
     install -m 0755 "$TARGET_DIR/$binary" "$BINDIR/$binary"
 done
 chown -R i2pd:i2pd "$WORKDIR/data"
+chown -R "$TOR_USER":"$TOR_USER" "$WORKDIR/tor-data" 2>/dev/null || true
 COOKIE="$WORKDIR/control_auth_cookie"
 head -c 32 /dev/urandom >"$COOKIE"
 chown "$CORE_UID" "$COOKIE"
@@ -133,7 +148,8 @@ keys = canary.dat
 EOF
 chmod 644 "$WORKDIR/tunnels.conf"
 
-echo "── the real router starts as its own uid"
+# ---------------------------------------------------------------- phase A: bootstrap and stability
+echo "── phase A: the real router bootstraps to the public network and stays stable"
 setpriv --reuid="$I2PD_UID" --regid="$I2PD_GID" --clear-groups \
     /usr/bin/i2pd --conf="$WORKDIR/i2pd.conf" --tunconf="$WORKDIR/tunnels.conf" \
     --datadir="$WORKDIR/data" --certsdir=/usr/share/i2pd/certificates --loglevel info \
@@ -153,7 +169,7 @@ except OSError: pass' 2>/dev/null | grep -q up; then PROXY_UP=1; break; fi
     sleep 1
 done
 [ -n "$PROXY_UP" ] && ok "the real HTTP proxy answers on 127.0.0.1:4444" ||
-    inc "the real HTTP proxy did not come up within the budget (the router stalled; see the log)"
+    fail_setup "the real HTTP proxy never came up"
 
 B32=""
 for _ in $(seq 1 60); do
@@ -162,8 +178,36 @@ for _ in $(seq 1 60); do
     sleep 1
 done
 [ -n "$B32" ] && ok "the canary destination exists ($B32.b32.i2p)" ||
-    inc "the canary destination was not created within the budget"
-CANARY_HOST="${B32:+$B32.b32.i2p}"
+    fail_setup "the canary destination was never created"
+CANARY_HOST="$B32.b32.i2p"
+
+# The bootstrap gate: the router must reach the network and hold. Without this the rest of the run
+# would be testing a local process, not a router.
+BOOTSTRAPPED=""
+for _ in $(seq 1 "$BOOTSTRAP_SECONDS"); do
+    if ! kill -0 "$I2PD_PID" 2>/dev/null; then break; fi
+    if grep -qiE 'reseed.*(downloaded|success)|floodfill|inbound tunnel .* created' "$WORKDIR/i2pd.log"; then
+        BOOTSTRAPPED=1
+        break
+    fi
+    sleep 1
+done
+if [ -n "$BOOTSTRAPPED" ]; then
+    ok "the router bootstrapped to the public I2P network"
+else
+    fail_setup "the router never showed bootstrap progress (see the log); the run cannot continue"
+fi
+STABLE=""
+for _ in $(seq 1 "$STABILITY_SECONDS"); do
+    if ! kill -0 "$I2PD_PID" 2>/dev/null; then break; fi
+    sleep 1
+done
+if kill -0 "$I2PD_PID" 2>/dev/null; then
+    ok "the router stayed alive and stable for ${STABILITY_SECONDS}s after bootstrap"
+else
+    fail_setup "the router died during the stability window; the run cannot continue"
+fi
+note "network-integration lines so far: $(grep -icE 'reseed.*(downloaded|success)|floodfill|inbound tunnel .* created' "$WORKDIR/i2pd.log")"
 
 # ---------------------------------------------------------------- the far side
 ip netns add "$FAR_NS"
@@ -179,46 +223,94 @@ ip route add "$BOUNDARY_ADDR/32" via "$FAR_ADDR" dev "$VETH_ROOT"
 ip netns exec "$FAR_NS" nft add table inet ghcount
 ip netns exec "$FAR_NS" nft add chain inet ghcount input \
     '{ type filter hook input priority -10; policy accept; }'
-ip netns exec "$FAR_NS" nft add rule inet ghcount input \
-    ip daddr "$BOUNDARY_ADDR" counter comment '"boundary"'
+for spec in "tcp dport $TCP_PORT" "udp dport $UDP_PORT" "udp dport $DNS_PORT"; do
+    ip netns exec "$FAR_NS" nft add rule inet ghcount input \
+        ip daddr "$BOUNDARY_ADDR" $spec counter comment "\"$spec\""
+done
 : >"$WORKDIR/far-connections.log"
 cat >"$WORKDIR/far.py" <<'PY'
 import socket, sys, threading
+
 log = open(sys.argv[1], "a", buffering=1)
-srv = socket.socket()
-srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-srv.bind(("203.0.113.10", 8080))
-srv.listen(16)
+
+def tcp_server():
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("203.0.113.10", 8080))
+    srv.listen(16)
+    while True:
+        conn, peer = srv.accept()
+        log.write(f"tcp accepted from {peer[0]}\n")
+        threading.Thread(target=lambda c=conn: (c.close(),), daemon=True).start()
+
+def udp_server(port, label):
+    srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("203.0.113.10", port))
+    while True:
+        data, peer = srv.recvfrom(4096)
+        log.write(f"{label} from {peer[0]}\n")
+        if label == "udp":
+            srv.sendto(b"udp-answer", peer)
+
+threading.Thread(target=tcp_server, daemon=True).start()
+threading.Thread(target=udp_server, args=(8081, "udp"), daemon=True).start()
+threading.Thread(target=udp_server, args=(53, "dns"), daemon=True).start()
 while True:
-    conn, peer = srv.accept()
-    log.write(f"accepted from {peer[0]}\n")
-    threading.Thread(target=lambda c=conn: (c.close(),), daemon=True).start()
+    threading.Event().wait(3600)
 PY
 ip netns exec "$FAR_NS" python3 "$WORKDIR/far.py" "$WORKDIR/far-connections.log" \
     >"$WORKDIR/far.log" 2>&1 &
 FAR_PID=$!
 sleep 0.3
 
-boundary_packets() {
+boundary_packets() { # boundary_packets <comment>
     ip netns exec "$FAR_NS" nft -j list chain inet ghcount input | python3 -c '
 import json, sys
+want = sys.argv[1]
 total = 0
 for item in json.load(sys.stdin).get("nftables", []):
     rule = item.get("rule")
-    if rule and rule.get("comment") == "boundary":
+    if rule and rule.get("comment") == want:
         for expr in rule.get("expr", []):
             counter = expr.get("counter")
             if counter: total += counter.get("packets", 0)
-print(total)'
+print(total)' "$1"
 }
 
 # ---------------------------------------------------------------- the stack
 "$BINDIR/ghostnector-netd" --socket "$RUNDIR/netd.sock" --peer-uid "$CORE_UID" \
-    --i2p-user i2pd \
+    --i2p-user i2pd --tor-user "$TOR_USER" \
     --fallback-path "$WORKDIR/fail-closed.nft" >"$WORKDIR/netd.log" 2>&1 &
 NETD_PID=$!
 for _ in $(seq 1 60); do [ -S "$RUNDIR/netd.sock" ] && break; sleep 0.1; done
 [ -S "$RUNDIR/netd.sock" ] || fail_setup "the firewall helper did not start"
+
+# Real Tor, for the transition phase: the product's external-services shape.
+cat >"$WORKDIR/torrc" <<EOF
+ClientOnly 1
+SocksPort 0
+ControlPort 127.0.0.1:$TOR_CONTROL_PORT
+CookieAuthentication 1
+CookieAuthFile $WORKDIR/tor-data/control.cookie
+CookieAuthFileGroupReadable 1
+DataDirectory $WORKDIR/tor-data
+Log notice stdout
+SafeLogging 1
+EOF
+chmod 644 "$WORKDIR/torrc"
+setpriv --reuid="$TOR_UID" --regid="$TOR_UID" --clear-groups \
+    /usr/bin/tor -f "$WORKDIR/torrc" >"$WORKDIR/tor.log" 2>&1 &
+TOR_PID=$!
+# The control cookie must be readable by the control plane, which is not in Tor's group.
+for _ in $(seq 1 60); do
+    [ -f "$WORKDIR/tor-data/control.cookie" ] && break
+    sleep 0.5
+done
+[ -f "$WORKDIR/tor-data/control.cookie" ] ||
+    fail_setup "Tor never wrote its control cookie"
+chown "$CORE_UID" "$WORKDIR/tor-data/control.cookie"
+chmod 600 "$WORKDIR/tor-data/control.cookie"
 
 setpriv --reuid="$CORE_UID" --regid="$CORE_GID" --clear-groups \
     --inh-caps +net_bind_service --ambient-caps +net_bind_service \
@@ -226,11 +318,12 @@ setpriv --reuid="$CORE_UID" --regid="$CORE_GID" --clear-groups \
     --socket "$RUNDIR/core.sock" --helper "$RUNDIR/netd.sock" \
     --journal "$WORKDIR/intent.json" --resolver-state "$WORKDIR/resolver.json" \
     --resolv-conf-root "$WORKDIR/root" \
-    --services external --tor-cookie "$COOKIE" --tor-control-port 9051 \
-    --tor-bootstrap-seconds 2 --dns-helper "$BINDIR/ghostnector-dns" \
+    --services external --tor-cookie "$WORKDIR/tor-control.cookie" \
+    --tor-control-port "$TOR_CONTROL_PORT" --tor-bootstrap-seconds 120 \
+    --dns-helper "$BINDIR/ghostnector-dns" \
     --i2p-ready-seconds 20 \
-    --i2p-canary "${CANARY_HOST:-canary.i2p}" --i2p-canary-path / --i2p-canary-expect i2p-ok \
-    --i2p-clearnet-check "$BOUNDARY_ADDR:$BOUNDARY_PORT" \
+    --i2p-canary "$CANARY_HOST" --i2p-canary-path / --i2p-canary-expect i2p-ok \
+    --i2p-clearnet-check "$BOUNDARY_ADDR:$TCP_PORT" \
     --verify-interval 5 --verify-stale-after 60 --verify-timeout 4 \
     --group "$CORE_USER" >"$WORKDIR/core.log" 2>&1 &
 CORE_PID=$!
@@ -242,9 +335,16 @@ cli() {
         "$BINDIR/ghostnector" --socket "$RUNDIR/core.sock" "$@"
 }
 status() { cli status 2>&1; }
-reach_as() {
+wait_for() {
+    for _ in $(seq 1 "$2"); do
+        if status | grep -q "$1"; then return 0; fi
+        sleep 1
+    done
+    return 1
+}
+reach_as() { # reach_as <uid> <gid> -> connected | blocked
     setpriv --reuid="$1" --regid="$2" --clear-groups \
-        python3 - "$BOUNDARY_ADDR" "$BOUNDARY_PORT" <<'PY'
+        python3 - "$BOUNDARY_ADDR" "$TCP_PORT" <<'PY'
 import socket, sys
 s = socket.socket()
 s.settimeout(4)
@@ -255,94 +355,214 @@ except OSError:
     print("blocked")
 PY
 }
+udp_as() { # udp_as <uid> <gid> <port> -> answered | refused
+    setpriv --reuid="$1" --regid="$2" --clear-groups \
+        python3 - "$BOUNDARY_ADDR" "$3" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(3)
+try:
+    s.sendto(b"probe", (sys.argv[1], int(sys.argv[2])))
+    s.recvfrom(64)
+    print("answered")
+except OSError:
+    print("refused")
+PY
+}
+dns_as() { # dns_as <uid> <gid> -> answered | refused
+    setpriv --reuid="$1" --regid="$2" --clear-groups \
+        python3 - "$BOUNDARY_ADDR" <<'PY'
+import socket, sys
+query = bytes([0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0])
+query += b"\x06canary\x04test\x00\x00\x01\x00\x01"
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(3)
+try:
+    s.sendto(query, (sys.argv[1], 53))
+    s.recvfrom(1024)
+    print("answered")
+except OSError:
+    print("refused")
+PY
+}
+skuid_set() { nft list table inet ghostnector 2>/dev/null | grep -oE 'skuid [0-9]+' | awk '{print $2}' | sort -u | tr '\n' ' '; }
 
-echo "── the product path with the real router"
-CONNECTED=""
+# ---------------------------------------------------------------- phase B: the product path
+echo "── phase B: the product path with the real router"
 if cli connect --network i2p >/dev/null 2>&1; then
-    CONNECTED=1
     ok "connect --network i2p succeeded with the real router"
 else
-    note "connect failed: $(cli connect --network i2p 2>&1)"
+    bad "connect --network i2p failed with the real router: $(cli connect --network i2p 2>&1)"
+fi
+TABLE="$(nft list table inet ghostnector 2>/dev/null)"
+case "$TABLE" in
+*"skuid $I2PD_UID"*) ok "the kernel policy exempts the real i2pd uid ($I2PD_UID)" ;;
+*) bad "the kernel policy does not exempt the real i2pd uid" ;;
+esac
+case "$TABLE" in
+*"out_nat"*) bad "the I2P policy has a NAT chain" ;;
+*) ok "the I2P policy has no NAT chain" ;;
+esac
+case "$(skuid_set)" in
+"$I2PD_UID "*) ok "the only exempted uid is the router's" ;;
+*) bad "unexpected exemptions: $(skuid_set)" ;;
+esac
+
+BEFORE_TCP="$(boundary_packets "tcp dport $TCP_PORT")"
+BEFORE_UDP="$(boundary_packets "udp dport $UDP_PORT")"
+BEFORE_DNS="$(boundary_packets "udp dport $DNS_PORT")"
+[ "$(reach_as "$I2PD_UID" "$I2PD_GID")" = "connected" ] &&
+    ok "the real router's own egress is carried" ||
+    bad "the real router's own egress was blocked"
+TCP_ORDINARY="$(reach_as "$LAUNCH_UID" "$LAUNCH_GID")"
+UDP_ORDINARY="$(udp_as "$LAUNCH_UID" "$LAUNCH_GID" "$UDP_PORT")"
+DNS_ORDINARY="$(dns_as "$LAUNCH_UID" "$LAUNCH_GID")"
+AFTER_TCP="$(boundary_packets "tcp dport $TCP_PORT")"
+AFTER_UDP="$(boundary_packets "udp dport $UDP_PORT")"
+AFTER_DNS="$(boundary_packets "udp dport $DNS_PORT")"
+note "ordinary: tcp=$TCP_ORDINARY udp=$UDP_ORDINARY dns=$DNS_ORDINARY; boundary tcp=$((AFTER_TCP-BEFORE_TCP)) udp=$((AFTER_UDP-BEFORE_UDP)) dns=$((AFTER_DNS-BEFORE_DNS))"
+[ "$TCP_ORDINARY" = "blocked" ] && [ "$((AFTER_TCP-BEFORE_TCP))" = "0" ] &&
+    ok "ordinary clearnet TCP is denied and nothing reached the far side" ||
+    bad "ordinary clearnet TCP was carried"
+[ "$UDP_ORDINARY" = "refused" ] && [ "$((AFTER_UDP-BEFORE_UDP))" = "0" ] &&
+    ok "ordinary UDP is refused and nothing reached the far side" ||
+    bad "ordinary UDP was carried"
+[ "$DNS_ORDINARY" = "refused" ] && [ "$((AFTER_DNS-BEFORE_DNS))" = "0" ] &&
+    ok "clearnet DNS is denied and nothing reached the far side" ||
+    bad "clearnet DNS was carried"
+
+if ip netns exec "$FAR_NS" timeout 3 bash -c "echo > /dev/tcp/$ROOT_ADDR/4444" 2>/dev/null; then
+    bad "the HTTP proxy accepted a connection from the far side"
+else
+    ok "the HTTP proxy is closed to the network (the input guard holds)"
 fi
 
-if [ -n "$CONNECTED" ]; then
-    TABLE="$(nft list table inet ghostnector 2>/dev/null)"
-    case "$TABLE" in
-    *"skuid $I2PD_UID"*) ok "the kernel policy exempts the real i2pd uid ($I2PD_UID)" ;;
-    *) bad "the kernel policy does not exempt the real i2pd uid" ;;
-    esac
-    case "$TABLE" in
-    *"out_nat"*) bad "the I2P policy has a NAT chain" ;;
-    *) ok "the I2P policy has no NAT chain" ;;
-    esac
-
-    BEFORE_PACKETS="$(boundary_packets)"
-    if [ "$(reach_as "$I2PD_UID" "$I2PD_GID")" = "connected" ]; then
-        ok "the real router's own egress is carried"
-    else
-        bad "the real router's own egress was blocked"
-    fi
-    if [ "$(reach_as "$LAUNCH_UID" "$LAUNCH_GID")" = "blocked" ]; then
-        ok "an ordinary identity is denied with the real router active"
-    else
-        bad "an ordinary identity reached the boundary with the real router active"
-    fi
-    AFTER_PACKETS="$(boundary_packets)"
-    [ "$((AFTER_PACKETS - BEFORE_PACKETS))" = "0" ] &&
-        ok "zero packets from the ordinary identity arrived at the boundary" ||
-        bad "packets from the ordinary identity arrived at the boundary"
+echo "── the canary through the real proxy is required for Protected"
+if wait_for "protected — and verified" "$CANARY_SECONDS"; then
+    ok "the real canary through the real proxy turned the state into protected-and-verified"
 else
-    # The router was not usable, so nothing was applied and the machine is open by design (DR-15
-    # allows rollback before protection was established). Asserting denial here would be wrong; the
-    # honest classification is inconclusive.
-    inc "the policy checks could not run: the real router was not usable in time"
+    bad "the state never became verified with the real canary: $(status)"
 fi
 
-# The canary through the real proxy: bounded, and classified honestly.
-CANARY=""
-if [ -n "$B32" ]; then
-    for _ in $(seq 1 12); do
-        if ! kill -0 "$I2PD_PID" 2>/dev/null; then break; fi
-        ANSWER="$(python3 - "$B32" <<'PY'
-import socket, sys
-s = socket.socket()
-s.settimeout(10)
-try:
-    s.connect(("127.0.0.1", 4444))
-except OSError:
-    print("no-proxy"); raise SystemExit
-s.sendall(f"GET http://{sys.argv[1]}.b32.i2p/ HTTP/1.0\r\nHost: {sys.argv[1]}.b32.i2p\r\n\r\n".encode())
-data = b""
-try:
-    while True:
-        chunk = s.recv(4096)
-        if not chunk:
-            break
-        data += chunk
-except OSError:
-    pass
-if b"i2p-ok" in data and b"200" in data.split(b"\r\n", 1)[0]:
-    print("canary-ok")
-else:
-    print("not-yet")
-PY
-)"
-        if [ "$ANSWER" = "canary-ok" ]; then CANARY=1; break; fi
-        sleep 5
-    done
-fi
-if [ -n "$CANARY" ]; then
-    ok "the canary was fetched through the real proxy"
+# ---------------------------------------------------------------- phase C: death and tampering
+echo "── phase C: router death and policy tampering fail closed"
+kill "$I2PD_PID" 2>/dev/null || true
+if wait_for "no traffic can leave" 60; then
+    ok "the router's death was noticed and the machine denied"
 else
-    inc "the canary could not be fetched through the real proxy in this environment"
+    bad "I2P kept claiming protection with its router dead: $(status)"
 fi
-if kill -0 "$I2PD_PID" 2>/dev/null; then
-    note "the real router was still running at the end of the checks"
+case "$(skuid_set)" in
+*"$I2PD_UID"*) bad "the router's exemption survived its death" ;;
+*) ok "the fail-closed baseline replaced the policy" ;;
+esac
+
+# Restart the router and reach Protected again, then tamper.
+setpriv --reuid="$I2PD_UID" --regid="$I2PD_GID" --clear-groups \
+    /usr/bin/i2pd --conf="$WORKDIR/i2pd.conf" --tunconf="$WORKDIR/tunnels.conf" \
+    --datadir="$WORKDIR/data" --certsdir=/usr/share/i2pd/certificates --loglevel info \
+    >>"$WORKDIR/i2pd.log" 2>&1 &
+I2PD_PID=$!
+cli disconnect >/dev/null 2>&1
+cli connect --network i2p >/dev/null 2>&1
+if wait_for "protected — and verified" "$CANARY_SECONDS"; then
+    ok "the restarted router reached protected-and-verified again"
 else
-    note "the real router died during the checks (i2pd 2.49.0 is unstable under this WSL environment; see the log)"
+    bad "the restarted router did not reach a verified state: $(status)"
 fi
-INTEGRATION="$(grep -icE 'reseed.*(downloaded|success)|floodfill|inbound tunnel .* created' "$WORKDIR/i2pd.log" 2>/dev/null || echo 0)"
-note "network-integration lines in the router log: $INTEGRATION"
+nft insert rule inet ghostnector out_filter meta l4proto tcp counter accept \
+    comment '"hand edited during the qualification"' 2>/dev/null
+if wait_for "no traffic can leave" 60; then
+    ok "the injected accept was noticed and the machine denied"
+else
+    bad "an injected accept survived while I2P claimed protection: $(status)"
+fi
+nft list table inet ghostnector 2>/dev/null | grep -q "hand edited" &&
+    bad "the tampered policy survived the alarm" ||
+    ok "the fail-closed baseline replaced the tampered policy"
+
+# ---------------------------------------------------------------- phase D: Tor -> I2P -> Tor
+echo "── phase D: Tor → I2P → Tor, sampling the kernel's exemption set throughout"
+cli disconnect >/dev/null 2>&1
+: >"$WORKDIR/samples.log"
+cat >"$WORKDIR/sampler.sh" <<'SAMPLER'
+#!/bin/bash
+while true; do
+    table="$(nft list table inet ghostnector 2>/dev/null)"
+    uids="$(printf '%s\n' "$table" | grep -oE 'skuid [0-9]+' | awk '{print $2}' | sort -u | tr '\n' ',')"
+    nat="no"
+    printf '%s\n' "$table" | grep -q out_nat && nat="yes"
+    echo "$(date +%s.%N) uids=${uids:-none} nat=$nat" >>"$1"
+    sleep 0.3
+done
+SAMPLER
+chmod +x "$WORKDIR/sampler.sh"
+"$WORKDIR/sampler.sh" "$WORKDIR/samples.log" &
+SAMPLER_PID=$!
+sleep 1
+
+TOR_OK=""
+if cli connect >/dev/null 2>&1; then
+    if wait_for "through Tor" 180; then TOR_OK=1; fi
+fi
+if [ -n "$TOR_OK" ]; then
+    ok "Tor system protection came up (state: $(status | head -1))"
+else
+    bad "Tor system protection did not come up: $(status)"
+fi
+sleep 3
+TOR_STAGE_UIDS="$(skuid_set)"
+case "$TOR_STAGE_UIDS" in
+*"$TOR_UID"*) ok "the Tor uid is exempt under Tor protection" ;;
+*) bad "the Tor uid is not exempt under Tor protection: $TOR_STAGE_UIDS" ;;
+esac
+case "$TOR_STAGE_UIDS" in
+*"$I2PD_UID"*) bad "the I2P uid is exempt under Tor protection" ;;
+*) ok "the I2P uid is not exempt under Tor protection" ;;
+esac
+
+cli connect --network i2p >/dev/null 2>&1
+sleep 3
+I2P_STAGE_UIDS="$(skuid_set)"
+case "$I2P_STAGE_UIDS" in
+*"$I2PD_UID"*) ok "the I2P uid is exempt under I2P protection" ;;
+*) bad "the I2P uid is not exempt under I2P protection: $I2P_STAGE_UIDS" ;;
+esac
+case "$I2P_STAGE_UIDS" in
+*"$TOR_UID"*) bad "the Tor uid is exempt under I2P protection" ;;
+*) ok "the Tor uid is not exempt under I2P protection" ;;
+esac
+
+cli connect >/dev/null 2>&1
+sleep 3
+BACK_UIDS="$(skuid_set)"
+case "$BACK_UIDS" in
+*"$TOR_UID"*) ok "the Tor uid is exempt again after returning to Tor" ;;
+*) bad "the Tor uid is not exempt after returning: $BACK_UIDS" ;;
+esac
+case "$BACK_UIDS" in
+*"$I2PD_UID"*) bad "the I2P uid is exempt after returning to Tor" ;;
+*) ok "the I2P uid is not exempt after returning to Tor" ;;
+esac
+sleep 2
+kill "$SAMPLER_PID" 2>/dev/null || true
+SAMPLER_PID=""
+
+BOTH=0
+NONE_BEFORE_CONNECT=0
+while read -r line; do
+    uids="${line#*uids=}"; uids="${uids%% *}"
+    has_tor=0; has_i2p=0
+    case ",$uids," in *",$TOR_UID,"*) has_tor=1 ;; esac
+    case ",$uids," in *",$I2PD_UID,"*) has_i2p=1 ;; esac
+    [ "$has_tor" = "1" ] && [ "$has_i2p" = "1" ] && BOTH=$((BOTH + 1))
+done <"$WORKDIR/samples.log"
+SAMPLES="$(wc -l <"$WORKDIR/samples.log")"
+note "samples: $SAMPLES; samples with both exemptions: $BOTH"
+[ "$SAMPLES" -gt 10 ] || inc "too few samples to say anything about the transitions"
+[ "$BOTH" = "0" ] && [ "$SAMPLES" -gt 10 ] &&
+    ok "no sample ever showed both exemptions in force" ||
+    { [ "$BOTH" != "0" ] && bad "$BOTH sample(s) showed both exemptions in force"; }
 
 cli disconnect >/dev/null 2>&1
 echo
