@@ -306,8 +306,12 @@ only the router's uid, and the canary fetched through the proxy is what turns th
 
 **Boundary:** this suite uses a fake router, so it proves the product machinery and the policy with
 the router's real uid, not the behaviour of `i2pd` itself. The separate real-`i2pd` qualification run
-(M9.5) is required before the freeze, and the claims state which run proved what (M9 decision 3).
-Public I2P network integration is not claimed by this suite.
+(M9.5, `scripts/i2p-real-router-test.sh`) starts real i2pd 2.49.0 under the product's rendered
+configuration, as its real uid, with its real proxy and a real canary destination — and records what
+it could not complete: in this WSL environment i2pd stalls in reseed or aborts within one to two
+minutes under peer traffic, and without peers it cannot publish a LeaseSet, so the canary through the
+real proxy is **inconclusive** (2 held, 0 contradicted, 4 inconclusive). The strongest real-router
+claim is not demonstrated; the claims state which run proved what (M9 decision 3).
 
 ## Appendix A — defects found so far, and their regression tests
 

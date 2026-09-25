@@ -351,8 +351,8 @@ invariant checker.
 
 | # | Gap | Claim |
 |---|---|---|
-| GI-1 | The hermetic suite uses a fake router: it proves the product machinery and the policy with the router's real uid, not `i2pd`'s own behaviour. The separate real-`i2pd` qualification run (M9.5) is required before the freeze, and the claims state which run proved what (M9 decision 3). | PC-22…PC-26 |
-| GI-2 | Public I2P network integration (reseeding, peers, tunnels) is not claimed by the hermetic suite; the canary is local. | PC-25 |
+| GI-1 | **The real-`i2pd` qualification run (M9.5) is partial.** It demonstrated: the product's rendered configuration is accepted by real i2pd 2.49.0; the real router starts as its real uid; the real HTTP proxy answers; the real canary destination is created; and in an exploratory run with transports enabled the router reseeded, found floodfills and built tunnels. It could **not** complete the canary through the real proxy: in this WSL environment i2pd stalls in reseed or aborts within one to two minutes under peer traffic, and without peers it cannot publish a LeaseSet. The strongest real-router claim (canary → `Protected`) is therefore **not demonstrated**; the hermetic suite remains the evidence for the product machinery. | PC-22…PC-26 |
+| GI-2 | Public I2P network integration (reseeding, peers, tunnels) was observed once in the exploratory run but is not relied on and not claimed; the canary in the hermetic suite is local. | PC-25 |
 | GI-3 | APP+I2P is refused in M9; per-application I2P needs a conduit that does not exist yet. | PC-22 |
 | GI-4 | The `Protected` definition's G9 rule applies: with no canary configured, an I2P profile stays `Degraded` by construction. | definition of `Protected` |
 

@@ -189,4 +189,21 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn the_rendered_config_can_be_exported_for_the_qualification_run() {
+        // Qualification-only. When the environment names a path, this writes the product's *own*
+        // rendered configuration there, so the real-i2pd run uses exactly what the product would
+        // write rather than a hand-made copy. Nothing is written otherwise.
+        let Ok(path) = std::env::var("GHOSTNECTOR_EXPORT_I2PD_CONF") else {
+            return;
+        };
+        let data_directory = std::env::var("GHOSTNECTOR_EXPORT_I2PD_DATA")
+            .unwrap_or_else(|_| "/var/lib/ghostnector-i2pd".to_string());
+        let settings = I2pSettings {
+            data_directory: PathBuf::from(data_directory),
+            ..I2pSettings::default()
+        };
+        std::fs::write(&path, render(&settings)).expect("export the rendered config");
+    }
 }
