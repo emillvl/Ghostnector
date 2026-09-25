@@ -317,6 +317,9 @@ impl SystemNamespaces {
         let environment = ghostnector_policy::Environment {
             tor_uid: None,
             dnscrypt_uid: None,
+            i2p_uid: None,
+            i2p_http_port: ghostnector_spec::backend::I2pPorts::default().http,
+            i2p_socks_port: ghostnector_spec::backend::I2pPorts::default().socks,
             trans_port: request.ports.trans,
             chokepoint_port: request.ports.chokepoint,
             socks_port: request.ports.socks,

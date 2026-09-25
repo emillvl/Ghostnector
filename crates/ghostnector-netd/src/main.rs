@@ -59,7 +59,7 @@ mod inner {
             config.summary()
         );
 
-        let server = Arc::new(Server::new(config, Arc::new(backend), SystemIdentities));
+        let server = Arc::new(Server::new(*config, Arc::new(backend), SystemIdentities));
         server.serve(listener).map_err(|error| error.to_string())
     }
 }

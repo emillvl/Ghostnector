@@ -28,6 +28,9 @@ pub const DEFAULT_TOR_USER: &str = "debian-tor";
 /// Default system user the encrypted-DNS resolver runs as.
 pub const DEFAULT_DNSCRYPT_USER: &str = "dnscrypt-proxy";
 
+/// Default system user the I2P router runs as on Debian and Ubuntu.
+pub const DEFAULT_I2P_USER: &str = "i2pd";
+
 /// Default port Tor's transparent proxy listens on.
 pub const DEFAULT_TRANS_PORT: u16 = 9040;
 
@@ -40,6 +43,12 @@ pub const DEFAULT_CHOKEPOINT_PORT: u16 = ghostnector_spec::backend::DEFAULT_CHOK
 
 /// Default port Tor's SOCKS proxy listens on.
 pub const DEFAULT_SOCKS_PORT: u16 = 9050;
+
+/// Default port I2P's HTTP proxy listens on. The single source of truth is the shared vocabulary.
+pub const DEFAULT_I2P_HTTP_PORT: u16 = ghostnector_spec::backend::DEFAULT_I2P_HTTP_PORT;
+
+/// Default port I2P's SOCKS proxy listens on. The single source of truth is the shared vocabulary.
+pub const DEFAULT_I2P_SOCKS_PORT: u16 = ghostnector_spec::backend::DEFAULT_I2P_SOCKS_PORT;
 
 /// Default source port of the DHCP client.
 pub const DEFAULT_DHCP_CLIENT_PORT: u16 = 68;
@@ -68,12 +77,18 @@ pub struct Config {
     pub tor_user: String,
     /// System user the resolver runs as.
     pub dnscrypt_user: String,
+    /// System user the I2P router runs as.
+    pub i2p_user: String,
     /// Tor's transparent proxy port.
     pub trans_port: u16,
     /// The DNS chokepoint port.
     pub chokepoint_port: u16,
     /// Tor's SOCKS port.
     pub socks_port: u16,
+    /// I2P's HTTP proxy port.
+    pub i2p_http_port: u16,
+    /// I2P's SOCKS proxy port.
+    pub i2p_socks_port: u16,
     /// DHCP client source port.
     pub dhcp_client_port: u16,
     /// The bridge carrying APP links on the host side.
@@ -86,7 +101,7 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Parsed {
     /// Run with this configuration.
-    Run(Config),
+    Run(Box<Config>),
     /// Print usage and exit successfully.
     Help,
     /// Print the version and exit successfully.
@@ -138,10 +153,14 @@ OPTIONS:
     --tor-user <NAME>      system user Tor runs as     [default: debian-tor]
     --dnscrypt-user <NAME> system user the resolver runs as
                                                       [default: dnscrypt-proxy]
+    --i2p-user <NAME>      system user the I2P router runs as
+                                                      [default: i2pd]
     --trans-port <PORT>    Tor transparent proxy port  [default: 9040]
     --chokepoint-port <PORT>  DNS chokepoint port      [default: 53]
                               (must be the port a nameserver line implies)
     --socks-port <PORT>    Tor SOCKS port              [default: 9050]
+    --i2p-http-port <PORT> I2P HTTP proxy port         [default: 4444]
+    --i2p-socks-port <PORT>  I2P SOCKS proxy port      [default: 4447]
     --dhcp-client-port <PORT> DHCP client source port  [default: 68]
     --app-bridge <NAME>    bridge carrying APP links   [default: ghbr0]
     --app-core <ADDR>      host-local APP core address [default: 10.200.0.1]
@@ -160,9 +179,12 @@ OPTIONS:
         let mut fallback_path = PathBuf::from(DEFAULT_FALLBACK);
         let mut tor_user = DEFAULT_TOR_USER.to_string();
         let mut dnscrypt_user = DEFAULT_DNSCRYPT_USER.to_string();
+        let mut i2p_user = DEFAULT_I2P_USER.to_string();
         let mut trans_port = DEFAULT_TRANS_PORT;
         let mut chokepoint_port = DEFAULT_CHOKEPOINT_PORT;
         let mut socks_port = DEFAULT_SOCKS_PORT;
+        let mut i2p_http_port = DEFAULT_I2P_HTTP_PORT;
+        let mut i2p_socks_port = DEFAULT_I2P_SOCKS_PORT;
         let mut dhcp_client_port = DEFAULT_DHCP_CLIENT_PORT;
         let mut app_bridge = DEFAULT_APP_BRIDGE.to_string();
         let mut app_core = DEFAULT_APP_CORE;
@@ -225,9 +247,12 @@ OPTIONS:
                 }
                 "--tor-user" => tor_user = user_name(&option, &value()?)?,
                 "--dnscrypt-user" => dnscrypt_user = user_name(&option, &value()?)?,
+                "--i2p-user" => i2p_user = user_name(&option, &value()?)?,
                 "--trans-port" => trans_port = port(&option, &value()?)?,
                 "--chokepoint-port" => chokepoint_port = port(&option, &value()?)?,
                 "--socks-port" => socks_port = port(&option, &value()?)?,
+                "--i2p-http-port" => i2p_http_port = port(&option, &value()?)?,
+                "--i2p-socks-port" => i2p_socks_port = port(&option, &value()?)?,
                 "--dhcp-client-port" => dhcp_client_port = port(&option, &value()?)?,
                 "--app-bridge" => {
                     let name = value()?;
@@ -262,11 +287,13 @@ OPTIONS:
         let socket = socket.ok_or(ConfigError::Missing("--socket"))?;
         let peer_uid = peer_uid.ok_or(ConfigError::Missing("--peer-uid or --peer-user"))?;
 
-        // Redirect targets must be distinct, or one listener would shadow another.
+        // Redirect targets and proxy ports must be distinct, or one listener would shadow another.
         let mut ports = [
             ("--trans-port", trans_port),
             ("--chokepoint-port", chokepoint_port),
             ("--socks-port", socks_port),
+            ("--i2p-http-port", i2p_http_port),
+            ("--i2p-socks-port", i2p_socks_port),
         ];
         ports.sort_by_key(|(_, port)| *port);
         for pair in ports.windows(2) {
@@ -278,7 +305,7 @@ OPTIONS:
             }
         }
 
-        Ok(Parsed::Run(Config {
+        Ok(Parsed::Run(Box::new(Config {
             socket,
             peer_uid,
             nft,
@@ -286,27 +313,33 @@ OPTIONS:
             fallback_path,
             tor_user,
             dnscrypt_user,
+            i2p_user,
             trans_port,
             chokepoint_port,
             socks_port,
+            i2p_http_port,
+            i2p_socks_port,
             dhcp_client_port,
             app_bridge,
             app_core,
-        }))
+        })))
     }
 
     /// A one-line description for the log, containing no paths a listener could not already see.
     pub fn summary(&self) -> String {
         format!(
-            "socket={} peer_uid={} tor_user={} dnscrypt_user={} ports=trans:{}/dns:{}/socks:{} \
-             app={}/{}",
+            "socket={} peer_uid={} tor_user={} dnscrypt_user={} i2p_user={} \
+             ports=trans:{}/dns:{}/socks:{} i2p:{}/{} app={}/{}",
             self.socket.display(),
             self.peer_uid,
             self.tor_user,
             self.dnscrypt_user,
+            self.i2p_user,
             self.trans_port,
             self.chokepoint_port,
             self.socks_port,
+            self.i2p_http_port,
+            self.i2p_socks_port,
             self.app_bridge,
             self.app_core,
         )
@@ -368,7 +401,7 @@ mod tests {
 
     fn run(list: &[&str]) -> Config {
         match Config::parse(args(list)).expect("should parse") {
-            Parsed::Run(config) => config,
+            Parsed::Run(config) => *config,
             other => panic!("expected Run, got {other:?}"),
         }
     }
@@ -387,6 +420,9 @@ mod tests {
         assert_eq!(config.trans_port, 9040);
         assert_eq!(config.chokepoint_port, 53);
         assert_eq!(config.socks_port, 9050);
+        assert_eq!(config.i2p_user, "i2pd");
+        assert_eq!(config.i2p_http_port, 4444);
+        assert_eq!(config.i2p_socks_port, 4447);
         assert_eq!(config.dhcp_client_port, 68);
         assert_eq!(config.app_bridge, "ghbr0");
         assert_eq!(config.app_core, std::net::Ipv4Addr::new(10, 200, 0, 1));
@@ -407,18 +443,27 @@ mod tests {
             "tor",
             "--dnscrypt-user",
             "dns",
+            "--i2p-user",
+            "i2pd",
             "--trans-port",
             "19040",
             "--chokepoint-port",
             "19054",
             "--socks-port",
             "19050",
+            "--i2p-http-port",
+            "14444",
+            "--i2p-socks-port",
+            "14447",
             "--dhcp-client-port",
             "68",
         ]);
         assert_eq!(config.tor_user, "tor");
         assert_eq!(config.dnscrypt_user, "dns");
+        assert_eq!(config.i2p_user, "i2pd");
         assert_eq!(config.trans_port, 19040);
+        assert_eq!(config.i2p_http_port, 14444);
+        assert_eq!(config.i2p_socks_port, 14447);
     }
 
     #[test]
@@ -532,6 +577,20 @@ mod tests {
         assert!(
             matches!(error, ConfigError::Invalid { .. }),
             "trans-port colliding with the chokepoint port must be refused"
+        );
+
+        let error = Config::parse(args(&[
+            "--socket",
+            "/run/x.sock",
+            "--peer-uid",
+            "1",
+            "--i2p-http-port",
+            "9050",
+        ]))
+        .unwrap_err();
+        assert!(
+            matches!(error, ConfigError::Invalid { .. }),
+            "an I2P proxy port colliding with a Tor port must be refused"
         );
     }
 

@@ -11,7 +11,7 @@
 use std::fmt;
 
 use crate::ir::{Chain, Expr, Mechanism, Proto, RuleOrigin, Ruleset, Verdict};
-use ghostnector_spec::exemption::{Exemption, SUBJECT_DHCP};
+use ghostnector_spec::exemption::{Exemption, SUBJECT_DHCP, SUBJECT_I2P};
 use ghostnector_spec::profile::Scope;
 use serde::{Deserialize, Serialize};
 
@@ -33,11 +33,15 @@ pub const REQUIRED_CHAINS: [&str; 3] = ["out_filter", "out_nat", "fwd_filter"];
 /// and the chokepoint, an input guard, and a default-deny forward chain. The APP shapes are the two
 /// halves of `APP` scope: a host table that only guards the app link and the forward path (it must
 /// **not** acquire an output policy, or APP scope would silently become SYSTEM scope), and the
-/// namespace-local table whose DNAT is the only mechanism that can create a usable path.
+/// namespace-local table whose DNAT is the only mechanism that can create a usable path. The I2P
+/// machine shape is the machine shape without any redirect at all: I2P has no transparent-proxy
+/// equivalent, so a NAT chain in an I2P policy would claim a path that does not exist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyShape {
     /// Machine-wide scope (`SYSTEM`, `USER`, and the DNS-lockdown/fail-closed baselines).
     Machine,
+    /// Machine-wide I2P: one router-uid exemption, no redirects, no DNS chokepoint.
+    I2pMachine,
     /// The host side of `APP` scope.
     AppHost,
     /// The ruleset installed inside one application namespace.
@@ -238,6 +242,9 @@ pub enum ViolationCode {
     /// A filter chain's default verdict is `Return`, `Redirect` or `Dnat`, none of which is a
     /// terminal verdict a base chain can carry.
     InvalidChainPolicy,
+    /// An I2P policy cites an exemption other than the I2P router's own uid and DHCP, so the
+    /// mutually exclusive exemption model has been broken.
+    ForeignExemptionInI2pPolicy,
 }
 
 impl ViolationCode {
@@ -291,6 +298,7 @@ impl ViolationCode {
             ViolationCode::AppNamespaceDnatMissing => "app_namespace_dnat_missing",
             ViolationCode::AppNamespaceDnsAfterCatchall => "app_namespace_dns_after_catchall",
             ViolationCode::InvalidChainPolicy => "invalid_chain_policy",
+            ViolationCode::ForeignExemptionInI2pPolicy => "foreign_exemption_in_i2p_policy",
         }
     }
 }
@@ -313,6 +321,9 @@ pub fn check(ruleset: &Ruleset, ctx: &CheckContext<'_>) -> Result<(), Vec<Invari
 
     let required: &[&str] = match ctx.shape {
         PolicyShape::Machine => &REQUIRED_CHAINS,
+        // I2P has no redirect and therefore no NAT chain, but it keeps the input guard (the router's
+        // proxies are loopback-only) and the forward deny.
+        PolicyShape::I2pMachine => &["out_filter", "in_filter", "fwd_filter"],
         // The host side of APP scope guards the link and the forward path; it has no output policy
         // at all, so it cannot become a machine-wide policy by accident.
         PolicyShape::AppHost => &["in_filter", "fwd_filter"],
@@ -331,6 +342,11 @@ pub fn check(ruleset: &Ruleset, ctx: &CheckContext<'_>) -> Result<(), Vec<Invari
 
     let forbidden: &[(&str, &str)] = match ctx.shape {
         PolicyShape::Machine => &[],
+        PolicyShape::I2pMachine => &[(
+            "out_nat",
+            "I2P has no transparent-proxy equivalent: a redirect would claim a path this profile \
+             does not have, and the only way to I2P is the router's local proxy",
+        )],
         PolicyShape::AppHost => &[
             (
                 "out_filter",
@@ -374,7 +390,7 @@ pub fn check(ruleset: &Ruleset, ctx: &CheckContext<'_>) -> Result<(), Vec<Invari
     }
 
     if let Some(chain) = table.chains.iter().find(|chain| chain.name == "out_filter") {
-        if ctx.shape == PolicyShape::Machine {
+        if matches!(ctx.shape, PolicyShape::Machine | PolicyShape::I2pMachine) {
             check_egress(chain, ctx, &set_names, &mut violations);
         }
     }
@@ -430,6 +446,7 @@ pub fn check(ruleset: &Ruleset, ctx: &CheckContext<'_>) -> Result<(), Vec<Invari
 
     match ctx.shape {
         PolicyShape::Machine => {}
+        PolicyShape::I2pMachine => check_i2p_machine(table, &mut violations),
         PolicyShape::AppHost => check_app_host(table, ctx, &set_names, &mut violations),
         PolicyShape::AppNamespace => check_app_namespace(table, ctx, &set_names, &mut violations),
     }
@@ -638,6 +655,30 @@ fn check_egress(
             "UDP must be rejected rather than silently dropped, so QUIC and real-time clients fall \
              back instead of hanging",
         ));
+    }
+}
+
+/// An I2P policy may exempt only the router's own uid and DHCP.
+///
+/// This is the code-level form of the mutually exclusive exemption model: a ruleset that carries
+/// Tor's uid exemption, an application identity, or anything else is refused before it can be
+/// applied, no matter which compiler produced it.
+fn check_i2p_machine(table: &crate::ir::Table, out: &mut Vec<InvariantViolation>) {
+    for chain in &table.chains {
+        for (index, rule) in chain.rules.iter().enumerate() {
+            if let RuleOrigin::Exemption { subject } = &rule.origin {
+                if subject != SUBJECT_I2P && subject != SUBJECT_DHCP {
+                    out.push(InvariantViolation::in_rule(
+                        chain,
+                        index,
+                        ViolationCode::ForeignExemptionInI2pPolicy,
+                        format!(
+                            "an I2P policy may exempt only the I2P router and DHCP, not '{subject}'"
+                        ),
+                    ));
+                }
+            }
+        }
     }
 }
 
@@ -1441,6 +1482,83 @@ mod tests {
         assert_eq!(violations[0].code, ViolationCode::MissingTable);
     }
 
+    fn i2p_env() -> crate::compile::Environment {
+        let mut env = app_env();
+        env.i2p_uid = Some(989);
+        env
+    }
+
+    fn i2p_context<'a>(exemptions: &'a [Exemption]) -> CheckContext<'a> {
+        CheckContext {
+            shape: PolicyShape::I2pMachine,
+            scope: Scope::System,
+            exemptions,
+            allowed_redirect_ports: &[],
+            require_dns_redirect: false,
+            require_udp_fast_fail: true,
+            require_exemption_before_redirect: false,
+            app_core: None,
+            app_bridge: None,
+            app_core_ports: &[],
+            app_dns_port: None,
+        }
+    }
+
+    #[test]
+    fn an_i2p_policy_is_clean_and_may_not_carry_a_foreign_exemption_or_a_redirect() {
+        let policy = crate::compile::compile(
+            ghostnector_spec::backend::ProfileId::I2pSystem,
+            &ghostnector_spec::backend::Params::default(),
+            &i2p_env(),
+        )
+        .expect("the I2P policy compiles");
+        let exemptions = policy.exemptions.clone();
+        assert_eq!(
+            check(&policy.ruleset, &i2p_context(&exemptions)),
+            Ok(()),
+            "the real I2P policy must satisfy the I2P shape"
+        );
+
+        // The mutually exclusive exemption model: Tor's uid may not appear in an I2P policy.
+        let mut foreign = policy.ruleset.clone();
+        for table in &mut foreign.tables {
+            for chain in &mut table.chains {
+                for rule in &mut chain.rules {
+                    if let RuleOrigin::Exemption { subject } = &mut rule.origin {
+                        if subject == SUBJECT_I2P {
+                            *subject = "system-user:tor".to_string();
+                        }
+                    }
+                }
+            }
+        }
+        let violations = check(&foreign, &i2p_context(&exemptions)).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.code == ViolationCode::ForeignExemptionInI2pPolicy),
+            "{violations:?}"
+        );
+
+        // A NAT chain would claim a transparent path I2P does not have.
+        let mut redirected = policy.ruleset.clone();
+        redirected.tables[0].chains.push(Chain {
+            name: "out_nat".to_string(),
+            kind: ChainKind::Nat,
+            hook: Hook::Output,
+            priority: -100,
+            policy: Verdict::Accept,
+            rules: Vec::new(),
+        });
+        let violations = check(&redirected, &i2p_context(&exemptions)).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.code == ViolationCode::ForbiddenChainPresent),
+            "{violations:?}"
+        );
+    }
+
     #[test]
     fn an_allow_policy_on_the_output_chain_is_caught() {
         let exemptions = tor_baseline();
@@ -1915,6 +2033,9 @@ mod tests {
         crate::compile::Environment {
             tor_uid: Some(TOR_UID),
             dnscrypt_uid: None,
+            i2p_uid: None,
+            i2p_http_port: 4444,
+            i2p_socks_port: 4447,
             trans_port: TRANS_PORT,
             chokepoint_port: DNS_PORT,
             socks_port: 9050,

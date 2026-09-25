@@ -116,6 +116,35 @@ impl Default for Ports {
     }
 }
 
+/// The ports I2P's local proxies listen on.
+///
+/// I2P has no transparent-proxy equivalent, so nothing is redirected into these; they exist so the
+/// policy can guard them and so the router's configuration and the firewall cannot disagree. The
+/// defaults are i2pd's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct I2pPorts {
+    /// The router's HTTP proxy (the common path to `.i2p` destinations).
+    pub http: u16,
+    /// The router's SOCKS proxy.
+    pub socks: u16,
+}
+
+/// Default port I2P's HTTP proxy listens on.
+pub const DEFAULT_I2P_HTTP_PORT: u16 = 4444;
+
+/// Default port I2P's SOCKS proxy listens on.
+pub const DEFAULT_I2P_SOCKS_PORT: u16 = 4447;
+
+impl Default for I2pPorts {
+    fn default() -> Self {
+        Self {
+            http: DEFAULT_I2P_HTTP_PORT,
+            socks: DEFAULT_I2P_SOCKS_PORT,
+        }
+    }
+}
+
 /// What the privileged helper currently has installed.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -201,6 +230,12 @@ mod tests {
         // default install while the policy keeps claiming to carry DNS.
         assert_eq!(DEFAULT_CHOKEPOINT_PORT, 53);
         assert_eq!(Ports::default().chokepoint, DEFAULT_CHOKEPOINT_PORT);
+    }
+
+    #[test]
+    fn the_i2p_proxy_ports_default_to_i2pds_own() {
+        assert_eq!(I2pPorts::default().http, 4444);
+        assert_eq!(I2pPorts::default().socks, 4447);
     }
 
     #[test]

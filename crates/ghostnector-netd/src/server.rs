@@ -404,6 +404,9 @@ impl<B: Backend + 'static, I: Identities + 'static> Server<B, I> {
         Environment {
             tor_uid: self.identities.uid_of(&self.config.tor_user).ok(),
             dnscrypt_uid: self.identities.uid_of(&self.config.dnscrypt_user).ok(),
+            i2p_uid: self.identities.uid_of(&self.config.i2p_user).ok(),
+            i2p_http_port: self.config.i2p_http_port,
+            i2p_socks_port: self.config.i2p_socks_port,
             trans_port: self.config.trans_port,
             chokepoint_port: self.config.chokepoint_port,
             socks_port: self.config.socks_port,
@@ -415,13 +418,17 @@ impl<B: Backend + 'static, I: Identities + 'static> Server<B, I> {
     }
 
     fn resolved_identities(&self) -> Vec<ResolvedIdentity> {
-        [&self.config.tor_user, &self.config.dnscrypt_user]
-            .into_iter()
-            .map(|name| ResolvedIdentity {
-                name: name.clone(),
-                uid: self.identities.uid_of(name).ok(),
-            })
-            .collect()
+        [
+            &self.config.tor_user,
+            &self.config.dnscrypt_user,
+            &self.config.i2p_user,
+        ]
+        .into_iter()
+        .map(|name| ResolvedIdentity {
+            name: name.clone(),
+            uid: self.identities.uid_of(name).ok(),
+        })
+        .collect()
     }
 
     fn problem(&self, code: ErrorCode, message: impl Into<String>) -> ErrorBody {
@@ -547,7 +554,7 @@ mod tests {
         )
         .expect("test config parses")
         {
-            Parsed::Run(config) => config,
+            Parsed::Run(config) => *config,
             other => panic!("expected a runnable config, got {other:?}"),
         }
     }
@@ -828,7 +835,9 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_profiles_are_refused_rather_than_approximated() {
+    fn i2p_without_a_router_identity_is_refused_rather_than_approximated() {
+        // The machine has no i2pd user: the policy cannot name the one identity it must exempt, so
+        // it refuses instead of guessing.
         let (backend, server) = server();
         let request = Verb::ApplyProfile {
             profile: ProfileId::I2pSystem,
@@ -846,8 +855,42 @@ mod tests {
         );
         let body = text(&out);
         assert!(body.contains("invalid_profile"), "{body}");
-        assert!(body.contains("not implemented"), "{body}");
+        assert!(body.contains("i2p"), "{body}");
         assert!(backend.scripts().is_empty());
+    }
+
+    #[test]
+    fn applying_i2p_renders_the_router_only_policy_with_no_redirect() {
+        let backend = Arc::new(MockBackend::new());
+        let server = Server::new(
+            config(),
+            Arc::clone(&backend),
+            FixedIdentities::new(&[("debian-tor", TOR_UID), ("i2pd", 990)]),
+        );
+        let request = Verb::ApplyProfile {
+            profile: ProfileId::I2pSystem,
+            params: Params::default(),
+        };
+        let mut out = Vec::new();
+        exchange(
+            &server,
+            &format!(
+                "{}{}\n",
+                handshake(),
+                serde_json::to_string(&request).expect("encode")
+            ),
+            &mut out,
+        );
+        let body = text(&out);
+        assert!(body.contains("\"result\":\"applied\""), "{body}");
+        let script = backend.scripts().join("\n");
+        // The router's uid is the one exemption; there is no NAT chain and no redirect at all.
+        assert!(script.contains("skuid 990"), "{script}");
+        assert!(!script.contains("out_nat"), "{script}");
+        assert!(!script.contains("redirect to"), "{script}");
+        // The proxies are guarded on input.
+        assert!(script.contains("4444"), "{script}");
+        assert!(script.contains("4447"), "{script}");
     }
 
     #[test]
@@ -940,10 +983,10 @@ mod tests {
     }
 
     #[test]
-    fn the_report_lists_both_configured_identities_even_when_one_is_missing() {
+    fn the_report_lists_every_configured_identity_even_when_one_is_missing() {
         let (_backend, server) = server();
         let report = server.report();
-        assert_eq!(report.resolved.len(), 2);
+        assert_eq!(report.resolved.len(), 3);
         let tor = report
             .resolved
             .iter()
@@ -956,5 +999,11 @@ mod tests {
             .find(|entry| entry.name == "dnscrypt-proxy")
             .expect("the resolver is listed");
         assert_eq!(resolver.uid, None, "not installed, and that is not hidden");
+        let i2p = report
+            .resolved
+            .iter()
+            .find(|entry| entry.name == "i2pd")
+            .expect("the I2P router is listed");
+        assert_eq!(i2p.uid, None, "not installed, and that is not hidden");
     }
 }

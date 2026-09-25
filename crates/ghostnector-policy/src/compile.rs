@@ -14,7 +14,7 @@
 
 use ghostnector_spec::backend::{Params, ProfileId};
 use ghostnector_spec::exemption::{
-    catalogue, Exemption, SUBJECT_DHCP, SUBJECT_DNSCRYPT, SUBJECT_LAN, SUBJECT_TOR,
+    catalogue, Exemption, SUBJECT_DHCP, SUBJECT_DNSCRYPT, SUBJECT_I2P, SUBJECT_LAN, SUBJECT_TOR,
 };
 use ghostnector_spec::profile::Scope;
 use serde::{Deserialize, Serialize};
@@ -83,6 +83,14 @@ pub struct Environment {
     pub tor_uid: Option<u32>,
     /// The uid the encrypted-DNS resolver runs as, if one is installed.
     pub dnscrypt_uid: Option<u32>,
+    /// The uid the I2P router runs as, if it is installed. Its egress must be direct: it speaks to
+    /// peers and reseed servers itself, and routing that through Tor would be both circular and a
+    /// mixed-network operation the design refuses.
+    pub i2p_uid: Option<u32>,
+    /// Port I2P's HTTP proxy listens on (loopback only).
+    pub i2p_http_port: u16,
+    /// Port I2P's SOCKS proxy listens on (loopback only).
+    pub i2p_socks_port: u16,
     /// Port Tor's transparent proxy listens on (loopback only).
     pub trans_port: u16,
     /// Port the DNS chokepoint listens on (loopback only).
@@ -209,7 +217,20 @@ pub fn compile(
             )
         }
         ProfileId::I2pSystem => {
-            return Err(PolicyError::Unsupported(profile));
+            if params.allow_lan {
+                return Err(PolicyError::InvalidParameter(
+                    "allow_lan",
+                    "I2P scope has no local-network exception: every flow that is not the router's \
+                     own is denied",
+                ));
+            }
+            (
+                Scope::System,
+                i2p_chains(env)?,
+                table_sets(false),
+                PolicyShape::I2pMachine,
+                false,
+            )
         }
     };
 
@@ -296,6 +317,10 @@ fn require_tor(env: &Environment) -> Result<u32, PolicyError> {
 fn require_dnscrypt(env: &Environment) -> Result<u32, PolicyError> {
     env.dnscrypt_uid
         .ok_or(PolicyError::MissingIdentity("dnscrypt-proxy"))
+}
+
+fn require_i2p(env: &Environment) -> Result<u32, PolicyError> {
+    env.i2p_uid.ok_or(PolicyError::MissingIdentity("i2p"))
 }
 
 /// A user scope must name a real, non-system identity.
@@ -735,38 +760,35 @@ fn forward_chain() -> Chain {
     }
 }
 
-/// Keep the transparent-proxy listeners off the network.
+/// Keep the local proxies off the network.
 ///
 /// The proxies bind to loopback, so this is a second line of defence: if a future change binds a
 /// listener to a wildcard address, the machine does not become an open proxy for its network.
-fn listener_guard_chain(env: &Environment) -> Chain {
+fn listener_guard_chain(ports: &[u16], why: &str) -> Chain {
     let guard = |port: u16| {
         rule(
             vec![Expr::L4Proto { proto: Proto::Tcp }, Expr::Dport { port }],
             Verdict::Drop,
             mechanism(Mechanism::ListenerGuard),
-            "the transparent proxies are not for the network",
+            why,
         )
     };
+    let mut rules = vec![rule(
+        vec![Expr::Iifname {
+            name: "lo".to_string(),
+        }],
+        Verdict::Accept,
+        RuleOrigin::Loopback,
+        "loopback delivery of redirected traffic",
+    )];
+    rules.extend(ports.iter().copied().map(guard));
     Chain {
         name: "in_filter".to_string(),
         kind: ChainKind::Filter,
         hook: Hook::Input,
         priority: FILTER_PRIORITY,
         policy: Verdict::Accept,
-        rules: vec![
-            rule(
-                vec![Expr::Iifname {
-                    name: "lo".to_string(),
-                }],
-                Verdict::Accept,
-                RuleOrigin::Loopback,
-                "loopback delivery of redirected traffic",
-            ),
-            guard(env.trans_port),
-            guard(env.chokepoint_port),
-            guard(env.socks_port),
-        ],
+        rules,
     }
 }
 
@@ -865,7 +887,10 @@ fn dns_lockdown_chains(env: &Environment, allow_lan: bool) -> Result<Vec<Chain>,
         nat_chain(nat_rules),
         filter_chain(rules),
         forward_chain(),
-        listener_guard_chain(env),
+        listener_guard_chain(
+            &[env.trans_port, env.chokepoint_port, env.socks_port],
+            "the transparent proxies are not for the network",
+        ),
     ])
 }
 
@@ -939,7 +964,42 @@ fn tor_chains(
         nat_chain(nat_rules),
         filter_chain(rules),
         forward_chain(),
-        listener_guard_chain(env),
+        listener_guard_chain(
+            &[env.trans_port, env.chokepoint_port, env.socks_port],
+            "the transparent proxies are not for the network",
+        ),
+    ])
+}
+
+/// I2P for the whole machine: the router's own egress is the only exemption.
+///
+/// There is deliberately no NAT chain: I2P has no transparent-proxy equivalent, so this profile
+/// never redirects anything, and the invariant checker refuses an I2P ruleset that contains a
+/// redirect. Applications reach the router's local proxies over loopback, which the loopback rule
+/// already permits; everything else — including clearnet DNS — is denied. `.i2p` naming is the
+/// router's address book, reached through the proxy.
+fn i2p_chains(env: &Environment) -> Result<Vec<Chain>, PolicyError> {
+    let i2p_uid = require_i2p(env)?;
+    let mut rules = vec![
+        loopback_rule(Verdict::Accept),
+        rule(
+            vec![Expr::Skuid { uid: i2p_uid }],
+            Verdict::Accept,
+            exemption(SUBJECT_I2P),
+            "the I2P router's own egress: peers and reseed servers",
+        ),
+        dhcp_rule(env),
+    ];
+    rules.extend(fast_fail_rules());
+    rules.push(default_deny_rule());
+
+    Ok(vec![
+        filter_chain(rules),
+        forward_chain(),
+        listener_guard_chain(
+            &[env.i2p_http_port, env.i2p_socks_port],
+            "the router's proxies are not for the network",
+        ),
     ])
 }
 
@@ -983,6 +1043,9 @@ mod tests {
         Environment {
             tor_uid: Some(987),
             dnscrypt_uid: Some(988),
+            i2p_uid: Some(989),
+            i2p_http_port: 4444,
+            i2p_socks_port: 4447,
             trans_port: 9040,
             chokepoint_port: 53,
             socks_port: 9050,
@@ -1214,9 +1277,55 @@ mod tests {
     }
 
     #[test]
-    fn profiles_without_an_implementation_are_rejected_rather_than_approximated() {
-        let error = compile(ProfileId::I2pSystem, &Params::default(), &env()).unwrap_err();
-        assert!(matches!(error, PolicyError::Unsupported(_)));
+    fn i2p_compiles_to_a_router_only_policy_with_no_redirect() {
+        let policy = compile(ProfileId::I2pSystem, &Params::default(), &env()).unwrap();
+        assert_eq!(
+            policy.ruleset.chain_names(),
+            vec!["out_filter", "fwd_filter", "in_filter"],
+            "I2P has no transparent equivalent: no NAT chain, but the input guard stays"
+        );
+        assert_eq!(
+            subjects(&policy),
+            vec![SUBJECT_I2P.to_string(), SUBJECT_DHCP.to_string()],
+            "the router's own uid and DHCP are the only exemptions"
+        );
+        let egress = chain(&policy, "out_filter");
+        let accepted: Vec<u32> = egress
+            .rules
+            .iter()
+            .filter_map(|rule| {
+                rule.exprs.iter().find_map(|expr| match expr {
+                    Expr::Skuid { uid } => Some(*uid),
+                    _ => None,
+                })
+            })
+            .collect();
+        assert_eq!(
+            accepted,
+            vec![989],
+            "the router's uid is the one identity allowed out"
+        );
+    }
+
+    #[test]
+    fn i2p_refuses_a_lan_exception_and_a_missing_router() {
+        let with_lan = Params {
+            allow_lan: true,
+            ..Params::default()
+        };
+        let error = compile(ProfileId::I2pSystem, &with_lan, &env()).unwrap_err();
+        assert!(
+            matches!(error, PolicyError::InvalidParameter("allow_lan", _)),
+            "{error}"
+        );
+
+        let mut without_i2p = env();
+        without_i2p.i2p_uid = None;
+        let error = compile(ProfileId::I2pSystem, &Params::default(), &without_i2p).unwrap_err();
+        assert!(
+            matches!(error, PolicyError::MissingIdentity("i2p")),
+            "{error}"
+        );
     }
 
     #[test]

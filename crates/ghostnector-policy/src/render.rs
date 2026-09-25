@@ -235,6 +235,9 @@ mod tests {
         Environment {
             tor_uid: Some(987),
             dnscrypt_uid: Some(988),
+            i2p_uid: Some(989),
+            i2p_http_port: 4444,
+            i2p_socks_port: 4447,
             trans_port: 9040,
             chokepoint_port: 53,
             socks_port: 9050,
@@ -270,6 +273,7 @@ mod tests {
                     ..Params::default()
                 },
             ),
+            ("i2p_system.nft", ProfileId::I2pSystem, Params::default()),
         ]
     }
 

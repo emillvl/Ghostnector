@@ -59,6 +59,9 @@ pub const NEVER_EXEMPT_PREFIXES: [&str; 6] = [
 /// The subject used for Tor's own egress.
 pub const SUBJECT_TOR: &str = "system-user:tor";
 
+/// The subject used for the I2P router's own egress.
+pub const SUBJECT_I2P: &str = "system-user:i2p";
+
 /// The subject used for the resolver's egress in encrypted-DNS mode.
 pub const SUBJECT_DNSCRYPT: &str = "system-user:dnscrypt-proxy";
 
@@ -79,6 +82,33 @@ pub fn tor_baseline() -> Vec<Exemption> {
             subject: SUBJECT_TOR.to_string(),
             reason: "Tor must reach relays, bridges, and directory authorities without going \
                      through itself"
+                .to_string(),
+            required: true,
+        },
+        Exemption {
+            kind: ExemptionKind::Protocol,
+            subject: SUBJECT_DHCP.to_string(),
+            reason: "The link must survive; DHCP reveals nothing the local network does not \
+                     already know"
+                .to_string(),
+            required: true,
+        },
+    ]
+}
+
+/// The exemptions that exist whenever I2P is enabled.
+///
+/// The router's own egress must be direct: it speaks to I2P peers on arbitrary ports and to
+/// reseed servers over clearnet, and routing that through anything else would be circular. Nothing
+/// else belongs here — in particular, no application uid: applications reach I2P only through the
+/// router's local proxies, which the loopback rule already permits.
+pub fn i2p_baseline() -> Vec<Exemption> {
+    vec![
+        Exemption {
+            kind: ExemptionKind::Uid,
+            subject: SUBJECT_I2P.to_string(),
+            reason: "The I2P router must reach peers and reseed servers without going through \
+                     itself"
                 .to_string(),
             required: true,
         },
@@ -139,6 +169,7 @@ pub fn catalogue() -> Vec<Exemption> {
     let mut all: Vec<Exemption> = Vec::new();
     let candidates = tor_baseline()
         .into_iter()
+        .chain(i2p_baseline())
         .chain(dns_lockdown_baseline())
         .chain(std::iter::once(lan_exemption()));
     for exemption in candidates {
@@ -179,6 +210,18 @@ mod tests {
         assert_eq!(
             tor_required,
             vec![SUBJECT_TOR.to_string(), SUBJECT_DHCP.to_string()]
+        );
+
+        // I2P's list is the router's own uid and DHCP, and nothing else: applications reach I2P
+        // only through the router's proxies, which loopback already carries.
+        let i2p_required: Vec<_> = i2p_baseline()
+            .into_iter()
+            .filter(|e| e.required)
+            .map(|e| e.subject)
+            .collect();
+        assert_eq!(
+            i2p_required,
+            vec![SUBJECT_I2P.to_string(), SUBJECT_DHCP.to_string()]
         );
     }
 
