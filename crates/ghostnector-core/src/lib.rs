@@ -17,6 +17,7 @@
 //! * **It reports what it does not know.** Until the verifier exists, a successfully applied policy
 //!   is reported as `Degraded` with verification `Unavailable` — never as `Protected`.
 
+pub mod apphelper;
 pub mod chokepoint;
 pub mod engine;
 pub mod fsutil;
@@ -35,6 +36,7 @@ pub mod verify;
 #[cfg(test)]
 pub mod testing;
 
+pub use apphelper::{AppHelper, AppHelperLink};
 pub use chokepoint::{ChildRelay, ChokepointError, DnsRelay};
 pub use engine::{Engine, EngineConfig, EngineError};
 pub use helper::{Helper, HelperError, HelperLink};

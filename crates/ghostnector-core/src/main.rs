@@ -12,6 +12,7 @@ mod inner {
     use std::time::Duration;
 
     use ghostnector_core::{
+        apphelper::{AppHelper, AppHelperLink},
         bind_socket, Canary, ChildRelay, CommandRunner, DnsRelay, Engine, EngineConfig,
         ExternalServices, Helper, HttpEndpoint, NetworkProbes, Server, Services, SystemCommands,
         SystemdServices, SystemdUnits, TorControl, TorSettings, Verification, VerificationConfig,
@@ -22,6 +23,7 @@ mod inner {
     const DEFAULT_SOCKET: &str = "/run/ghostnector/core.sock";
     const DEFAULT_JOURNAL: &str = "/var/lib/ghostnector/intent.json";
     const DEFAULT_SYSTEMCTL: &str = "/usr/bin/systemctl";
+    const DEFAULT_APP_SOCKET: &str = "/run/ghostnector/appd.sock";
     const DEFAULT_TOR_UNIT: &str = "ghostnector-tor.service";
     const DEFAULT_TORRC: &str = "/run/ghostnector/torrc";
     const DEFAULT_TOR_DATA: &str = "/var/lib/tor";
@@ -84,6 +86,9 @@ OPTIONS:
                                hiding                        [default: /]
     --resolvectl <PATH>     the tool used to configure systemd-resolved
                                                       [default: /usr/bin/resolvectl]
+    --app-socket <PATH>     the namespace helper's socket
+                                            [default: /run/ghostnector/appd.sock]
+    --app-core <ADDR>       the host-local APP core address [default: 10.200.0.1]
 
   Verification (a run that proves the policy is working, not just applied):
     --check-url <URL>       an endpoint that answers 200 to a GET, and reports this
@@ -125,6 +130,8 @@ OPTIONS:
         resolver_port: u16,
         resolver_root: PathBuf,
         resolvectl: PathBuf,
+        app_socket: PathBuf,
+        app_core: Ipv4Addr,
         verification: VerificationConfig,
     }
 
@@ -172,6 +179,8 @@ OPTIONS:
             ChildRelay::new(config.dns_helper.clone()).map_err(|error| error.to_string())?,
         );
         let commands: Arc<dyn CommandRunner> = Arc::new(SystemCommands);
+        let app_helper: Arc<dyn AppHelperLink> =
+            Arc::new(AppHelper::new(config.app_socket.clone()));
         let verification: Arc<dyn Verification> = Arc::new(Verifier::new(NetworkProbes::new(
             config.verification.clone(),
         )));
@@ -183,6 +192,8 @@ OPTIONS:
                 resolver_port: config.resolver_port,
                 resolver_root: config.resolver_root.clone(),
                 resolvectl: config.resolvectl.clone(),
+                app_socket: config.app_socket.clone(),
+                app_core: config.app_core,
                 verification: config.verification.clone(),
             },
             Arc::new(helper),
@@ -190,6 +201,7 @@ OPTIONS:
             relay,
             commands,
             verification,
+            app_helper,
         ));
 
         // Verification runs on its own thread, so a slow check can never hold up the interface, and
@@ -290,6 +302,8 @@ OPTIONS:
         let mut resolver_port = DEFAULT_RESOLVER_PORT;
         let mut resolver_root = PathBuf::from(DEFAULT_RESOLVE_CONF_ROOT);
         let mut resolvectl = PathBuf::from(DEFAULT_RESOLVECTL);
+        let mut app_socket = PathBuf::from(DEFAULT_APP_SOCKET);
+        let mut app_core = ghostnector_spec::app::DEFAULT_APP_CORE_ADDRESS;
         let mut check_url: Option<HttpEndpoint> = None;
         let mut udp_check: Option<SocketAddr> = None;
         let mut canary_name: Option<(String, Ipv4Addr)> = None;
@@ -353,6 +367,12 @@ OPTIONS:
                 "--resolver-state" => resolver_state = absolute(&option, value()?)?,
                 "--resolv-conf-root" => resolver_root = absolute(&option, value()?)?,
                 "--resolvectl" => resolvectl = absolute(&option, value()?)?,
+                "--app-socket" => app_socket = absolute(&option, value()?)?,
+                "--app-core" => {
+                    app_core = value()?
+                        .parse()
+                        .map_err(|_| "value for '--app-core' is not an IPv4 address".to_string())?;
+                }
                 "--check-url" => check_url = Some(http_endpoint(&option, &value()?)?),
                 "--udp-check" => udp_check = Some(address(&option, &value()?)?),
                 "--canary" => canary_name = Some(canary(&option, &value()?)?),
@@ -395,6 +415,8 @@ OPTIONS:
             resolver_port,
             resolver_root,
             resolvectl,
+            app_socket,
+            app_core,
             verification: VerificationConfig {
                 interval: verify_interval,
                 stale_after: verify_stale,

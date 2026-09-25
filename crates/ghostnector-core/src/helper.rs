@@ -135,8 +135,17 @@ impl HelperLink for Helper {
 }
 
 fn send(stream: &mut impl Write, verb: &Verb) -> Result<(), HelperError> {
+    send_typed(stream, verb)
+}
+
+/// Send one newline-delimited JSON value. Shared with the namespace helper's client, so both
+/// sockets use one framing implementation.
+pub(crate) fn send_typed<T: serde::Serialize>(
+    stream: &mut impl Write,
+    value: &T,
+) -> Result<(), HelperError> {
     let mut encoded =
-        serde_json::to_vec(verb).map_err(|error| HelperError::Protocol(error.to_string()))?;
+        serde_json::to_vec(value).map_err(|error| HelperError::Protocol(error.to_string()))?;
     encoded.push(b'\n');
     stream
         .write_all(&encoded)
@@ -147,6 +156,13 @@ fn send(stream: &mut impl Write, verb: &Verb) -> Result<(), HelperError> {
 }
 
 fn read(stream: &mut impl BufRead) -> Result<HelperResponse, HelperError> {
+    read_typed(stream)
+}
+
+/// Read one newline-delimited JSON value.
+pub(crate) fn read_typed<T: serde::de::DeserializeOwned>(
+    stream: &mut impl BufRead,
+) -> Result<T, HelperError> {
     let mut line = String::new();
     let read = stream
         .read_line(&mut line)
@@ -177,7 +193,7 @@ fn answer_kind(answer: &HelperResponse) -> &'static str {
     }
 }
 
-fn verify_endpoint(path: &Path) -> Result<(), HelperError> {
+pub(crate) fn verify_endpoint(path: &Path) -> Result<(), HelperError> {
     let reject = |reason: String| HelperError::Endpoint {
         path: path.to_path_buf(),
         reason,

@@ -35,4 +35,6 @@ pub use ipc::{
     ErrorBody, ErrorCode, Event, Frame, HelperResponse, Request, Response, PROTOCOL_VERSION,
 };
 pub use profile::{Networks, Profile, ProfileError, Scope, ValidProfile, Warning};
-pub use state::{Health, ProtectionState, Reason, ServiceHealth, Snapshot, Verification};
+pub use state::{
+    AppStatus, Health, ProtectionState, Reason, ServiceHealth, Snapshot, Verification,
+};

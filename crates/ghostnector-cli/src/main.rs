@@ -6,13 +6,13 @@
 
 #[cfg(unix)]
 mod inner {
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::process::ExitCode;
 
     use ghostnector_spec::ipc::{ErrorBody, Frame, Request, Response, PROTOCOL_VERSION};
-    use ghostnector_spec::{Networks, Profile, ProtectionState, Scope, Snapshot};
+    use ghostnector_spec::{AppStatus, Networks, Profile, ProtectionState, Scope, Snapshot};
 
     const DEFAULT_SOCKET: &str = "/run/ghostnector/core.sock";
     const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -29,11 +29,16 @@ COMMANDS:
             [--lan]              also allow reaching the local network
     disconnect                   return to the network as it was before
     panic                        deny everything now, leaving services running
+    run [-- <COMMAND>...]        open a protected application session (APP scope);
+                                 with a command, run it there instead of a shell
+    apps                         list the protected applications
+    stop-app <ID>                stop one protected application
     watch                        follow state changes until interrupted
 
 SCOPES:
     system   every process on the machine (default)
     user     only processes belonging to you
+    app      only applications you launch through `ghostnector run`
     dns      encrypted DNS only, no Tor
 
 OPTIONS:
@@ -47,6 +52,9 @@ OPTIONS:
         Connect { scope: Scope, lan: bool },
         Disconnect,
         Panic,
+        Run { command: Option<String> },
+        Apps,
+        StopApp { id: u32 },
         Watch,
     }
 
@@ -112,6 +120,27 @@ OPTIONS:
                 check_accepted(response)?;
                 report(&mut session)
             }
+            Command::Run { command } => {
+                let response = session.send(&Request::AppRun)?;
+                let socket = match response {
+                    Response::AppSession { socket, .. } => socket,
+                    Response::Error(body) => return Err(explain(body)),
+                    other => return Err(unexpected(other)),
+                };
+                run_session(&socket, command)
+            }
+            Command::Apps => match session.send(&Request::AppList)? {
+                Response::AppList { apps } => {
+                    print!("{}", render_apps(&apps));
+                    Ok(())
+                }
+                other => Err(unexpected(other)),
+            },
+            Command::StopApp { id } => {
+                let response = session.send(&Request::AppStop { id })?;
+                check_accepted(response)?;
+                report(&mut session)
+            }
             Command::Watch => session.watch(),
         }
     }
@@ -136,6 +165,82 @@ OPTIONS:
 
     fn explain(body: ErrorBody) -> String {
         format!("{} ({:?})", body.message, body.code)
+    }
+
+    /// Drive a prepared session: optionally run a command in it, then relay standard input and
+    /// output until the session ends.
+    ///
+    /// The command is written to the *user's own shell* inside the namespace, as the user. It never
+    /// crosses a privileged interface: the kernel already decided who may connect to the session.
+    fn run_session(socket: &str, command: Option<String>) -> Result<(), String> {
+        let stream = UnixStream::connect(socket)
+            .map_err(|error| format!("cannot open the protected session at '{socket}': {error}"))?;
+        let mut writer = stream
+            .try_clone()
+            .map_err(|error| format!("cannot use the session: {error}"))?;
+        if let Some(command) = command {
+            writeln!(writer, "exec {command}")
+                .map_err(|error| format!("cannot start the command: {error}"))?;
+            writer
+                .flush()
+                .map_err(|error| format!("cannot start the command: {error}"))?;
+        }
+
+        let input = std::thread::spawn(move || {
+            let mut stdin = std::io::stdin();
+            let mut buffer = [0u8; 4096];
+            loop {
+                match stdin.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        if writer.write_all(&buffer[..count]).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = writer.shutdown(std::net::Shutdown::Write);
+        });
+
+        let mut reader = stream;
+        let mut stdout = std::io::stdout();
+        let mut buffer = [0u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => {
+                    stdout
+                        .write_all(&buffer[..count])
+                        .map_err(|error| format!("cannot write output: {error}"))?;
+                    let _ = stdout.flush();
+                }
+                Err(error) => return Err(format!("the session ended unexpectedly: {error}")),
+            }
+        }
+        let _ = input.join();
+        Ok(())
+    }
+
+    fn render_apps(apps: &[AppStatus]) -> String {
+        if apps.is_empty() {
+            return "no protected applications are running\n".to_string();
+        }
+        let mut out = String::new();
+        out.push_str("protected applications:\n");
+        for app in apps {
+            out.push_str(&format!(
+                "  - {:<3} {}  {}\n",
+                app.id,
+                app.address,
+                if app.present {
+                    "running"
+                } else {
+                    "not present"
+                }
+            ));
+        }
+        out
     }
 
     fn unexpected(response: Response) -> String {
@@ -193,6 +298,9 @@ OPTIONS:
                     exemption.subject, exemption.reason
                 ));
             }
+        }
+        if !snapshot.apps.is_empty() {
+            out.push_str(&render_apps(&snapshot.apps));
         }
         out.push_str(&format!(
             "blocked egress attempts: {}\n",
@@ -350,15 +458,42 @@ OPTIONS:
                 }
                 "disconnect" => command = Some(Command::Disconnect),
                 "panic" => command = Some(Command::Panic),
+                "apps" => command = Some(Command::Apps),
+                "run" => {
+                    // Everything after `run` (or after `--`) is the command to run in the session.
+                    // It never crosses a privileged interface: the CLI writes it to the user's own
+                    // shell over the session socket, as the user.
+                    let mut rest: Vec<String> = arguments.collect();
+                    if rest.first().map(String::as_str) == Some("--") {
+                        rest.remove(0);
+                    }
+                    let joined = rest.join(" ");
+                    command = Some(Command::Run {
+                        command: if joined.trim().is_empty() {
+                            None
+                        } else {
+                            Some(joined)
+                        },
+                    });
+                    break;
+                }
+                "stop-app" => {
+                    let raw = value()?;
+                    let id: u32 = raw
+                        .parse()
+                        .map_err(|_| format!("'{raw}' is not an application id"))?;
+                    command = Some(Command::StopApp { id });
+                }
                 "watch" => command = Some(Command::Watch),
                 "--scope" => {
                     scope = match value()?.as_str() {
                         "system" => Scope::System,
                         "user" => Scope::User,
+                        "app" => Scope::App,
                         "dns" => Scope::Dns,
                         other => {
                             return Err(format!(
-                                "unknown scope '{other}'; expected system, user, or dns"
+                                "unknown scope '{other}'; expected system, user, app, or dns"
                             ))
                         }
                     };
@@ -437,6 +572,46 @@ OPTIONS:
         #[test]
         fn an_unknown_scope_is_refused() {
             assert!(parse(args(&["connect", "--scope", "galaxy"])).is_err());
+        }
+
+        #[test]
+        fn app_scope_is_accepted_and_run_takes_the_command_it_is_given() {
+            match parse(args(&["connect", "--scope", "app"]))
+                .expect("parse")
+                .1
+            {
+                Command::Connect { scope, lan } => {
+                    assert_eq!(scope, Scope::App);
+                    assert!(!lan);
+                }
+                _ => panic!("expected a connect"),
+            }
+            match parse(args(&["run"])).expect("parse").1 {
+                Command::Run { command } => assert!(command.is_none()),
+                _ => panic!("expected a run"),
+            }
+            match parse(args(&["run", "--", "firefox", "--new-window"]))
+                .expect("parse")
+                .1
+            {
+                Command::Run { command } => {
+                    assert_eq!(command.as_deref(), Some("firefox --new-window"))
+                }
+                _ => panic!("expected a run"),
+            }
+            match parse(args(&["run", "firefox"])).expect("parse").1 {
+                Command::Run { command } => assert_eq!(command.as_deref(), Some("firefox")),
+                _ => panic!("expected a run"),
+            }
+            match parse(args(&["apps"])).expect("parse").1 {
+                Command::Apps => {}
+                _ => panic!("expected an apps listing"),
+            }
+            match parse(args(&["stop-app", "3"])).expect("parse").1 {
+                Command::StopApp { id } => assert_eq!(id, 3),
+                _ => panic!("expected a stop"),
+            }
+            assert!(parse(args(&["stop-app", "many"])).is_err());
         }
 
         #[test]

@@ -249,6 +249,20 @@ impl Server {
                 Ok(()) => keep(Response::Accepted),
                 Err(error) => keep(Response::Error(error_body(&error))),
             },
+            Request::AppRun => match self.engine.app_run(peer) {
+                Ok(session) => keep(Response::AppSession {
+                    id: session.id,
+                    socket: session.socket,
+                }),
+                Err(error) => keep(Response::Error(error_body(&error))),
+            },
+            Request::AppList => keep(Response::AppList {
+                apps: self.engine.app_list(),
+            }),
+            Request::AppStop { id } => match self.engine.app_stop(id) {
+                Ok(()) => keep(Response::Accepted),
+                Err(error) => keep(Response::Error(error_body(&error))),
+            },
             Request::Cancel => keep(error(
                 ErrorCode::UnsafeState,
                 "a transition cannot be interrupted once it has started; ask for the state again",
@@ -287,8 +301,8 @@ fn error_body(error: &EngineError) -> ErrorBody {
         EngineError::Helper(_) | EngineError::NotApplied | EngineError::Services(_) => {
             ErrorCode::BackendFailure
         }
-        EngineError::Dns(_) => ErrorCode::BackendFailure,
-        EngineError::Transition(_) => ErrorCode::UnsafeState,
+        EngineError::Dns(_) | EngineError::AppHelper(_) => ErrorCode::BackendFailure,
+        EngineError::Transition(_) | EngineError::UnsafeState(_) => ErrorCode::UnsafeState,
         EngineError::Protocol(_) | EngineError::Journal(_) => ErrorCode::Internal,
     };
     ErrorBody {
@@ -427,6 +441,8 @@ mod tests {
             Arc::new(crate::testing::MockRunner::new()) as Arc<dyn crate::resolver::CommandRunner>,
             Arc::new(crate::testing::MockVerification::new())
                 as Arc<dyn crate::verify::Verification>,
+            Arc::new(crate::testing::MockAppHelper::new())
+                as Arc<dyn crate::apphelper::AppHelperLink>,
         ));
         let server = Arc::new(Server::new(Arc::clone(&engine)));
         Fixture {

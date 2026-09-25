@@ -112,6 +112,21 @@ pub struct Health {
     pub verification: Verification,
 }
 
+/// One protected application group, as the interface may show it.
+///
+/// Deliberately minimal: an id the interface can use as a handle, the address the group was given,
+/// and whether its objects exist right now. No destinations, no traffic, no command lines, no
+/// namespaces, no uids — the interface never needs any of that to display or stop a protected app.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppStatus {
+    /// The helper's handle for this group.
+    pub id: u32,
+    /// The address assigned inside the group's namespace.
+    pub address: std::net::Ipv4Addr,
+    /// Whether the namespace and its link exist right now.
+    pub present: bool,
+}
+
 /// Everything the interface needs, and nothing sensitive (invariant I6 / DR-19).
 ///
 /// Note what is *absent*: destinations, queries, per-connection records, exit addresses, guard
@@ -135,6 +150,8 @@ pub struct Snapshot {
     pub verified_ago_secs: Option<u64>,
     /// Egress attempts denied by policy since the last Connect. A count only.
     pub blocked_egress_attempts: u64,
+    /// The protected application groups, when the scope is `APP`.
+    pub apps: Vec<AppStatus>,
     /// Bumped on every transition so clients can discard stale updates.
     pub generation: u64,
 }
@@ -199,6 +216,11 @@ mod tests {
             },
             verified_ago_secs: Some(12),
             blocked_egress_attempts: 3,
+            apps: vec![AppStatus {
+                id: 1,
+                address: std::net::Ipv4Addr::new(10, 200, 0, 2),
+                present: true,
+            }],
             generation: 7,
         };
         let json = serde_json::to_string(&snapshot).unwrap();

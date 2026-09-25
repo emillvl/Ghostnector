@@ -138,7 +138,7 @@ impl<B: Namespaces + 'static> Server<B> {
                 Ok(report) => AppResponse::Applied { report },
                 Err(body) => AppResponse::Error(body),
             },
-            AppVerb::Create => match self.create(peer_uid) {
+            AppVerb::Create { user_uid } => match self.create(user_uid) {
                 Ok(entry) => AppResponse::Created { entry },
                 Err(body) => AppResponse::Error(body),
             },
@@ -288,6 +288,12 @@ impl<B: Namespaces + 'static> Server<B> {
     }
 
     fn create(&self, owner_uid: u32) -> Result<AppEntry, ErrorBody> {
+        if owner_uid == 0 {
+            return Err(self.problem(
+                ErrorCode::NotAuthorized,
+                "a group belongs to a user; root is not one".to_string(),
+            ));
+        }
         let ports = self.registry.ports().ok_or_else(|| {
             self.problem(
                 ErrorCode::UnsafeState,
@@ -609,7 +615,9 @@ impl<B: Namespaces + 'static> Server<B> {
     }
 
     fn require_owner(&self, record: &AppRecord, peer_uid: u32) -> Result<(), ErrorBody> {
-        if peer_uid == 0 || peer_uid == record.owner_uid {
+        // Root could do all of this itself; the configured control plane is the component that
+        // manages groups on behalf of users; the owner may manage its own.
+        if peer_uid == 0 || peer_uid == self.config.peer_uid || peer_uid == record.owner_uid {
             return Ok(());
         }
         Err(self.problem(
@@ -846,7 +854,7 @@ mod tests {
     fn the_handshake_comes_first_and_a_version_mismatch_closes() {
         let (_backend, server) = server(8);
         let mut out = Vec::new();
-        let requests = "{\"verb\":\"create\"}\n".to_string();
+        let requests = "{\"verb\":\"report_registry\"}\n".to_string();
         let mut reader = std::io::BufReader::new(requests.as_bytes());
         server
             .serve_stream(&mut reader, &mut out, PEER)
@@ -867,7 +875,7 @@ mod tests {
     #[test]
     fn a_group_cannot_be_created_before_the_bridge_is_ensured() {
         let (backend, server) = server(8);
-        match server.handle(AppVerb::Create, PEER) {
+        match server.handle(AppVerb::Create { user_uid: PEER }, PEER) {
             AppResponse::Error(body) => assert_eq!(body.code, ErrorCode::UnsafeState),
             other => panic!("expected a refusal, got {other:?}"),
         }
@@ -903,20 +911,20 @@ mod tests {
     fn ids_and_addresses_are_allocated_internally_and_bounded() {
         let (_backend, server) = server(2);
         applied(server.handle(AppVerb::EnsureBridge { ports: ports() }, PEER));
-        let first = match server.handle(AppVerb::Create, PEER) {
+        let first = match server.handle(AppVerb::Create { user_uid: PEER }, PEER) {
             AppResponse::Created { entry } => entry,
             other => panic!("expected a created group, got {other:?}"),
         };
         assert_eq!(first.id, 1);
         assert_eq!(first.owner_uid, PEER);
         assert_eq!(first.address, std::net::Ipv4Addr::new(10, 200, 0, 2));
-        let second = match server.handle(AppVerb::Create, PEER) {
+        let second = match server.handle(AppVerb::Create { user_uid: PEER }, PEER) {
             AppResponse::Created { entry } => entry,
             other => panic!("expected a created group, got {other:?}"),
         };
         assert_eq!(second.id, 2);
         assert_eq!(second.address, std::net::Ipv4Addr::new(10, 200, 0, 3));
-        match server.handle(AppVerb::Create, PEER) {
+        match server.handle(AppVerb::Create { user_uid: PEER }, PEER) {
             AppResponse::Error(body) => assert_eq!(body.code, ErrorCode::Internal),
             other => panic!("expected the registry to be full, got {other:?}"),
         }
@@ -926,7 +934,7 @@ mod tests {
     fn verification_compares_the_namespace_against_what_was_installed() {
         let (backend, server) = server(8);
         applied(server.handle(AppVerb::EnsureBridge { ports: ports() }, PEER));
-        let entry = match server.handle(AppVerb::Create, PEER) {
+        let entry = match server.handle(AppVerb::Create { user_uid: PEER }, PEER) {
             AppResponse::Created { entry } => entry,
             other => panic!("expected a created group, got {other:?}"),
         };
@@ -968,7 +976,7 @@ mod tests {
         let (backend, server) = server(8);
         applied(server.handle(AppVerb::EnsureBridge { ports: ports() }, PEER));
         backend.fail_next_create("the kernel said no");
-        match server.handle(AppVerb::Create, PEER) {
+        match server.handle(AppVerb::Create { user_uid: PEER }, PEER) {
             AppResponse::Error(body) => assert_eq!(body.code, ErrorCode::BackendFailure),
             other => panic!("expected a failure, got {other:?}"),
         }
@@ -977,10 +985,10 @@ mod tests {
     }
 
     #[test]
-    fn a_non_root_peer_can_only_touch_its_own_groups() {
+    fn a_stranger_cannot_touch_a_group_but_its_owner_and_the_control_plane_can() {
         let (_backend, server) = server(8);
         applied(server.handle(AppVerb::EnsureBridge { ports: ports() }, PEER));
-        let entry = match server.handle(AppVerb::Create, PEER) {
+        let entry = match server.handle(AppVerb::Create { user_uid: PEER }, PEER) {
             AppResponse::Created { entry } => entry,
             other => panic!("expected a created group, got {other:?}"),
         };
@@ -989,7 +997,14 @@ mod tests {
             other => panic!("expected a refusal, got {other:?}"),
         }
         assert_eq!(server.report().entries.len(), 1, "it must still exist");
-        // Root may act on anything; the boot/recovery path needs that.
+
+        // The user a group belongs to may manage it...
+        let other_entry = match server.handle(AppVerb::Create { user_uid: OTHER }, PEER) {
+            AppResponse::Created { entry } => entry,
+            other => panic!("expected a created group, got {other:?}"),
+        };
+        applied(server.handle(AppVerb::Destroy { id: other_entry.id }, OTHER));
+        // ...and root may act on anything; the boot/recovery path needs that.
         applied(server.handle(AppVerb::Destroy { id: entry.id }, 0));
         assert!(server.report().entries.is_empty());
     }
@@ -999,7 +1014,7 @@ mod tests {
         let (backend, server) = server(8);
         applied(server.handle(AppVerb::EnsureBridge { ports: ports() }, PEER));
         for _ in 0..2 {
-            match server.handle(AppVerb::Create, PEER) {
+            match server.handle(AppVerb::Create { user_uid: PEER }, PEER) {
                 AppResponse::Created { .. } => {}
                 other => panic!("expected a created group, got {other:?}"),
             }
@@ -1021,7 +1036,7 @@ mod tests {
     fn inspect_reports_a_missing_object_honestly() {
         let (_backend, server) = server(8);
         applied(server.handle(AppVerb::EnsureBridge { ports: ports() }, PEER));
-        let entry = match server.handle(AppVerb::Create, PEER) {
+        let entry = match server.handle(AppVerb::Create { user_uid: PEER }, PEER) {
             AppResponse::Created { entry } => entry,
             other => panic!("expected a created group, got {other:?}"),
         };
@@ -1055,7 +1070,7 @@ mod tests {
             AppResponse::Error(body) => assert_eq!(body.code, ErrorCode::UnsafeState),
             other => panic!("expected a refusal, got {other:?}"),
         }
-        let entry = match server.handle(AppVerb::Create, PEER) {
+        let entry = match server.handle(AppVerb::Create { user_uid: PEER }, PEER) {
             AppResponse::Created { entry } => entry,
             other => panic!("expected a created group, got {other:?}"),
         };
@@ -1092,7 +1107,7 @@ mod tests {
         };
         let (_backend, server) = server(8);
         applied(server.handle(AppVerb::EnsureBridge { ports: ports() }, PEER));
-        let entry = match server.handle(AppVerb::Create, PEER) {
+        let entry = match server.handle(AppVerb::Create { user_uid: PEER }, PEER) {
             AppResponse::Created { entry } => entry,
             other => panic!("expected a created group, got {other:?}"),
         };
@@ -1126,7 +1141,7 @@ mod tests {
     fn the_report_is_counts_and_ids_only() {
         let (_backend, server) = server(8);
         applied(server.handle(AppVerb::EnsureBridge { ports: ports() }, PEER));
-        match server.handle(AppVerb::Create, PEER) {
+        match server.handle(AppVerb::Create { user_uid: PEER }, PEER) {
             AppResponse::Created { .. } => {}
             other => panic!("expected a created group, got {other:?}"),
         }

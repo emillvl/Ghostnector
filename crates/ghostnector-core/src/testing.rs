@@ -2,15 +2,155 @@
 
 use std::sync::Mutex;
 
+use ghostnector_spec::appd::{AppEntry, AppReport, AppResponse, AppVerb, APP_PROTOCOL_VERSION};
 use ghostnector_spec::backend::{Ports, ProfileId, Report, Verb};
 use ghostnector_spec::exemption::tor_baseline;
 use ghostnector_spec::ipc::{ErrorCode, HelperResponse, PROTOCOL_VERSION};
 use ghostnector_spec::ResolvedIdentity;
 
+use crate::apphelper::AppHelperLink;
 use crate::helper::{HelperError, HelperLink};
 use crate::resolver::{CommandError, CommandRunner};
 use crate::services::{ServiceError, Services};
 use crate::verify::Outcome;
+
+/// A namespace helper that records what it was asked and can fail on demand.
+#[derive(Debug, Default)]
+pub struct MockAppHelper {
+    bridge: Mutex<bool>,
+    entries: Mutex<Vec<AppEntry>>,
+    calls: Mutex<Vec<AppVerb>>,
+    fail_create: Mutex<Option<String>>,
+    fail_launch: Mutex<Option<String>>,
+}
+
+impl MockAppHelper {
+    /// A helper that is present and willing.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Every verb that reached the helper, in order.
+    pub fn calls(&self) -> Vec<AppVerb> {
+        self.calls.lock().expect("mock lock").clone()
+    }
+
+    /// Whether a bridge was ensured.
+    pub fn bridge_ready(&self) -> bool {
+        *self.bridge.lock().expect("mock lock")
+    }
+
+    /// Fail the next create.
+    pub fn fail_create_with(&self, message: &str) {
+        *self.fail_create.lock().expect("mock lock") = Some(message.to_string());
+    }
+
+    /// Fail the next launch.
+    pub fn fail_launch_with(&self, message: &str) {
+        *self.fail_launch.lock().expect("mock lock") = Some(message.to_string());
+    }
+
+    fn report(&self) -> AppReport {
+        AppReport {
+            bridge_present: *self.bridge.lock().expect("mock lock"),
+            entries: self.entries.lock().expect("mock lock").clone(),
+            ..AppReport::default()
+        }
+    }
+
+    fn refused(message: &str) -> HelperError {
+        HelperError::Refused {
+            code: ErrorCode::BackendFailure,
+            message: message.to_string(),
+            sensitive: false,
+        }
+    }
+}
+
+impl AppHelperLink for MockAppHelper {
+    fn invoke(&self, verb: AppVerb) -> Result<AppResponse, HelperError> {
+        self.calls.lock().expect("mock lock").push(verb.clone());
+        match verb {
+            AppVerb::Hello { .. } => Ok(AppResponse::Hello {
+                protocol: APP_PROTOCOL_VERSION,
+                version: "mock".to_string(),
+            }),
+            AppVerb::EnsureBridge { .. } => {
+                *self.bridge.lock().expect("mock lock") = true;
+                Ok(AppResponse::Applied {
+                    report: self.report(),
+                })
+            }
+            AppVerb::Create { user_uid } => {
+                if let Some(message) = self.fail_create.lock().expect("mock lock").take() {
+                    return Err(Self::refused(&message));
+                }
+                let mut entries = self.entries.lock().expect("mock lock");
+                let id = (1..=32)
+                    .find(|id| !entries.iter().any(|entry| entry.id == *id))
+                    .expect("the mock has room");
+                let entry = AppEntry {
+                    id,
+                    owner_uid: user_uid,
+                    address: std::net::Ipv4Addr::new(10, 200, 0, (id + 1) as u8),
+                    created_at: 0,
+                    present: true,
+                };
+                entries.push(entry.clone());
+                Ok(AppResponse::Created { entry })
+            }
+            AppVerb::Destroy { id } => {
+                self.entries
+                    .lock()
+                    .expect("mock lock")
+                    .retain(|entry| entry.id != id);
+                Ok(AppResponse::Applied {
+                    report: self.report(),
+                })
+            }
+            AppVerb::Inspect { id } => Ok(AppResponse::Inspected {
+                entry: self
+                    .entries
+                    .lock()
+                    .expect("mock lock")
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .cloned(),
+                notes: Vec::new(),
+            }),
+            AppVerb::Verify { .. } => Ok(AppResponse::Verified {
+                matches: true,
+                detail: "the mock namespace is unchanged".to_string(),
+            }),
+            AppVerb::Launch { id, user_uid } => {
+                if let Some(message) = self.fail_launch.lock().expect("mock lock").take() {
+                    return Err(Self::refused(&message));
+                }
+                let entry = self
+                    .entries
+                    .lock()
+                    .expect("mock lock")
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .cloned()
+                    .ok_or_else(|| Self::refused("no such group"))?;
+                let _ = user_uid;
+                Ok(AppResponse::Launched {
+                    entry,
+                    socket: format!("/tmp/ghostnector-mock-session-{id}.sock"),
+                })
+            }
+            AppVerb::ReportRegistry => Ok(AppResponse::Report(self.report())),
+            AppVerb::Revert => {
+                *self.bridge.lock().expect("mock lock") = false;
+                self.entries.lock().expect("mock lock").clear();
+                Ok(AppResponse::Applied {
+                    report: self.report(),
+                })
+            }
+        }
+    }
+}
 
 /// A helper that records what it was asked, and can be told to fail in specific ways.
 #[derive(Debug, Default)]

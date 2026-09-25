@@ -19,13 +19,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use ghostnector_spec::appd::{AppResponse, AppVerb};
 use ghostnector_spec::backend::{Params, Ports, ProfileId, Report, Verb};
 use ghostnector_spec::ipc::HelperResponse;
+use ghostnector_spec::state::AppStatus;
 use ghostnector_spec::{
     Event, Health, Profile, ProfileError, ProtectionState, Reason, Scope, ServiceHealth, Snapshot,
     ValidProfile, Verification,
 };
 
+use crate::apphelper::AppHelperLink;
 use crate::chokepoint::DnsRelay;
 use crate::helper::{HelperError, HelperLink};
 use crate::journal::{Intent, Journal, JournalError};
@@ -43,6 +46,9 @@ pub const DEFAULT_JOURNAL: &str = "/var/lib/ghostnector/intent.json";
 /// Where the resolver's original configuration is recorded.
 pub const DEFAULT_RESOLVER_STATE: &str = "/var/lib/ghostnector/resolver.json";
 
+/// Where the namespace helper's socket lives.
+pub const DEFAULT_APP_SOCKET: &str = "/run/ghostnector/appd.sock";
+
 /// What the engine needs to know about its environment.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -58,6 +64,11 @@ pub struct EngineConfig {
     pub resolver_root: PathBuf,
     /// Where `resolvectl` lives.
     pub resolvectl: PathBuf,
+    /// Where the namespace helper's socket lives.
+    pub app_socket: PathBuf,
+    /// The host-local core address APP namespaces DNAT to. Comes from the shared vocabulary, so the
+    /// policy, the helper, and this configuration cannot disagree.
+    pub app_core: std::net::Ipv4Addr,
     /// How, and whether, to verify that the policy is working.
     pub verification: VerificationConfig,
 }
@@ -71,6 +82,8 @@ impl Default for EngineConfig {
             resolver_port: 5353,
             resolver_root: PathBuf::from("/"),
             resolvectl: PathBuf::from("/usr/bin/resolvectl"),
+            app_socket: PathBuf::from(DEFAULT_APP_SOCKET),
+            app_core: ghostnector_spec::app::DEFAULT_APP_CORE_ADDRESS,
             verification: VerificationConfig::default(),
         }
     }
@@ -85,9 +98,15 @@ pub enum EngineError {
     /// The profile is valid in principle but not implemented in this milestone.
     #[error("cannot do that yet: {0}")]
     NotSupported(String),
+    /// The request is not safe in the current state.
+    #[error("cannot do that now: {0}")]
+    UnsafeState(String),
     /// The helper could not be reached or refused.
     #[error("{0}")]
     Helper(#[from] HelperError),
+    /// The namespace helper could not be reached or refused.
+    #[error("the namespace helper: {0}")]
+    AppHelper(String),
     /// The helper said it applied the policy, but the policy is not present.
     #[error("the helper reported success, but no policy is present")]
     NotApplied,
@@ -108,10 +127,21 @@ pub enum EngineError {
     Dns(#[from] crate::chokepoint::ChokepointError),
 }
 
+/// A prepared protected session: everything the interface needs to run an application, and nothing
+/// about how it is implemented.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppSession {
+    /// The handle for the group the session runs in.
+    pub id: u32,
+    /// The socket the requesting user connects to in order to drive the session.
+    pub socket: String,
+}
+
 /// The control plane.
 pub struct Engine {
     machine: Mutex<Machine>,
     helper: Arc<dyn HelperLink>,
+    app_helper: Arc<dyn AppHelperLink>,
     services: Arc<dyn Services>,
     relay: Arc<dyn DnsRelay>,
     resolver: Resolver,
@@ -125,6 +155,7 @@ pub struct Engine {
     subscribers: Mutex<Vec<Sender<Event>>>,
     verification: Arc<dyn VerificationRuns>,
     last_verification: Mutex<VerificationState>,
+    apps: Mutex<Vec<AppStatus>>,
     verify_soon: AtomicBool,
 }
 
@@ -137,8 +168,9 @@ struct VerificationState {
 }
 
 impl Engine {
-    /// Build an engine around the pieces it does not own: the helper, the service supervisor, the DNS
-    /// relay, a command runner for the resolver tools, and the verifier.
+    /// Build an engine around the pieces it does not own: the firewall helper, the namespace
+    /// helper, the service supervisor, the DNS relay, a command runner for the resolver tools, and
+    /// the verifier.
     pub fn new(
         config: EngineConfig,
         helper: Arc<dyn HelperLink>,
@@ -146,6 +178,7 @@ impl Engine {
         relay: Arc<dyn DnsRelay>,
         commands: Arc<dyn CommandRunner>,
         verification: Arc<dyn VerificationRuns>,
+        app_helper: Arc<dyn AppHelperLink>,
     ) -> Self {
         let journal = Journal::new(config.journal_path.clone());
         let resolver = Resolver::new(
@@ -159,6 +192,7 @@ impl Engine {
         Self {
             machine: Mutex::new(Machine::new()),
             helper,
+            app_helper,
             services,
             relay,
             resolver,
@@ -172,6 +206,7 @@ impl Engine {
             subscribers: Mutex::new(Vec::new()),
             verification,
             last_verification: Mutex::new(VerificationState::default()),
+            apps: Mutex::new(Vec::new()),
             verify_soon: AtomicBool::new(false),
         }
     }
@@ -216,6 +251,7 @@ impl Engine {
             },
             verified_ago_secs: checked.checked_at.map(|at| (now_unix() - at).max(0) as u64),
             blocked_egress_attempts: 0,
+            apps: self.lock_apps().clone(),
             generation: machine.generation(),
         }
     }
@@ -312,6 +348,9 @@ impl Engine {
                 ));
             }
         }
+        if profile == Some(ProfileId::TorApp) {
+            self.remove_app_namespaces();
+        }
 
         let report = report_from(self.helper.invoke(Verb::Revert)?)?;
         self.remember_report(report);
@@ -328,6 +367,7 @@ impl Engine {
 
     /// Deny everything, immediately, regardless of what was applied before.
     pub fn panic(&self) -> Result<(), EngineError> {
+        self.remove_app_namespaces();
         let report = self.apply(ProfileId::FailClosed, &Params::default())?;
         self.remember_report(report);
         *self.lock_requested() = None;
@@ -344,6 +384,134 @@ impl Engine {
         ))?;
         self.publish();
         Ok(())
+    }
+
+    /// Prepare a protected session for a user.
+    ///
+    /// This is the whole "run a protected application" operation. The interface receives a handle
+    /// and a session socket; it never sees a namespace, a uid, a port, or a policy name, and it
+    /// never has to understand how any of them work.
+    pub fn app_run(&self, requester_uid: u32) -> Result<AppSession, EngineError> {
+        self.require_app_scope()?;
+        let created = self
+            .app_invoke(AppVerb::Create {
+                user_uid: requester_uid,
+            })
+            .map_err(|error| EngineError::AppHelper(error.to_string()))?;
+        let entry = match created {
+            AppResponse::Created { entry } => entry,
+            other => {
+                return Err(EngineError::Protocol(format!(
+                    "the namespace helper answered a create with {other:?}"
+                )))
+            }
+        };
+
+        match self.app_invoke(AppVerb::Launch {
+            id: entry.id,
+            user_uid: requester_uid,
+        }) {
+            Ok(AppResponse::Launched { socket, .. }) => {
+                self.refresh_apps();
+                self.publish();
+                Ok(AppSession {
+                    id: entry.id,
+                    socket,
+                })
+            }
+            Ok(other) => {
+                let _ = self.app_invoke(AppVerb::Destroy { id: entry.id });
+                Err(EngineError::Protocol(format!(
+                    "the namespace helper answered a launch with {other:?}"
+                )))
+            }
+            Err(error) => {
+                // A group whose session could not be prepared is removed again: no half-created
+                // protection is left for the interface to explain.
+                let _ = self.app_invoke(AppVerb::Destroy { id: entry.id });
+                Err(EngineError::AppHelper(error.to_string()))
+            }
+        }
+    }
+
+    /// The protected application groups, as the interface may show them.
+    pub fn app_list(&self) -> Vec<AppStatus> {
+        self.refresh_apps();
+        self.lock_apps().clone()
+    }
+
+    /// Stop one protected application group.
+    pub fn app_stop(&self, id: u32) -> Result<(), EngineError> {
+        self.require_app_scope()?;
+        match self
+            .app_invoke(AppVerb::Destroy { id })
+            .map_err(|error| EngineError::AppHelper(error.to_string()))?
+        {
+            AppResponse::Applied { .. } => {
+                self.refresh_apps();
+                self.publish();
+                Ok(())
+            }
+            other => Err(EngineError::Protocol(format!(
+                "the namespace helper answered a stop with {other:?}"
+            ))),
+        }
+    }
+
+    /// Whether the current state is one in which application operations make sense.
+    fn require_app_scope(&self) -> Result<(), EngineError> {
+        if !self.lock_machine().state().is_protected() {
+            return Err(EngineError::UnsafeState(
+                "protection is not on, so there is nothing to run an application in".to_string(),
+            ));
+        }
+        if self.lock_report().profile != Some(ProfileId::TorApp) {
+            return Err(EngineError::UnsafeState(
+                "the active scope does not protect individual applications".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Ask the namespace helper what groups exist and remember it for the snapshot.
+    fn refresh_apps(&self) {
+        match self.app_invoke(AppVerb::ReportRegistry) {
+            Ok(AppResponse::Report(report)) => {
+                let apps = report
+                    .entries
+                    .into_iter()
+                    .map(|entry| AppStatus {
+                        id: entry.id,
+                        address: entry.address,
+                        present: entry.present,
+                    })
+                    .collect();
+                *self.lock_apps() = apps;
+                self.clear_note_containing("namespace helper");
+            }
+            Ok(other) => self.add_note(format!(
+                "the namespace helper answered a report with {other:?}"
+            )),
+            Err(error) => self.add_note(format!(
+                "the namespace helper could not be asked what it has ({error})"
+            )),
+        }
+    }
+
+    /// Ask the namespace helper to remove every namespace it owns.
+    fn remove_app_namespaces(&self) {
+        if let Err(error) = self.app_invoke(AppVerb::Revert) {
+            self.add_note(format!(
+                "the namespace helper could not remove its namespaces: {error}"
+            ));
+        }
+        self.lock_apps().clear();
+    }
+
+    fn lock_apps(&self) -> MutexGuard<'_, Vec<AppStatus>> {
+        self.apps
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Bring the engine's view in line with reality after a restart.
@@ -375,6 +543,11 @@ impl Engine {
                 ),
                 Some(other) => {
                     *self.lock_requested() = profile_of(other);
+                    if other == ProfileId::TorApp {
+                        // Namespaces do not survive a reboot; whatever the helper still has is the
+                        // truth, and it is listed rather than assumed.
+                        self.refresh_apps();
+                    }
                     (
                         ProtectionState::Degraded,
                         vec![
@@ -452,18 +625,29 @@ impl Engine {
     /// The order is the security property (DR-4): the machine is denied while Tor bootstraps, and
     /// Tor can bootstrap because the baseline exempts its uid. Nothing is opened until the service
     /// says it is ready.
+    ///
+    /// `APP` scope is the exception that proves the rule: it never applies the machine-wide
+    /// baseline, because it does not protect the machine. Its deny-first step is the APP host table
+    /// itself — the bridge exists but admits nothing until a namespace's DNAT creates a flow, and
+    /// no namespace exists yet.
     fn bring_up_then_open(
         &self,
         target: ProfileId,
         params: &Params,
     ) -> Result<Report, EngineError> {
-        if target != ProfileId::FailClosed {
+        if target == ProfileId::TorApp {
+            self.apply(ProfileId::TorApp, params)?;
+        } else if target != ProfileId::FailClosed {
             self.apply(ProfileId::FailClosed, &Params::default())?;
         }
 
         // The ports come from the helper, so Tor is configured with the same numbers the firewall
         // redirects into. Two sources for one port is how DNS silently stops working.
         let ports = self.helper_ports()?;
+        if target == ProfileId::TorApp {
+            // The bridge is created only after the host table exists: deny first, then the path.
+            self.ensure_app_bridge(ports)?;
+        }
         self.services.bring_up(target, ports)?;
 
         let report = self.apply(target, params)?;
@@ -472,6 +656,23 @@ impl Engine {
         // earlier would have been serving queries under the previous rules.
         self.bring_up_dns(target, ports)?;
         Ok(report)
+    }
+
+    /// Ensure the namespace helper's bridge with the ports the firewall redirects into.
+    fn ensure_app_bridge(&self, ports: Ports) -> Result<(), EngineError> {
+        match self
+            .app_invoke(AppVerb::EnsureBridge { ports })
+            .map_err(|error| EngineError::AppHelper(error.to_string()))?
+        {
+            AppResponse::Applied { .. } => Ok(()),
+            other => Err(EngineError::Protocol(format!(
+                "the namespace helper answered a bridge request with {other:?}"
+            ))),
+        }
+    }
+
+    fn app_invoke(&self, verb: AppVerb) -> Result<AppResponse, HelperError> {
+        self.app_helper.invoke(verb)
     }
 
     /// Ask the helper which ports its policy redirects into.
@@ -487,6 +688,13 @@ impl Engine {
     /// every query at port 53 into the chokepoint whatever the file says, so a machine whose
     /// resolver configuration could not be changed is still not leaking.
     fn bring_up_dns(&self, profile: ProfileId, ports: Ports) -> Result<(), EngineError> {
+        if profile == ProfileId::TorApp {
+            // APP scope never touches the machine's resolver: that would be a machine-wide change.
+            // The app-facing chokepoint and Tor's core-address listeners arrive in the next
+            // increment (M8.4b); until then an app session is confined but cannot reach Tor, which
+            // is the fail-closed direction.
+            return Ok(());
+        }
         let listen = SocketAddr::from((Ipv4Addr::LOCALHOST, ports.chokepoint));
         let upstream = self.dns_upstream(profile);
         self.relay.start(listen, upstream)?;
@@ -919,12 +1127,17 @@ fn plan(valid: &ValidProfile, requester_uid: u32) -> Result<(ProfileId, Params),
             params.user_uid = Some(requester_uid);
             ProfileId::TorUser
         }
-        (Scope::Dns, false, false) | (Scope::System, false, false) => ProfileId::DnsLockdown,
-        (Scope::App, _, _) => {
-            return Err(EngineError::NotSupported(
-                "protecting single applications arrives in a later milestone".to_string(),
-            ))
+        (Scope::App, true, false) => {
+            if valid.profile().allow_lan {
+                return Err(EngineError::NotSupported(
+                    "APP scope preserves source identity and does not use SNAT, so local network \
+                     access is unsupported; remove --lan"
+                        .to_string(),
+                ));
+            }
+            ProfileId::TorApp
         }
+        (Scope::Dns, false, false) | (Scope::System, false, false) => ProfileId::DnsLockdown,
         (_, _, true) => {
             return Err(EngineError::NotSupported(
                 "I2P arrives in a later milestone".to_string(),
@@ -967,7 +1180,7 @@ fn profile_of(id: ProfileId) -> Option<Profile> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{MockHelper, MockRelay, MockServices, MockVerification};
+    use crate::testing::{MockAppHelper, MockHelper, MockRelay, MockServices, MockVerification};
     use std::time::Duration;
 
     const USER_UID: u32 = 1000;
@@ -978,6 +1191,24 @@ mod tests {
         relay: Arc<MockRelay>,
         verification: Arc<MockVerification>,
         verification_config: VerificationConfig,
+    ) -> (Engine, PathBuf) {
+        engine_with_app(
+            helper,
+            services,
+            relay,
+            verification,
+            verification_config,
+            Arc::new(MockAppHelper::new()),
+        )
+    }
+
+    fn engine_with_app(
+        helper: Arc<MockHelper>,
+        services: Arc<MockServices>,
+        relay: Arc<MockRelay>,
+        verification: Arc<MockVerification>,
+        verification_config: VerificationConfig,
+        app_helper: Arc<MockAppHelper>,
     ) -> (Engine, PathBuf) {
         let directory = std::env::temp_dir().join(format!(
             "ghostnector-engine-{}-{:?}",
@@ -1006,6 +1237,7 @@ mod tests {
             relay as Arc<dyn DnsRelay>,
             Arc::new(crate::testing::MockRunner::new()) as Arc<dyn CommandRunner>,
             verification as Arc<dyn VerificationRuns>,
+            app_helper as Arc<dyn AppHelperLink>,
         );
         (engine, directory)
     }
@@ -1343,6 +1575,7 @@ mod tests {
             Profile {
                 scope: Scope::App,
                 networks: ghostnector_spec::Networks::tor(),
+                allow_lan: true,
                 ..Profile::default()
             },
             Profile {
@@ -1840,6 +2073,118 @@ mod tests {
             engine.snapshot().state,
             ProtectionState::Off,
             "a passing check cannot conjure protection that was never applied"
+        );
+    }
+
+    // ---------------------------------------------------------------- APP scope
+
+    fn engine_and_apps() -> (Arc<MockAppHelper>, Engine, PathBuf) {
+        let helper = Arc::new(MockHelper::new());
+        let services = Arc::new(MockServices::new());
+        let relay = Arc::new(MockRelay::new());
+        let verification = Arc::new(MockVerification::new());
+        let app_helper = Arc::new(MockAppHelper::new());
+        let (engine, directory) = engine_with_app(
+            helper,
+            services,
+            relay,
+            verification,
+            VerificationConfig::default(),
+            Arc::clone(&app_helper),
+        );
+        (app_helper, engine, directory)
+    }
+
+    fn app_profile() -> Profile {
+        Profile {
+            scope: Scope::App,
+            networks: ghostnector_spec::Networks::tor(),
+            ..Profile::default()
+        }
+    }
+
+    #[test]
+    fn connecting_in_app_scope_ensures_the_bridge_and_claims_nothing_yet() {
+        let (app_helper, engine, _dir) = engine_and_apps();
+        engine.connect(app_profile(), USER_UID).expect("connect");
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.state, ProtectionState::Degraded);
+        assert_eq!(
+            snapshot.profile.map(|profile| profile.scope),
+            Some(Scope::App)
+        );
+        assert!(
+            snapshot
+                .reasons
+                .iter()
+                .any(|reason| reason.as_str().contains("degraded rather than protected")),
+            "{:?}",
+            snapshot.reasons
+        );
+        assert!(app_helper.bridge_ready(), "the bridge must exist");
+        assert!(snapshot.apps.is_empty(), "nothing is protected yet");
+    }
+
+    #[test]
+    fn running_an_application_creates_a_group_and_prepares_a_session() {
+        let (_app_helper, engine, _dir) = engine_and_apps();
+        engine.connect(app_profile(), USER_UID).expect("connect");
+        let session = engine.app_run(USER_UID).expect("run");
+        assert_eq!(session.id, 1);
+        assert!(session.socket.contains("session-1"));
+        let apps = engine.app_list();
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].id, 1);
+        assert!(apps[0].present);
+    }
+
+    #[test]
+    fn an_app_session_needs_protection_and_leaves_no_half_created_group() {
+        let (_app_helper, engine, _dir) = engine_and_apps();
+        assert!(matches!(
+            engine.app_run(USER_UID),
+            Err(EngineError::UnsafeState(_))
+        ));
+
+        let (app_helper, engine, _dir) = engine_and_apps();
+        engine.connect(app_profile(), USER_UID).expect("connect");
+        app_helper.fail_launch_with("the shell is not there");
+        assert!(engine.app_run(USER_UID).is_err());
+        assert!(
+            engine.app_list().is_empty(),
+            "a group whose session failed must not remain"
+        );
+    }
+
+    #[test]
+    fn stopping_an_application_removes_it_from_the_list() {
+        let (_app_helper, engine, _dir) = engine_and_apps();
+        engine.connect(app_profile(), USER_UID).expect("connect");
+        let session = engine.app_run(USER_UID).expect("run");
+        engine.app_stop(session.id).expect("stop");
+        assert!(engine.app_list().is_empty());
+    }
+
+    #[test]
+    fn disconnecting_removes_the_namespaces_and_the_bridge() {
+        let (app_helper, engine, _dir) = engine_and_apps();
+        engine.connect(app_profile(), USER_UID).expect("connect");
+        engine.app_run(USER_UID).expect("run");
+        engine.disconnect().expect("disconnect");
+        assert!(!app_helper.bridge_ready());
+        assert!(engine.snapshot().apps.is_empty());
+    }
+
+    #[test]
+    fn app_scope_never_repoints_the_machines_resolver() {
+        let (_helper, relay, engine, _dir) = engine_and_relay();
+        // `engine_and_relay` builds its own app helper; APP connect must not start the loopback
+        // relay, because the machine's resolver is not part of APP scope.
+        engine.connect(app_profile(), USER_UID).expect("connect");
+        assert!(
+            relay.started().is_empty(),
+            "APP scope must not touch the machine's resolver: {:?}",
+            relay.started()
         );
     }
 }

@@ -38,11 +38,15 @@ pub enum AppVerb {
         /// The ports the host firewall redirects into, as reported by `netd`.
         ports: Ports,
     },
-    /// Create one isolation group.
+    /// Create one isolation group for a user.
     ///
-    /// The owner is the peer's uid, taken from the kernel; the id, the namespace name, the link
-    /// name, and the address are allocated by the helper from its own registry.
-    Create,
+    /// The caller names the user the group belongs to (a bounded integer, not a name). The helper
+    /// records it and, for a session, enforces it against the kernel: only a connection from that
+    /// uid can drive the shell.
+    Create {
+        /// The user the group belongs to.
+        user_uid: u32,
+    },
     /// Destroy one isolation group. Idempotent: an unknown or already-destroyed id is not an error.
     Destroy {
         /// The group's id, as allocated by the helper.
@@ -178,8 +182,8 @@ mod tests {
             r#"{"verb":"hello","protocol":1}"#
         );
         assert_eq!(
-            serde_json::to_string(&AppVerb::Create).unwrap(),
-            r#"{"verb":"create"}"#
+            serde_json::to_string(&AppVerb::Create { user_uid: 1000 }).unwrap(),
+            r#"{"verb":"create","user_uid":1000}"#
         );
         assert_eq!(
             serde_json::to_string(&AppVerb::Destroy { id: 7 }).unwrap(),
@@ -237,7 +241,7 @@ mod tests {
             AppVerb::EnsureBridge {
                 ports: Ports::default(),
             },
-            AppVerb::Create,
+            AppVerb::Create { user_uid: 1000 },
             AppVerb::Destroy { id: 1 },
             AppVerb::Inspect { id: 1 },
             AppVerb::Verify { id: 1 },

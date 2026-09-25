@@ -186,10 +186,10 @@ case "$ANSWER" in
 esac
 
 echo "[3] groups get internal ids, distinct addresses, and real dead-end namespaces"
-FIRST="$(call '{"verb":"create"}')"
+FIRST="$(call "{\"verb\":\"create\",\"user_uid\":$LAUNCH_UID}")"
 ID1="$(field "$FIRST" entry.id)"
 ADDR1="$(field "$FIRST" entry.address)"
-SECOND="$(call '{"verb":"create"}')"
+SECOND="$(call "{\"verb\":\"create\",\"user_uid\":$CORE_UID}")"
 ID2="$(field "$SECOND" entry.id)"
 ADDR2="$(field "$SECOND" entry.address)"
 note "group ids $ID1 and $ID2 at $ADDR1 and $ADDR2"
@@ -230,7 +230,7 @@ note "$ANSWER"
 
 # Re-create the policy by rebuilding the group: destroy and create again.
 call "{\"verb\":\"destroy\",\"id\":$ID1}" >/dev/null
-FIRST="$(call '{"verb":"create"}')"
+FIRST="$(call "{\"verb\":\"create\",\"user_uid\":$LAUNCH_UID}")"
 ID1="$(field "$FIRST" entry.id)"
 ADDR1="$(field "$FIRST" entry.address)"
 
@@ -377,7 +377,7 @@ case "$ANSWER" in
 *'"result":"applied"'*) ok "the bridge works under the packaged set" ;;
 *) fail "the packaged set could not build the bridge: $ANSWER" ;;
 esac
-ANSWER="$(packaged_call '{"verb":"create"}')"
+ANSWER="$(packaged_call "{\"verb\":\"create\",\"user_uid\":$CORE_UID}")"
 case "$ANSWER" in
 *'"result":"created"'*) ok "namespace creation works under the packaged set" ;;
 *) fail "the packaged set could not create a namespace: $ANSWER" ;;
@@ -416,7 +416,7 @@ case "$ANSWER" in
 *'"result":"applied"'*) ok "CAP_NET_ADMIN alone is enough for the bridge" ;;
 *) fail "the limited helper could not even build the bridge: $ANSWER" ;;
 esac
-ANSWER="$(limit_call '{"verb":"create"}')"
+ANSWER="$(limit_call "{\"verb\":\"create\",\"user_uid\":$CORE_UID}")"
 case "$ANSWER" in
 *'"code":"backend_failure"'*)
     ok "without CAP_SYS_ADMIN, creating a namespace fails closed"

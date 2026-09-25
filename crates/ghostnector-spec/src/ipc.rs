@@ -38,6 +38,19 @@ pub enum Request {
     Disconnect,
     /// Apply the fail-closed baseline immediately, leaving services running.
     Panic,
+    /// Prepare a protected session for the requesting user.
+    ///
+    /// This is the whole "run a protected application" operation: the interface asks for a session,
+    /// receives one, and runs the application in it. No namespace, uid, port, or command is part of
+    /// the request.
+    AppRun,
+    /// List the protected application groups.
+    AppList,
+    /// Stop one protected application group.
+    AppStop {
+        /// The handle from [`AppStatus`](crate::state::AppStatus).
+        id: u32,
+    },
     /// Cancel an in-flight transition.
     Cancel,
     /// Subscribe to state-change events.
@@ -57,6 +70,19 @@ pub enum Response {
     },
     /// The current snapshot.
     Snapshot(Box<Snapshot>),
+    /// A prepared protected session.
+    AppSession {
+        /// The handle for the group the session runs in.
+        id: u32,
+        /// The socket the requesting user connects to in order to drive the session. Derived by
+        /// the namespace helper; the client never chooses it.
+        socket: String,
+    },
+    /// The protected application groups.
+    AppList {
+        /// The groups.
+        apps: Vec<crate::state::AppStatus>,
+    },
     /// The request was accepted; progress is reported through events.
     Accepted,
     /// The request failed.
@@ -177,7 +203,21 @@ mod tests {
                 },
             }),
             Frame::Request(Request::Panic),
+            Frame::Request(Request::AppRun),
+            Frame::Request(Request::AppStop { id: 3 }),
+            Frame::Request(Request::AppList),
             Frame::Response(Response::Accepted),
+            Frame::Response(Response::AppSession {
+                id: 3,
+                socket: "/run/ghostnector/apps/3/stdio.sock".to_string(),
+            }),
+            Frame::Response(Response::AppList {
+                apps: vec![crate::state::AppStatus {
+                    id: 3,
+                    address: std::net::Ipv4Addr::new(10, 200, 0, 4),
+                    present: true,
+                }],
+            }),
             Frame::Response(Response::Hello {
                 protocol: PROTOCOL_VERSION,
                 daemon_version: "0.1.0".to_string(),
