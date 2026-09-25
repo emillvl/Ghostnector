@@ -11,6 +11,7 @@ pub struct MockNamespaces {
     bridge: Mutex<bool>,
     groups: Mutex<BTreeMap<u32, String>>,
     shape: Mutex<Vec<String>>,
+    probe_results: Mutex<Vec<ghostnector_spec::appd::CheckVerdict>>,
     fail_create: Mutex<Option<String>>,
     calls: Mutex<Vec<String>>,
 }
@@ -32,6 +33,11 @@ impl MockNamespaces {
     /// Make the shape check report these problems.
     pub fn set_shape_problems(&self, problems: Vec<String>) {
         *self.shape.lock().expect("mock lock") = problems;
+    }
+
+    /// Make the probe report these verdicts.
+    pub fn set_probe_results(&self, results: Vec<ghostnector_spec::appd::CheckVerdict>) {
+        *self.probe_results.lock().expect("mock lock") = results;
     }
 
     /// Make the next create fail with this message.
@@ -117,6 +123,19 @@ impl Namespaces for MockNamespaces {
             .get(&id)
             .cloned()
             .unwrap_or_default())
+    }
+
+    fn probe(
+        &self,
+        _id: u32,
+        _uid: u32,
+        _config: &ghostnector_spec::appd::ProbeConfig,
+    ) -> Result<Vec<ghostnector_spec::appd::CheckVerdict>, BackendError> {
+        self.calls
+            .lock()
+            .expect("mock lock")
+            .push("probe".to_string());
+        Ok(self.probe_results.lock().expect("mock lock").clone())
     }
 
     fn shape_problems(&self, _request: &GroupRequest) -> Result<Vec<String>, BackendError> {

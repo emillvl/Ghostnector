@@ -34,6 +34,7 @@ fn main() -> std::process::ExitCode {
         config.nft.clone(),
         config.ip.clone(),
         config.bridge_ctl.clone(),
+        config.probe.clone(),
         config.bridge.clone(),
         config.core,
         config.prefix,
@@ -45,10 +46,12 @@ fn main() -> std::process::ExitCode {
         }
     };
 
-    // The launch helper is executed on behalf of users; verify it before serving anything.
-    if let Err(error) = ghostnector_appd::backend::check_tool(&config.launcher) {
-        eprintln!("ghostnector-appd: {error}");
-        return ExitCode::FAILURE;
+    // The launch helper and the probe are executed on behalf of users; verify them before serving.
+    for tool in [&config.launcher, &config.probe] {
+        if let Err(error) = ghostnector_appd::backend::check_tool(tool) {
+            eprintln!("ghostnector-appd: {error}");
+            return ExitCode::FAILURE;
+        }
     }
 
     let server = match Server::new(config.clone(), backend) {

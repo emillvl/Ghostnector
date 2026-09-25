@@ -73,14 +73,125 @@ pub enum AppVerb {
         /// The user the session is for.
         user_uid: u32,
     },
+    /// Run the fixed verification probe inside one group.
+    ///
+    /// The probe is a product binary run by the helper with no command line at all; it reads the
+    /// check configuration below on standard input and prints typed verdicts. It runs as an
+    /// unprivileged uid inside the namespace, so a caller cannot use it to obtain privilege — only
+    /// to ask the same three questions the host-scope verifier asks.
+    Probe {
+        /// The group's id.
+        id: u32,
+        /// The checks to run. Endpoints are the operator's verification configuration, validated
+        /// and bounded by the helper before the probe sees them.
+        config: ProbeConfig,
+    },
     /// List every group the helper knows, with no traffic information of any kind.
     ReportRegistry,
     /// Destroy every group and the bridge: the APP-scope equivalent of reverting the policy.
     Revert,
 }
 
-/// One APP isolation group, as shown to the control plane.
+/// A single check's verdict, as the probe reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckStatus {
+    /// The check ran and the result was the expected one.
+    Passed,
+    /// The check ran and the result was wrong. This is an alarm.
+    Failed,
+    /// The check could not reach a conclusion, which is never a pass.
+    Inconclusive,
+}
+
+/// One check's outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckVerdict {
+    /// Which check: `udp`, `protected-path`, or `canary`.
+    pub check: String,
+    /// What it concluded.
+    pub status: CheckStatus,
+    /// A short, non-sensitive explanation.
+    pub detail: String,
+    /// For the protected-path check, the address the endpoint reported, if any.
+    #[serde(default)]
+    pub address: Option<Ipv4Addr>,
+}
+
+/// What the whole probe run concluded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "outcome")]
+pub enum ProbeOutcome {
+    /// Every check that could run passed.
+    Passed,
+    /// At least one check observed something wrong.
+    Failed {
+        /// Why, in one line.
+        reason: String,
+    },
+    /// No check could reach a conclusion.
+    Inconclusive {
+        /// Why, in one line.
+        reason: String,
+    },
+}
+
+/// The endpoint for the liveness and identity check inside a namespace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpCheck {
+    /// Where to connect. Any destination works: the namespace DNAT carries it to the core address.
+    pub address: std::net::SocketAddr,
+    /// The `Host` header, which is also the name the endpoint expects.
+    pub host: String,
+    /// The path to request.
+    pub path: String,
+}
+
+/// A name that should resolve to one particular address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanaryCheck {
+    /// The name to ask for.
+    pub name: String,
+    /// The address only the right resolver should give.
+    pub expected: Ipv4Addr,
+    /// Which resolver to ask, usually the core chokepoint.
+    pub resolver: std::net::SocketAddr,
+}
+
+/// The checks the probe should run inside a namespace.
 ///
+/// Every field is optional: with nothing configured, every check is inconclusive and the state
+/// honestly says nothing has verified the group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProbeConfig {
+    /// A UDP endpoint that answers if a datagram reaches it.
+    pub udp: Option<std::net::SocketAddr>,
+    /// An endpoint that answers `200` to a GET if the protected path works.
+    pub http: Option<HttpCheck>,
+    /// A name that should resolve to a known address.
+    pub canary: Option<CanaryCheck>,
+    /// How long a single network operation may take, in seconds.
+    pub timeout_seconds: u64,
+    /// The host-local core address. Filled in by the helper from its own configuration; a value
+    /// from a client is ignored, because it is not the client's machine.
+    #[serde(default)]
+    pub core: Option<Ipv4Addr>,
+}
+
+impl Default for ProbeConfig {
+    fn default() -> Self {
+        Self {
+            udp: None,
+            http: None,
+            canary: None,
+            timeout_seconds: 10,
+            core: None,
+        }
+    }
+}
+
+/// One APP isolation group, as shown to the control plane.///
 /// Note what is absent: no destinations, no traffic counters, no queries. An id, the owner, the
 /// address the helper assigned, when it was created, and whether its objects are still present.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,6 +276,13 @@ pub enum AppResponse {
         /// directory and the group id; never accepted from a client.
         socket: String,
     },
+    /// The answer to [`AppVerb::Probe`].
+    Probed {
+        /// What the probe run concluded.
+        outcome: ProbeOutcome,
+        /// One line per check, safe to show.
+        details: Vec<String>,
+    },
     /// The answer to [`AppVerb::ReportRegistry`].
     Report(AppReport),
     /// The verb failed.
@@ -204,6 +322,17 @@ mod tests {
             })
             .unwrap(),
             r#"{"verb":"launch","id":7,"user_uid":1000}"#
+        );
+        let probe = AppVerb::Probe {
+            id: 7,
+            config: ProbeConfig {
+                timeout_seconds: 5,
+                ..ProbeConfig::default()
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&probe).unwrap(),
+            r#"{"verb":"probe","id":7,"config":{"udp":null,"http":null,"canary":null,"timeout_seconds":5,"core":null}}"#
         );
         assert_eq!(
             serde_json::to_string(&AppVerb::ReportRegistry).unwrap(),
@@ -249,6 +378,10 @@ mod tests {
                 id: 1,
                 user_uid: 1000,
             },
+            AppVerb::Probe {
+                id: 1,
+                config: ProbeConfig::default(),
+            },
             AppVerb::ReportRegistry,
             AppVerb::Revert,
         ];
@@ -287,6 +420,12 @@ mod tests {
                     present: true,
                 },
                 socket: "/run/ghostnector/apps/1/stdio.sock".to_string(),
+            },
+            AppResponse::Probed {
+                outcome: ProbeOutcome::Failed {
+                    reason: "a UDP datagram reached 203.0.113.1".to_string(),
+                },
+                details: vec!["failed: a UDP datagram reached 203.0.113.1".to_string()],
             },
             AppResponse::Report(AppReport::default()),
         ];

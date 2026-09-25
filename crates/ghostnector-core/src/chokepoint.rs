@@ -40,6 +40,7 @@ pub trait DnsRelay: Send + Sync {
 #[derive(Debug)]
 pub struct ChildRelay {
     program: PathBuf,
+    app_core: Option<std::net::Ipv4Addr>,
     child: Mutex<Option<Child>>,
 }
 
@@ -49,8 +50,18 @@ impl ChildRelay {
         check_tool(&program)?;
         Ok(Self {
             program,
+            app_core: None,
             child: Mutex::new(None),
         })
+    }
+
+    /// Tell the relay which private core address it may also accept queries on.
+    ///
+    /// The relay still refuses anything but loopback and this exact address, and still refuses a
+    /// wildcard; APP namespaces deliver their queries here.
+    pub fn with_app_core(mut self, core: std::net::Ipv4Addr) -> Self {
+        self.app_core = Some(core);
+        self
     }
 
     /// The program in use.
@@ -76,11 +87,16 @@ impl DnsRelay for ChildRelay {
             let _ = previous.wait();
         }
 
-        let child = Command::new(&self.program)
+        let mut command = Command::new(&self.program);
+        command
             .arg("--listen")
             .arg(listen.to_string())
             .arg("--upstream")
-            .arg(upstream.to_string())
+            .arg(upstream.to_string());
+        if let Some(core) = self.app_core {
+            command.arg("--app-core").arg(core.to_string());
+        }
+        let child = command
             // The tether: when this process goes away, the child's standard input closes and the
             // relay stops, instead of lingering with port 53 bound.
             .arg("--exit-when-stdin-closes")

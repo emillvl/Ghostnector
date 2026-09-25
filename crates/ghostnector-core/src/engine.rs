@@ -19,7 +19,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use ghostnector_spec::appd::{AppResponse, AppVerb};
+use ghostnector_spec::appd::{
+    AppResponse, AppVerb, CanaryCheck, HttpCheck, ProbeConfig, ProbeOutcome,
+};
 use ghostnector_spec::backend::{Params, Ports, ProfileId, Report, Verb};
 use ghostnector_spec::ipc::HelperResponse;
 use ghostnector_spec::state::AppStatus;
@@ -648,7 +650,11 @@ impl Engine {
             // The bridge is created only after the host table exists: deny first, then the path.
             self.ensure_app_bridge(ports)?;
         }
-        self.services.bring_up(target, ports)?;
+        self.services.bring_up(
+            target,
+            ports,
+            (target == ProfileId::TorApp).then_some(self.config.app_core),
+        )?;
 
         let report = self.apply(target, params)?;
 
@@ -688,14 +694,13 @@ impl Engine {
     /// every query at port 53 into the chokepoint whatever the file says, so a machine whose
     /// resolver configuration could not be changed is still not leaking.
     fn bring_up_dns(&self, profile: ProfileId, ports: Ports) -> Result<(), EngineError> {
-        if profile == ProfileId::TorApp {
-            // APP scope never touches the machine's resolver: that would be a machine-wide change.
-            // The app-facing chokepoint and Tor's core-address listeners arrive in the next
-            // increment (M8.4b); until then an app session is confined but cannot reach Tor, which
-            // is the fail-closed direction.
-            return Ok(());
-        }
-        let listen = SocketAddr::from((Ipv4Addr::LOCALHOST, ports.chokepoint));
+        let listen = if profile == ProfileId::TorApp {
+            // The app-facing chokepoint: the namespace DNAT delivers here, and the machine's own
+            // resolver is deliberately not touched — APP scope never changes the machine.
+            SocketAddr::from((self.config.app_core, ports.chokepoint))
+        } else {
+            SocketAddr::from((Ipv4Addr::LOCALHOST, ports.chokepoint))
+        };
         let upstream = self.dns_upstream(profile);
         self.relay.start(listen, upstream)?;
 
@@ -709,6 +714,10 @@ impl Engine {
                     "nothing would answer on {listen}"
                 )),
             ));
+        }
+
+        if profile == ProfileId::TorApp {
+            return Ok(());
         }
 
         let mut baseline = match self.resolver.capture() {
@@ -803,7 +812,12 @@ impl Engine {
             };
         }
 
-        let mut report = self.verification.run_once();
+        let app_scope = self.lock_report().profile == Some(ProfileId::TorApp);
+        let mut report = if app_scope {
+            self.verify_apps()
+        } else {
+            self.verification.run_once()
+        };
 
         // The probes exercise the paths that exist. This asks the kernel what it actually holds, and
         // compares it against what was applied: a rule change made by something else is invisible to
@@ -869,18 +883,31 @@ impl Engine {
             }
             Outcome::Failed { reason } => {
                 self.add_note(format!("verification failed: {reason}"));
-                if let Err(error) = self.apply(ProfileId::FailClosed, &Params::default()) {
+                if app_scope {
+                    // APP scope's fail-closed answer is to remove the namespaces: the host is not
+                    // the protected scope, so denying the machine would claim something that is not
+                    // true. No application can reach the network after this.
+                    self.remove_app_namespaces();
+                } else if let Err(error) = self.apply(ProfileId::FailClosed, &Params::default()) {
                     self.add_note(format!(
                         "the fail-closed baseline could not be applied after a failed \
                          verification: {error}"
                     ));
                 }
+                let blocked_reason = if app_scope {
+                    format!(
+                        "verification failed, so every protected application's namespace was \
+                         removed: {reason}"
+                    )
+                } else {
+                    format!(
+                        "verification failed, so the fail-closed baseline was applied: {reason}"
+                    )
+                };
                 let _ = self.set_state(
                     ProtectionState::Blocked,
                     Cause::Automatic,
-                    vec![Reason::new(format!(
-                        "verification failed, so the fail-closed baseline was applied: {reason}"
-                    ))],
+                    vec![Reason::new(blocked_reason)],
                 );
                 let _ = self.record_intent(Intent::requested(
                     ProfileId::FailClosed,
@@ -904,6 +931,160 @@ impl Engine {
 
         self.publish();
         report
+    }
+
+    /// Verify the protected APP scope: every group's namespace and ruleset, and the three checks
+    /// run inside each group.
+    ///
+    /// The host-scope probes are deliberately not used here: in APP scope the machine is not
+    /// protected, so a datagram leaving the *host* would be expected and proving nothing. Evidence
+    /// for an APP claim has to come from inside the namespaces the claim is about.
+    fn verify_apps(&self) -> VerificationReport {
+        let registry = match self.app_invoke(AppVerb::ReportRegistry) {
+            Ok(AppResponse::Report(report)) => report,
+            Ok(other) => {
+                return app_report(
+                    Outcome::Inconclusive {
+                        reason: "the namespace helper answered a report unexpectedly".to_string(),
+                    },
+                    vec![format!(
+                        "the namespace helper answered a report with {other:?}"
+                    )],
+                )
+            }
+            Err(error) => {
+                return app_report(
+                    Outcome::Inconclusive {
+                        reason: "the namespace helper could not be asked what it has".to_string(),
+                    },
+                    vec![format!("the namespace helper could not be asked: {error}")],
+                )
+            }
+        };
+        if registry.entries.is_empty() {
+            return app_report(
+                Outcome::Inconclusive {
+                    reason: "APP protection is configured, but no application currently has \
+                             verification evidence"
+                        .to_string(),
+                },
+                vec![
+                    "unknown: no protected application exists, so there is nothing to verify"
+                        .to_string(),
+                ],
+            );
+        }
+
+        let config = self.probe_config();
+        let mut details = Vec::new();
+        let mut failure: Option<String> = None;
+        let mut passed = 0usize;
+
+        for entry in &registry.entries {
+            // The namespace's shape and effective ruleset, compared against what was installed.
+            match self.app_invoke(AppVerb::Verify { id: entry.id }) {
+                Ok(AppResponse::Verified {
+                    matches: true,
+                    detail,
+                }) => details.push(format!("ok: group {}: {detail}", entry.id)),
+                Ok(AppResponse::Verified {
+                    matches: false,
+                    detail,
+                }) => {
+                    let reason = format!(
+                        "group {} is not the namespace that was installed: {detail}",
+                        entry.id
+                    );
+                    details.push(format!("failed: {reason}"));
+                    failure.get_or_insert(reason);
+                }
+                Ok(other) => details.push(format!(
+                    "unknown: group {} verification answered {other:?}",
+                    entry.id
+                )),
+                Err(error) => details.push(format!(
+                    "unknown: group {} could not be verified: {error}",
+                    entry.id
+                )),
+            }
+
+            // The three checks, run inside the namespace as an unprivileged user.
+            match self.app_invoke(AppVerb::Probe {
+                id: entry.id,
+                config: config.clone(),
+            }) {
+                Ok(AppResponse::Probed {
+                    outcome,
+                    details: probe_details,
+                }) => {
+                    for detail in probe_details {
+                        details.push(format!("group {}: {detail}", entry.id));
+                    }
+                    match outcome {
+                        ProbeOutcome::Passed => passed += 1,
+                        ProbeOutcome::Failed { reason } => {
+                            let reason = format!("group {}: {reason}", entry.id);
+                            details.push(format!("failed: {reason}"));
+                            failure.get_or_insert(reason);
+                        }
+                        ProbeOutcome::Inconclusive { .. } => {}
+                    }
+                }
+                Ok(other) => details.push(format!(
+                    "unknown: group {} probe answered {other:?}",
+                    entry.id
+                )),
+                Err(error) => details.push(format!(
+                    "unknown: group {} could not be probed: {error}",
+                    entry.id
+                )),
+            }
+        }
+
+        if let Some(reason) = failure {
+            return app_report(Outcome::Failed { reason }, details);
+        }
+        if passed == 0 {
+            return app_report(
+                Outcome::Inconclusive {
+                    reason: "no application could be verified".to_string(),
+                },
+                details,
+            );
+        }
+        if passed < registry.entries.len() {
+            return app_report(
+                Outcome::Inconclusive {
+                    reason: "not every protected application could be verified".to_string(),
+                },
+                details,
+            );
+        }
+        app_report(Outcome::Passed, details)
+    }
+
+    /// The probe configuration, translated from the operator's verification settings.
+    fn probe_config(&self) -> ProbeConfig {
+        let verification = &self.config.verification;
+        ProbeConfig {
+            udp: verification.udp_endpoint,
+            http: verification
+                .http_endpoint
+                .as_ref()
+                .map(|endpoint| HttpCheck {
+                    address: endpoint.address,
+                    host: endpoint.host.clone(),
+                    path: endpoint.path.clone(),
+                }),
+            canary: verification.canary.as_ref().map(|canary| CanaryCheck {
+                name: canary.name.clone(),
+                expected: canary.expected,
+                resolver: canary.resolver,
+            }),
+            timeout_seconds: verification.timeout.as_secs().clamp(1, 60),
+            // Filled in by the namespace helper from its own configuration.
+            core: None,
+        }
     }
 
     /// Stop calling a result fresh once it is older than the configured window.
@@ -1100,6 +1281,11 @@ impl Engine {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+/// Build an APP verification report.
+fn app_report(outcome: Outcome, details: Vec<String>) -> VerificationReport {
+    VerificationReport { outcome, details }
 }
 
 fn report_from(answer: ghostnector_spec::HelperResponse) -> Result<Report, EngineError> {
@@ -2176,15 +2362,63 @@ mod tests {
     }
 
     #[test]
-    fn app_scope_never_repoints_the_machines_resolver() {
+    fn app_scope_starts_the_chokepoint_on_the_core_address_and_leaves_the_machine_alone() {
         let (_helper, relay, engine, _dir) = engine_and_relay();
-        // `engine_and_relay` builds its own app helper; APP connect must not start the loopback
-        // relay, because the machine's resolver is not part of APP scope.
         engine.connect(app_profile(), USER_UID).expect("connect");
-        assert!(
-            relay.started().is_empty(),
-            "APP scope must not touch the machine's resolver: {:?}",
-            relay.started()
+        assert_eq!(
+            relay.started(),
+            vec!["10.200.0.1:53 -> 127.0.0.1:9053".to_string()],
+            "APP scope's chokepoint listens on the core address the namespace DNAT targets"
         );
+        // The machine's resolver file is not touched: APP scope does not change the machine.
+        let resolv = _dir.join("etc").join("resolv.conf");
+        assert_eq!(
+            std::fs::read_to_string(&resolv).expect("resolv.conf"),
+            "nameserver 192.0.2.53\n"
+        );
+    }
+
+    #[test]
+    fn app_protection_is_never_claimed_without_per_app_evidence() {
+        let (_app_helper, engine, _dir) = engine_and_apps();
+        engine.connect(app_profile(), USER_UID).expect("connect");
+
+        // No applications: nothing has been verified, so the claim stays degraded.
+        engine.verify_once();
+        assert_eq!(engine.snapshot().state, ProtectionState::Degraded);
+
+        // One application with passing evidence is the only route to Protected.
+        engine.app_run(USER_UID).expect("run");
+        let report = engine.verify_once();
+        assert_eq!(report.outcome, Outcome::Passed, "{:?}", report.details);
+        assert_eq!(engine.snapshot().state, ProtectionState::Protected);
+        assert!(report
+            .details
+            .iter()
+            .any(|detail| detail.contains("group 1")));
+    }
+
+    #[test]
+    fn a_changed_namespace_blocks_the_app_scope_and_removes_the_namespaces() {
+        let (app_helper, engine, _dir) = engine_and_apps();
+        engine.connect(app_profile(), USER_UID).expect("connect");
+        engine.app_run(USER_UID).expect("run");
+        engine.verify_once();
+        assert_eq!(engine.snapshot().state, ProtectionState::Protected);
+
+        app_helper.fail_verify_with("the namespace policy differs from what was applied");
+        engine.verify_once();
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.state, ProtectionState::Blocked);
+        assert!(
+            snapshot
+                .reasons
+                .iter()
+                .any(|reason| reason.as_str().contains("namespace was removed")),
+            "{:?}",
+            snapshot.reasons
+        );
+        assert!(snapshot.apps.is_empty(), "no namespace may remain");
+        assert!(!app_helper.bridge_ready());
     }
 }

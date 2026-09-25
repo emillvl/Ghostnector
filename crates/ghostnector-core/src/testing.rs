@@ -14,6 +14,55 @@ use crate::resolver::{CommandError, CommandRunner};
 use crate::services::{ServiceError, Services};
 use crate::verify::Outcome;
 
+/// A supervisor that records what it was asked, and reports units as running.
+#[derive(Debug, Default)]
+pub struct MockSupervisor {
+    started: Mutex<Vec<String>>,
+    stopped: Mutex<Vec<String>>,
+}
+
+impl MockSupervisor {
+    /// A supervisor that accepts everything.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Units that were started, in order.
+    pub fn started(&self) -> Vec<String> {
+        self.started.lock().expect("mock lock").clone()
+    }
+
+    /// Units that were stopped, in order.
+    pub fn stopped(&self) -> Vec<String> {
+        self.stopped.lock().expect("mock lock").clone()
+    }
+}
+
+impl crate::supervisor::Supervisor for MockSupervisor {
+    fn start(&self, unit: &str) -> Result<(), crate::supervisor::SupervisorError> {
+        self.started
+            .lock()
+            .expect("mock lock")
+            .push(unit.to_string());
+        Ok(())
+    }
+
+    fn stop(&self, unit: &str) -> Result<(), crate::supervisor::SupervisorError> {
+        self.stopped
+            .lock()
+            .expect("mock lock")
+            .push(unit.to_string());
+        Ok(())
+    }
+
+    fn state(
+        &self,
+        _unit: &str,
+    ) -> Result<crate::supervisor::ServiceState, crate::supervisor::SupervisorError> {
+        Ok(crate::supervisor::ServiceState::Running)
+    }
+}
+
 /// A namespace helper that records what it was asked and can fail on demand.
 #[derive(Debug, Default)]
 pub struct MockAppHelper {
@@ -22,6 +71,7 @@ pub struct MockAppHelper {
     calls: Mutex<Vec<AppVerb>>,
     fail_create: Mutex<Option<String>>,
     fail_launch: Mutex<Option<String>>,
+    fail_verify: Mutex<Option<String>>,
 }
 
 impl MockAppHelper {
@@ -48,6 +98,11 @@ impl MockAppHelper {
     /// Fail the next launch.
     pub fn fail_launch_with(&self, message: &str) {
         *self.fail_launch.lock().expect("mock lock") = Some(message.to_string());
+    }
+
+    /// Make the next `Verify` report a changed namespace.
+    pub fn fail_verify_with(&self, detail: &str) {
+        *self.fail_verify.lock().expect("mock lock") = Some(detail.to_string());
     }
 
     fn report(&self) -> AppReport {
@@ -118,10 +173,18 @@ impl AppHelperLink for MockAppHelper {
                     .cloned(),
                 notes: Vec::new(),
             }),
-            AppVerb::Verify { .. } => Ok(AppResponse::Verified {
-                matches: true,
-                detail: "the mock namespace is unchanged".to_string(),
-            }),
+            AppVerb::Verify { .. } => {
+                if let Some(detail) = self.fail_verify.lock().expect("mock lock").take() {
+                    return Ok(AppResponse::Verified {
+                        matches: false,
+                        detail,
+                    });
+                }
+                Ok(AppResponse::Verified {
+                    matches: true,
+                    detail: "the mock namespace is unchanged".to_string(),
+                })
+            }
             AppVerb::Launch { id, user_uid } => {
                 if let Some(message) = self.fail_launch.lock().expect("mock lock").take() {
                     return Err(Self::refused(&message));
@@ -140,6 +203,10 @@ impl AppHelperLink for MockAppHelper {
                     socket: format!("/tmp/ghostnector-mock-session-{id}.sock"),
                 })
             }
+            AppVerb::Probe { .. } => Ok(AppResponse::Probed {
+                outcome: ghostnector_spec::appd::ProbeOutcome::Passed,
+                details: vec!["ok: the mock probe passed".to_string()],
+            }),
             AppVerb::ReportRegistry => Ok(AppResponse::Report(self.report())),
             AppVerb::Revert => {
                 *self.bridge.lock().expect("mock lock") = false;
@@ -349,7 +416,12 @@ impl MockServices {
 }
 
 impl Services for MockServices {
-    fn bring_up(&self, profile: ProfileId, _ports: Ports) -> Result<(), ServiceError> {
+    fn bring_up(
+        &self,
+        profile: ProfileId,
+        _ports: Ports,
+        _app_core: Option<std::net::Ipv4Addr>,
+    ) -> Result<(), ServiceError> {
         if let Some(message) = self.fail_bring_up.lock().expect("mock lock").clone() {
             return Err(ServiceError::Config(message));
         }

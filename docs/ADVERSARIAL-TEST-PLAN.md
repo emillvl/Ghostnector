@@ -234,37 +234,47 @@ Defects this campaign found and fixed: **D-15, D-16** (which falsified PC-03 and
 **D-17, D-18, D-19** and **D-20** (a fix that rendered a policy nftables refuses, hidden by a harness
 that ignored the connect result). Each has a regression test that fails on the old behaviour.
 
-## 12. M8 APP scope (planned): the AA class
+## 12. M8 APP scope: the AA class, executed
 
-The APP scope brings a new enforcement surface — namespaces, a host-side APP table with input/forward
-guards only, a bridge, and a launcher — and the M7 lesson applies unchanged: an untested surface is
-not protected. The M8 campaign extends the observation points and adds the `AA` class. The topology
-assumption itself is already pinned by `scripts/app-topology-test.sh`, and the rendered policy is
-already exercised against the kernel by `scripts/app-policy-test.sh` (M8.1): applicability, DNAT with
-source preservation, the flushed-DNAT dead end, and the host link bounded to the core listeners.
-The AA cases extend those two scripts to the real components.
+The M8 campaign extends the observation points to the APP scope and adds the `AA` class. The
+topology assumption is pinned by `scripts/app-topology-test.sh`, the rendered policy by
+`scripts/app-policy-test.sh`, the helper lifecycle and capability set by
+`scripts/appd-socket-test.sh`, the end-to-end product path by `scripts/core-app-test.sh`, and the
+adversarial cases by `scripts/app-adversarial.sh`.
 
-Planned cases, to be implemented in M8.6 against the real components:
+Executed cases and results (all observed at the host link, the helper's own verification, the fake
+Tor's event log, or the reported state):
 
-| ID | Injected action | Expected | Falsifier |
-|---|---|---|---|
-| AA-1 | Remove a protected namespace by hand | the app loses its path; the helper notices on the next check; state says so | the app still reaches anything, or the state keeps claiming APP protection |
-| AA-2 | Inject a `masquerade`/`snat` rule in the host or namespace ruleset | refused by the invariant before it can be applied, or alarmed and replaced if it appears in the kernel | two protected groups present the same source identity to Tor; the rule survives a check |
-| AA-3 | Inject a route inside an APP namespace (root scenario) | nothing reaches the host veth or a boundary: the host does not answer ARP for the destination and `fwd_filter` drops anything that arrives | one packet from the application address at the host link or a boundary |
-| AA-4 | Set `proxy_arp=1` on the host side of an app link | detected by the namespace-shape check; no packet leaves in the meantime | an un-DNAT'ed application packet is forwarded or delivered while APP protection is reported |
-| AA-5 | Create a second path/interface inside the namespace (the AN-5 trick, app edition) | the new path is subject to the same dead end; nothing from the application address uses it | a packet from the application address over the new path |
-| AA-6 | Launch/stop/reconnect storm with two apps running | no prohibited crossing at any point; no stale namespace or veth afterwards | one prohibited packet, or a leftover namespace/veth/rule |
-| AA-7 | `panic` while apps run | apps lose the path; the state and wording are APP-scoped; the machine-wide policy is untouched | an app still reaches the network, or a machine-wide claim appears that is not true |
-| AA-8 | Reboot/reconcile with APP intent persisted | the conservative machine-wide boot baseline is applied; nothing is claimed about app protection until it is re-established and verified | an application reaches the network while protection is claimed, or the state reports `Protected` with no apps |
-| AA-9 | Two apps in separate namespaces, and a masquerade control | the harness observes two distinct Application Addresses at Tor, and no SNAT anywhere | identical source identities, or a rewrite visible at the boundary |
-| AA-10 | DNS from inside an app namespace to a foreign resolver | answered only through the chokepoint; no port-53 packet at a boundary | a port-53 datagram from the application address at a boundary |
-| AA-11 | IPv6 attempt from inside an app namespace | fails; no IPv6 packet anywhere | one IPv6 packet from an application address |
-| AA-12 | Change the namespace ruleset/shape without removing it | detected by the shape/ruleset comparison within the bound | the change survives a check while APP protection is reported |
-| AA-13 | Kill `appd`, then `core`; leave a stale registry entry | existing namespaces keep their protection; nothing opens; reconciliation is honest | a loosening coincident with the death, or a state that invents protection |
-| AA-14 | Read the `Snapshot` while apps run | only ids/counts and evidence flow to the interface | a destination, query, or per-flow record appears |
+| ID | Injected action | Observed |
+|---|---|---|
+| AA-1 | A protected namespace removed by hand | held: noticed, and the APP scope denied within the window |
+| AA-2 | A masquerade rule injected into the host table | held: noticed, and the APP scope denied (the table was replaced) |
+| AA-3 | A route injected inside the namespace | held: the connection still went through Tor; no direct path |
+| AA-4 | `proxy_arp=1` on the app link | held: shape change noticed, APP scope denied |
+| AA-5 | An extra interface inside the namespace | held: shape change noticed, APP scope denied |
+| AA-6/AA-9 | Two applications in separate namespaces | held: Tor saw two distinct application addresses; no masquerade |
+| AA-7 | `panic` while applications run | held: every namespace removed, state blocked |
+| AA-10 | A DNS query to a foreign resolver | held: answered by the chokepoint; no query from an application address reached the resolver directly |
+| AA-12 | The namespace ruleset flushed | held: noticed, APP scope denied |
+| AA-13 | The namespace helper killed | held: the existing namespace kept its protected path, and the host APP table survived |
 
-Regression: every M1–M7 case runs unchanged against an APP build with APP scope inactive, and the
-SYSTEM goldens stay byte-identical.
+**Result: 13 held, 0 contradicted, 0 inconclusive** (several cases assert two observations).
+
+Not implemented as separate cases, and recorded as such rather than passed: AA-8 (reboot/reconcile)
+is covered by engine unit tests and the conservative boot guard, not end to end; AA-11 (an IPv6
+attempt from inside a namespace) is covered structurally by the shape check that refuses a namespace
+without `disable_ipv6=1`; AA-14 (`Snapshot` carries no traffic metadata) is covered by unit tests on
+`AppStatus` and `AppReport`.
+
+**One classified observation, not whitelisted:** the fake resolver in this environment also saw a
+single query from the WSL virtual gateway (`10.255.255.254`), which is not an application address
+and not part of the protected scope. The assertion therefore states the property that matters — *no
+query from an application address reached a resolver directly* — and the environmental source is
+recorded here (the D-02 lesson: link noise is classified, never counted as a pass).
+
+**Boundary:** the suite's outside world is a fake Tor inside the same host; there is no ISP-facing
+vantage (the SYSTEM-scope G8 remains open for APP, recorded as GA-1). "Distinct source identities"
+is what was demonstrated; distinct Tor circuits are Tor's behaviour and are not claimed (GA-2).
 
 ## Appendix A — defects found so far, and their regression tests
 

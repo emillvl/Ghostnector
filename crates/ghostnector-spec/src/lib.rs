@@ -28,7 +28,10 @@ pub use app::{
     app_core_element, valid_interface_name, APP_LINK_PREFIX, APP_NETNS_PREFIX, DEFAULT_APP_BRIDGE,
     DEFAULT_APP_CORE_ADDRESS, DEFAULT_APP_DEAD_DEVICE, DEFAULT_APP_PREFIX, MAX_APP_GROUPS,
 };
-pub use appd::{AppEntry, AppReport, AppResponse, AppVerb, APP_PROTOCOL_VERSION};
+pub use appd::{
+    AppEntry, AppReport, AppResponse, AppVerb, CanaryCheck, CheckStatus, CheckVerdict, HttpCheck,
+    ProbeConfig, ProbeOutcome, APP_PROTOCOL_VERSION,
+};
 pub use backend::{Params, Ports, ProfileId, Report, ResolvedIdentity, Verb};
 pub use exemption::{Exemption, ExemptionKind};
 pub use ipc::{

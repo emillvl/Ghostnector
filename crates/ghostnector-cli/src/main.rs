@@ -251,10 +251,7 @@ OPTIONS:
 
     fn render(snapshot: &Snapshot) -> String {
         let mut out = String::new();
-        out.push_str(&format!(
-            "state:        {}\n",
-            describe_state(snapshot.state)
-        ));
+        out.push_str(&format!("state:        {}\n", describe_state(snapshot)));
         if let Some(profile) = &snapshot.profile {
             out.push_str(&format!(
                 "profile:      {} ({})\n",
@@ -309,12 +306,16 @@ OPTIONS:
         out
     }
 
-    fn describe_state(state: ProtectionState) -> String {
-        match state {
+    fn describe_state(snapshot: &Snapshot) -> String {
+        let scope = snapshot.profile.as_ref().map(|profile| profile.scope);
+        match snapshot.state {
             ProtectionState::Off => "off — traffic is not protected".to_string(),
             ProtectionState::Applying => "applying — a transition is in progress".to_string(),
             ProtectionState::Protected => "protected — and verified".to_string(),
             ProtectionState::Degraded => "protected, but unverified".to_string(),
+            ProtectionState::Blocked if scope == Some(Scope::App) => {
+                "blocked — no protected application can reach the network".to_string()
+            }
             ProtectionState::Blocked => "blocked — no traffic can leave".to_string(),
             ProtectionState::Portal => "captive portal — protection is relaxed".to_string(),
         }

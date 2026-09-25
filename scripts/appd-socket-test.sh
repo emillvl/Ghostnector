@@ -25,6 +25,7 @@ set -euo pipefail
 APPD="${1:?usage: appd-socket-test.sh <path-to-ghostnector-appd>}"
 APPD="$(cd "$(dirname "$APPD")" && pwd)/$(basename "$APPD")"
 LAUNCHER="$(dirname "$APPD")/ghostnector-appd-launch"
+PROBE="$(dirname "$APPD")/ghostnector-appd-probe"
 
 RUNDIR="/run/ghostnector"
 SOCK="$RUNDIR/appd-test.sock"
@@ -87,6 +88,7 @@ OUTSIDER_GID="$(id -g "$OUTSIDER")"
 LAUNCH_UID="$(id -u "$LAUNCH_USER")"
 LAUNCH_GID="$(id -g "$LAUNCH_USER")"
 [ -x "$LAUNCHER" ] || fail "the launch helper was not found at $LAUNCHER"
+[ -x "$PROBE" ] || fail "the probe was not found at $PROBE"
 
 mkdir -p "$WORK" "$RUNDIR" "$STATE" "$STATE2"
 chmod 0755 "$RUNDIR"
@@ -152,7 +154,7 @@ print(value)' "$1" "$2"
 echo "[1] the socket is owner-only and the peer is checked"
 python3 "$WORK/client.py" "$SOCK" >/dev/null 2>&1 || true
 "$APPD" --socket "$SOCK" --peer-uid "$CORE_UID" --state-dir "$STATE" \
-    --launcher "$LAUNCHER" \
+    --launcher "$LAUNCHER" --probe "$PROBE" \
     --bridge "$BRIDGE" --core "$CORE" --prefix "$PREFIX" --dead-device "$DEAD" \
     >"$WORK/appd.log" 2>&1 &
 APPD_PID=$!
@@ -243,7 +245,30 @@ esac
 note "$ANSWER"
 sysctl -qw "net.ipv4.conf.ghav$ID1.proxy_arp=0"
 
-echo "[5] a shell session inside the group, with every granting capability dropped"
+echo "[5] the fixed probe runs inside the namespace and answers honestly"
+# No checks configured: every check is inconclusive, which is never a pass.
+ANSWER="$(call "{\"verb\":\"probe\",\"id\":$ID1,\"config\":{\"timeout_seconds\":5}}")"
+case "$ANSWER" in
+*'"result":"probed"'*'"outcome":{"outcome":"inconclusive"'*)
+    ok "with nothing configured the probe is inconclusive, never a pass"
+    ;;
+*) fail "the probe did not answer honestly: $ANSWER" ;;
+esac
+note "$ANSWER"
+
+# The helper validates the configuration before the probe is allowed to run.
+ANSWER="$(call "{\"verb\":\"probe\",\"id\":$ID1,\"config\":{\"canary\":{\"name\":\"bad name\",\"expected\":\"203.0.113.9\",\"resolver\":\"127.0.0.1:53\"},\"timeout_seconds\":5}}")"
+case "$ANSWER" in
+*'"code":"invalid_profile"'*) ok "a malformed canary name is refused before the probe runs" ;;
+*) fail "a malformed canary name was accepted: $ANSWER" ;;
+esac
+ANSWER="$(call "{\"verb\":\"probe\",\"id\":$ID1,\"config\":{\"timeout_seconds\":600}}")"
+case "$ANSWER" in
+*'"code":"invalid_profile"'*) ok "an out-of-range probe timeout is refused" ;;
+*) fail "an out-of-range probe timeout was accepted: $ANSWER" ;;
+esac
+
+echo "[6] a shell session inside the group, with every granting capability dropped"
 LAUNCHED="$(call "{\"verb\":\"launch\",\"id\":$ID1,\"user_uid\":$LAUNCH_UID}")"
 case "$LAUNCHED" in
 *'"result":"launched"'*) ok "a session socket was prepared" ;;
@@ -328,7 +353,7 @@ case "$OUTPUT" in
 esac
 ok "the session has its own network and mount namespaces"
 
-echo "[6] destroy is idempotent and revert removes everything"
+echo "[7] destroy is idempotent and revert removes everything"
 call "{\"verb\":\"destroy\",\"id\":$ID2}" >/dev/null
 [ ! -e "/run/netns/ghapp$ID2" ] || fail "the namespace survived destroy"
 call "{\"verb\":\"destroy\",\"id\":$ID2}" >/dev/null
@@ -351,14 +376,14 @@ ip link show "$BRIDGE" >/dev/null 2>&1 && fail "revert left the bridge behind"
     fail "revert left host links behind"
 ok "every namespace, link and the bridge are gone"
 
-echo "[7] the packaged capability set is sufficient, and CAP_SYS_ADMIN is necessary"
+echo "[8] the packaged capability set is sufficient, and CAP_SYS_ADMIN is necessary"
 # Exactly the packaged state: bounding {net_admin, sys_admin, chown}, ambient net_admin only.
 # (A root process's permitted set after exec is its bounding set, which is what setpriv emulates.)
 setpriv --reuid=0 --regid=0 --clear-groups \
     --bounding-set=-all,+net_admin,+sys_admin,+chown \
     --inh-caps +net_admin --ambient-caps +net_admin \
     "$APPD" --socket "$SOCK3" --peer-uid "$CORE_UID" --state-dir "$STATE3" \
-    --launcher "$LAUNCHER" \
+    --launcher "$LAUNCHER" --probe "$PROBE" \
     --bridge "$BRIDGE3" --core "$CORE" --prefix "$PREFIX" --dead-device "$DEAD" \
     >"$WORK/appd3.log" 2>&1 &
 APPD3_PID=$!
@@ -400,7 +425,7 @@ setpriv --reuid=0 --regid=0 --clear-groups \
     --bounding-set=-all,+net_admin,+chown \
     --inh-caps +net_admin --ambient-caps +net_admin \
     "$APPD" --socket "$SOCK2" --peer-uid "$CORE_UID" --state-dir "$STATE2" \
-    --launcher "$LAUNCHER" \
+    --launcher "$LAUNCHER" --probe "$PROBE" \
     --bridge "$BRIDGE2" --core "$CORE" --prefix "$PREFIX" --dead-device "$DEAD" \
     >"$WORK/appd2.log" 2>&1 &
 APPD2_PID=$!

@@ -19,7 +19,6 @@
 set -euo pipefail
 
 TARGET_DIR="${1:?usage: core-app-test.sh <target/debug directory>}"
-NS="gh-core-app"
 RUNDIR="/run/ghostnector"
 BINDIR="/tmp/gh-app-bin"
 WORKDIR="/tmp/gh-core-app"
@@ -41,7 +40,7 @@ cleanup() {
     done
     for ns in ghapp1 ghapp2 ghapp3; do ip netns del "$ns" 2>/dev/null || true; done
     ip link del "$BRIDGE" 2>/dev/null || true
-    ip netns del "$NS" 2>/dev/null || true
+    nft destroy table inet ghostnector 2>/dev/null || true
     rm -rf "$BINDIR" "$WORKDIR" "$RUNDIR/appd.sock" "$RUNDIR/core.sock" "$RUNDIR/netd.sock"
 }
 trap cleanup EXIT
@@ -74,15 +73,16 @@ mkdir -p "$BINDIR" "$WORKDIR" "$RUNDIR"
 install -m 0755 "$TARGET_DIR/ghostnector-netd" "$BINDIR/ghostnector-netd"
 install -m 0755 "$TARGET_DIR/ghostnector-appd" "$BINDIR/ghostnector-appd"
 install -m 0755 "$TARGET_DIR/ghostnector-appd-launch" "$BINDIR/ghostnector-appd-launch"
+install -m 0755 "$TARGET_DIR/ghostnector-appd-probe" "$BINDIR/ghostnector-appd-probe"
 install -m 0755 "$TARGET_DIR/ghostnector-core" "$BINDIR/ghostnector-core"
 install -m 0755 "$TARGET_DIR/ghostnector" "$BINDIR/ghostnector"
 install -m 0755 "$TARGET_DIR/ghostnector-dns" "$BINDIR/ghostnector-dns"
 chmod 0755 "$RUNDIR"
 chown "$CORE_UID" "$RUNDIR" 2>/dev/null || true
 
-ip netns add "$NS"
-ip -n "$NS" link set lo up
-
+# The whole stack runs in the initial network namespace, exactly as in production: `appd` must be
+# able to create and re-enter named namespaces, which only works from the initial namespace. The
+# test owns every object it creates and removes them all in the trap above.
 COOKIE="$WORKDIR/control_auth_cookie"
 head -c 32 /dev/urandom >"$COOKIE"
 chown "$CORE_UID" "$COOKIE"
@@ -91,65 +91,154 @@ printf 'nameserver 192.0.2.53\n' >"$WORKDIR/root/etc/resolv.conf"
 chown -R "$CORE_UID" "$WORKDIR"
 
 cat >"$WORKDIR/fake-tor.py" <<'PY'
-import socket, sys, threading
+"""A stand-in for Tor: control, TransPort, and DNSPort.
 
-port = int(sys.argv[1])
-server = socket.socket()
-server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-server.bind(("127.0.0.1", port))
-server.listen(16)
+It does not relay anywhere: the point of the test is that an APP session reaches *these* listeners
+through the namespace DNAT, with its own source address, and gets an answer back.
+"""
+import json, socket, sys, threading, time
+
+control_port, trans_port, dns_port, core, events = (
+    int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), sys.argv[4], sys.argv[5]
+)
 READY = (
     b"250-status/bootstrap-phase=NOTICE BOOTSTRAP PROGRESS=100 TAG=done SUMMARY=\"Done\"\r\n"
     b"250 OK\r\n"
 )
 
 
-def handle(connection):
-    try:
-        connection.sendall(b"250 OK\r\n")
-        while True:
-            line = b""
-            while not line.endswith(b"\r\n"):
-                chunk = connection.recv(4096)
-                if not chunk:
-                    return
-                line += chunk
-            if line.startswith(b"AUTHENTICATE"):
-                connection.sendall(b"250 OK\r\n")
-            elif line.startswith(b"GETINFO"):
-                connection.sendall(READY)
+def record(kind, **fields):
+    with open(events, "a") as log:
+        log.write(json.dumps({"kind": kind, **fields}) + "\n")
+
+
+def control_server():
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", control_port))
+    server.listen(16)
+
+    def handle(connection):
+        try:
+            connection.sendall(b"250 OK\r\n")
+            while True:
+                line = b""
+                while not line.endswith(b"\r\n"):
+                    chunk = connection.recv(4096)
+                    if not chunk:
+                        return
+                    line += chunk
+                if line.startswith(b"AUTHENTICATE"):
+                    connection.sendall(b"250 OK\r\n")
+                elif line.startswith(b"GETINFO"):
+                    connection.sendall(READY)
+                else:
+                    connection.sendall(b"510 Unrecognized command\r\n")
+        except OSError:
+            pass
+
+    while True:
+        conn, _ = server.accept()
+        threading.Thread(target=handle, args=(conn,), daemon=True).start()
+
+
+def trans_server():
+    # The core address exists only after the helper has created the bridge; wait for it rather than
+    # binding a wildcard. Nothing in this double is reachable except through the namespace DNAT.
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    for _ in range(300):
+        try:
+            server.bind((core, trans_port))
+            break
+        except OSError:
+            time.sleep(0.1)
+    else:
+        record("trans-unbound", address=core)
+        return
+    server.listen(16)
+    while True:
+        conn, peer = server.accept()
+        record("trans", from_address=peer[0], from_port=peer[1])
+        try:
+            conn.settimeout(2)
+            request = b""
+            try:
+                request = conn.recv(4096)
+            except OSError:
+                request = b""
+            if request.startswith(b"GET "):
+                conn.sendall(b"HTTP/1.0 200 OK\r\n\r\n203.0.113.9\n")
             else:
-                connection.sendall(b"510 Unrecognized command\r\n")
-    except OSError:
-        pass
+                conn.sendall(b"tor-ok")
+        except OSError:
+            pass
+        conn.close()
 
 
-while True:
-    conn, _ = server.accept()
-    threading.Thread(target=handle, args=(conn,), daemon=True).start()
+def dns_answer(query):
+    question_end = 12
+    while query[question_end] != 0:
+        question_end += 1 + query[question_end]
+    question_end += 5
+    reply = bytearray(query[:2])
+    reply += bytes([0x81, 0x80])
+    reply += (1).to_bytes(2, "big")
+    reply += (1).to_bytes(2, "big")
+    reply += b"\x00\x00\x00\x00"
+    reply += query[12:question_end]
+    reply += b"\xc0\x0c"
+    reply += (1).to_bytes(2, "big")
+    reply += (1).to_bytes(2, "big")
+    reply += (60).to_bytes(4, "big")
+    reply += (4).to_bytes(2, "big")
+    reply += bytes([203, 0, 113, 9])
+    return bytes(reply)
+
+
+def dns_server():
+    # The relay forwards to loopback; the fake never needs to be reachable from anywhere else.
+    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", dns_port))
+    while True:
+        query, peer = server.recvfrom(4096)
+        record("dns", from_address=peer[0], from_port=peer[1])
+        if len(query) >= 12:
+            server.sendto(dns_answer(query), peer)
+
+
+threading.Thread(target=control_server, daemon=True).start()
+threading.Thread(target=dns_server, daemon=True).start()
+trans_server()
 PY
 
-ip netns exec "$NS" python3 "$WORKDIR/fake-tor.py" "$CONTROL_PORT" >"$WORKDIR/tor.log" 2>&1 &
+: >"$WORKDIR/events.jsonl"
+python3 "$WORKDIR/fake-tor.py" "$CONTROL_PORT" 9040 9053 "$CORE" "$WORKDIR/events.jsonl" \
+    >"$WORKDIR/tor.log" 2>&1 &
 TOR_PID=$!
 sleep 0.3
 
-ip netns exec "$NS" "$BINDIR/ghostnector-netd" \
+"$BINDIR/ghostnector-netd" \
     --socket "$RUNDIR/netd.sock" --peer-uid "$CORE_UID" \
+    --app-bridge "$BRIDGE" --app-core "$CORE" \
     --fallback-path "$WORKDIR/fail-closed.nft" >"$WORKDIR/netd.log" 2>&1 &
 NETD_PID=$!
 for _ in $(seq 1 60); do [ -S "$RUNDIR/netd.sock" ] && break; sleep 0.1; done
 [ -S "$RUNDIR/netd.sock" ] || fail "the firewall helper did not start"
 
-ip netns exec "$NS" "$BINDIR/ghostnector-appd" \
+"$BINDIR/ghostnector-appd" \
     --socket "$RUNDIR/appd.sock" --peer-user "$CORE_USER" \
     --state-dir "$WORKDIR/apps" --launcher "$BINDIR/ghostnector-appd-launch" \
+    --probe "$BINDIR/ghostnector-appd-probe" \
     --bridge "$BRIDGE" --core "$CORE" --prefix "$PREFIX" --dead-device "$DEAD" \
     >"$WORKDIR/appd.log" 2>&1 &
 APPD_PID=$!
 for _ in $(seq 1 60); do [ -S "$RUNDIR/appd.sock" ] && break; sleep 0.1; done
 [ -S "$RUNDIR/appd.sock" ] || fail "the namespace helper did not start"
 
-ip netns exec "$NS" setpriv --reuid="$CORE_UID" --regid="$CORE_GID" --clear-groups \
+setpriv --reuid="$CORE_UID" --regid="$CORE_GID" --clear-groups \
+    --inh-caps +net_bind_service --ambient-caps +net_bind_service \
     "$BINDIR/ghostnector-core" \
     --socket "$RUNDIR/core.sock" --helper "$RUNDIR/netd.sock" \
     --journal "$WORKDIR/intent.json" --resolver-state "$WORKDIR/resolver.json" \
@@ -157,6 +246,9 @@ ip netns exec "$NS" setpriv --reuid="$CORE_UID" --regid="$CORE_GID" --clear-grou
     --services external --tor-cookie "$COOKIE" --tor-control-port "$CONTROL_PORT" \
     --tor-bootstrap-seconds 10 --dns-helper "$BINDIR/ghostnector-dns" \
     --app-socket "$RUNDIR/appd.sock" --app-core "$CORE" \
+    --udp-check 198.51.100.10:9999 --check-url http://198.51.100.10/ \
+    --canary "canary.test@203.0.113.9" --canary-resolver "$CORE:53" \
+    --verify-interval 3 --verify-stale-after 60 --verify-timeout 3 \
     --group "$CORE_USER" \
     >"$WORKDIR/core.log" 2>&1 &
 CORE_PID=$!
@@ -165,7 +257,7 @@ for _ in $(seq 1 60); do [ -S "$RUNDIR/core.sock" ] && break; sleep 0.1; done
 
 # The CLI runs as the launch user, with the control plane's group so it may reach the socket.
 cli() {
-    ip netns exec "$NS" setpriv --reuid="$LAUNCH_UID" --regid="$LAUNCH_GID" \
+    setpriv --reuid="$LAUNCH_UID" --regid="$LAUNCH_GID" \
         --groups "$CORE_GID" \
         "$BINDIR/ghostnector" --socket "$RUNDIR/core.sock" "$@"
 }
@@ -180,27 +272,54 @@ case "$CONNECTED" in
 *"chosen applications"*) ok "the scope is reported as chosen applications" ;;
 *) fail "the scope was not reported: $CONNECTED" ;;
 esac
-ip netns exec "$NS" ip link show "$BRIDGE" >/dev/null 2>&1 ||
+ip link show "$BRIDGE" >/dev/null 2>&1 ||
     fail "the bridge was not created"
-ip netns exec "$NS" nft list table inet ghostnector >/dev/null 2>&1 ||
+nft list table inet ghostnector >/dev/null 2>&1 ||
     fail "the host table was not applied"
 ok "the host table and the bridge exist"
 
-echo "[2] a protected application session runs the command as the user"
+echo "[2] a protected application session runs the command as the user, through Tor"
 LIST="$(cli apps 2>&1)"
 case "$LIST" in
 *"no protected applications"*) ok "nothing is protected yet" ;;
 *) fail "unexpected apps output: $LIST" ;;
 esac
-OUTPUT="$(cli run -- id -u 2>&1)" || { echo "$OUTPUT"; fail "run failed"; }
+
+cat >"$WORKDIR/probe.py" <<'PY'
+import socket
+
+print("uid:" + str(__import__("os").getuid()))
+
+# TCP: any destination is DNAT'ed to the core address, where Tor's TransPort answers.
+connection = socket.socket()
+connection.settimeout(5)
+connection.connect(("198.51.100.10", 80))
+print("tcp:" + connection.recv(16).decode(errors="replace"))
+connection.close()
+
+# DNS: the namespace resolver points at the core address, and the chokepoint forwards to Tor.
+query = bytes([0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0])
+query += b"\x06canary\x04test\x00\x00\x01\x00\x01"
+udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+udp.settimeout(5)
+udp.sendto(query, ("10.232.0.1", 53))
+answer, _ = udp.recvfrom(1024)
+print("dns:" + ".".join(str(byte) for byte in answer[-4:]))
+PY
+
+OUTPUT="$(cli run -- python3 "$WORKDIR/probe.py" 2>&1)" || { echo "$OUTPUT"; fail "run failed"; }
 note "the session said: $OUTPUT"
 case "$OUTPUT" in
-*"$LAUNCH_UID"*) ok "the command ran as uid $LAUNCH_UID inside the namespace" ;;
+*"uid:$LAUNCH_UID"*) ok "the command ran as uid $LAUNCH_UID inside the namespace" ;;
 *) fail "the session did not run as the requesting user: $OUTPUT" ;;
 esac
 case "$OUTPUT" in
-*"$LAUNCH_UID"*"$LAUNCH_GID"*) ok "the session's group is the user's group" ;;
-*) : ;;
+*"tcp:tor-ok"*) ok "TCP reached Tor's transparent proxy through the namespace DNAT" ;;
+*) fail "the protected TCP path did not answer: $OUTPUT" ;;
+esac
+case "$OUTPUT" in
+*"dns:203.0.113.9"*) ok "DNS was answered by Tor's DNSPort through the chokepoint" ;;
+*) fail "the protected DNS path did not answer: $OUTPUT" ;;
 esac
 
 LIST="$(cli apps 2>&1)"
@@ -209,9 +328,37 @@ case "$LIST" in
 *) fail "the application was not listed: $LIST" ;;
 esac
 APP_ID="$(printf '%s\n' "$LIST" | awk '/^  -/ { print $2; exit }')"
+APP_ADDR="$(printf '%s\n' "$LIST" | awk '/^  -/ { print $3; exit }')"
 [ -n "$APP_ID" ] || fail "could not read the application id from: $LIST"
+[ -n "$APP_ADDR" ] || fail "could not read the application address from: $LIST"
 
-echo "[3] stopping one application removes its namespace"
+# Source preservation: Tor saw the application's own address, not the host's and not a rewritten one.
+grep -q "\"kind\": \"trans\", \"from_address\": \"$APP_ADDR\"" "$WORKDIR/events.jsonl" ||
+    { cat "$WORKDIR/events.jsonl"; fail "Tor did not see the application's own source address"; }
+ok "Tor saw the application's source address ($APP_ADDR): no masquerade"
+
+# The chokepoint forwarded the query to Tor's DNSPort from loopback, as designed.
+grep -q '"kind": "dns", "from_address": "127.0.0.1"' "$WORKDIR/events.jsonl" ||
+    { cat "$WORKDIR/events.jsonl"; fail "the chokepoint did not forward the query"; }
+ok "the chokepoint forwarded the query to Tor's DNSPort"
+
+echo "[3] verification runs inside the namespace and is the only route to Protected"
+VERIFIED=""
+for _ in $(seq 1 20); do
+    STATUS="$(cli status 2>&1)"
+    case "$STATUS" in
+    *"protected — and verified"*) VERIFIED=1; break ;;
+    esac
+    sleep 1
+done
+[ -n "$VERIFIED" ] || fail "the state never became verified: $(cli status 2>&1)"
+ok "per-app evidence turned the state into protected-and-verified"
+case "$STATUS" in
+*"the canary resolved as expected"*) ok "the canary check ran inside the namespace" ;;
+*) note "verification details: $STATUS" ;;
+esac
+
+echo "[4] stopping one application removes its namespace"
 cli stop-app "$APP_ID" >/dev/null || fail "stop-app failed"
 LIST="$(cli apps 2>&1)"
 case "$LIST" in
@@ -221,19 +368,48 @@ esac
 [ ! -e "/run/netns/ghapp$APP_ID" ] || fail "the namespace survived stop-app"
 ok "the namespace is gone"
 
-echo "[4] disconnect removes everything and returns to off"
+echo "[5] a tampered namespace blocks the APP scope and removes the namespaces"
+OUTPUT="$(cli run -- python3 "$WORKDIR/probe.py" 2>&1)" || { echo "$OUTPUT"; fail "run failed"; }
+LIST="$(cli apps 2>&1)"
+APP_ID="$(printf '%s\n' "$LIST" | awk '/^  -/ { print $2; exit }')"
+[ -n "$APP_ID" ] || fail "no application to tamper with: $LIST"
+for _ in $(seq 1 20); do
+    case "$(cli status 2>&1)" in
+    *"protected — and verified"*) break ;;
+    esac
+    sleep 1
+done
+note "namespaces before tampering: $(ip netns list 2>&1 | tr '\n' ' ')"
+note "/run/netns: $(ls /run/netns 2>&1 | tr '\n' ' ')"
+ip netns exec "ghapp$APP_ID" nft insert rule inet ghostnector out_filter \
+    meta l4proto tcp counter accept
+BLOCKED=""
+for _ in $(seq 1 20); do
+    STATUS="$(cli status 2>&1)"
+    case "$STATUS" in
+    *"no protected application can reach the network"*) BLOCKED=1; break ;;
+    esac
+    sleep 1
+done
+[ -n "$BLOCKED" ] || fail "the tampered namespace did not block the APP scope: $(cli status 2>&1)"
+ok "the state is blocked with APP-scoped wording"
+[ ! -e "/run/netns/ghapp$APP_ID" ] ||
+    fail "the tampered namespace was not removed"
+ok "the namespace was removed, so no application can reach the network"
+
+echo "[6] disconnect removes everything and returns to off"
 cli disconnect >/dev/null || fail "disconnect failed"
 case "$(cli status 2>&1)" in
 *"traffic is not protected"*) ok "the state is off" ;;
 *) fail "unexpected state after disconnect: $(cli status 2>&1)" ;;
 esac
-ip netns exec "$NS" ip link show "$BRIDGE" >/dev/null 2>&1 &&
+ip link show "$BRIDGE" >/dev/null 2>&1 &&
     fail "the bridge survived disconnect"
-ip netns exec "$NS" nft list table inet ghostnector >/dev/null 2>&1 &&
+nft list table inet ghostnector >/dev/null 2>&1 &&
     fail "the host table survived disconnect"
 ok "the bridge and the host table are gone"
 
-echo "[5] running an application is refused while protection is off"
+echo "[7] running an application is refused while protection is off"
 OUTPUT="$(cli run -- id -u 2>&1)" && fail "run succeeded with protection off: $OUTPUT"
 case "$OUTPUT" in
 *"protection is not on"*) ok "the refusal explains why" ;;

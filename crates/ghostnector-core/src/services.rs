@@ -11,6 +11,7 @@
 //! own Tor (a systemd unit it starts and stops), or the operator can run Tor themselves and have
 //! Ghostnector use it. Neither is a test backdoor: readiness is required either way.
 
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,7 +40,16 @@ pub enum ServiceError {
 /// The services a profile needs.
 pub trait Services: Send + Sync {
     /// Bring up what this profile needs, and wait until it is usable.
-    fn bring_up(&self, profile: ProfileId, ports: Ports) -> Result<(), ServiceError>;
+    ///
+    /// `app_core` is the host-local address APP namespaces reach: when it is present, Tor's
+    /// transparent-proxy and SOCKS listeners move there so the namespace DNAT has somewhere to
+    /// deliver to. It is `None` for every machine-wide profile.
+    fn bring_up(
+        &self,
+        profile: ProfileId,
+        ports: Ports,
+        app_core: Option<Ipv4Addr>,
+    ) -> Result<(), ServiceError>;
     /// Stop whatever this profile needed. Best effort: failing here is a note, not a rollback.
     fn stand_down(&self, profile: ProfileId) -> Result<(), ServiceError>;
     /// Anything the user should know about this profile's services.
@@ -51,7 +61,10 @@ pub trait Services: Send + Sync {
 
 /// Whether a profile needs Tor at all.
 pub fn needs_tor(profile: ProfileId) -> bool {
-    matches!(profile, ProfileId::TorSystem | ProfileId::TorUser)
+    matches!(
+        profile,
+        ProfileId::TorSystem | ProfileId::TorUser | ProfileId::TorApp
+    )
 }
 
 /// The resolver's health cannot be checked yet, and saying so is better than implying it is fine.
@@ -95,13 +108,23 @@ impl SystemdServices {
 }
 
 impl Services for SystemdServices {
-    fn bring_up(&self, profile: ProfileId, ports: Ports) -> Result<(), ServiceError> {
+    fn bring_up(
+        &self,
+        profile: ProfileId,
+        ports: Ports,
+        app_core: Option<Ipv4Addr>,
+    ) -> Result<(), ServiceError> {
         if !needs_tor(profile) {
             return Ok(());
         }
 
-        // The ports the firewall actually redirects into, so the two cannot disagree.
-        let settings = self.template.clone().with_ports(ports);
+        // The ports the firewall actually redirects into, so the two cannot disagree. In APP scope
+        // the transparent proxy and SOCKS move to the core address the namespace DNAT targets;
+        // there is deliberately no wildcard listener.
+        let mut settings = self.template.clone().with_ports(ports);
+        if let Some(core) = app_core {
+            settings = settings.with_app_core(core);
+        }
         let rendered = torrc::render(&settings);
         write_atomic(&self.torrc_path, rendered.as_bytes()).map_err(|error| {
             ServiceError::Config(format!(
@@ -145,7 +168,12 @@ impl ExternalServices {
 }
 
 impl Services for ExternalServices {
-    fn bring_up(&self, profile: ProfileId, _ports: Ports) -> Result<(), ServiceError> {
+    fn bring_up(
+        &self,
+        profile: ProfileId,
+        _ports: Ports,
+        _app_core: Option<Ipv4Addr>,
+    ) -> Result<(), ServiceError> {
         if !needs_tor(profile) {
             return Ok(());
         }
@@ -253,17 +281,47 @@ mod tests {
     }
 
     #[test]
-    fn tor_is_only_needed_for_the_tor_profiles() {
+    fn tor_is_needed_for_every_tor_profile_including_app_scope() {
         assert!(needs_tor(ProfileId::TorSystem));
         assert!(needs_tor(ProfileId::TorUser));
+        assert!(
+            needs_tor(ProfileId::TorApp),
+            "APP scope needs Tor as much as any other Tor scope"
+        );
         for profile in [
             ProfileId::FailClosed,
             ProfileId::DnsLockdown,
-            ProfileId::TorApp,
             ProfileId::I2pIsolated,
         ] {
             assert!(!needs_tor(profile), "{profile:?}");
         }
+    }
+
+    #[test]
+    fn app_scope_writes_the_core_address_into_tors_configuration() {
+        let (address, cookie, _dir) = ready_control(0);
+        let tor = TorControl::new(address, cookie, Duration::from_secs(2));
+        let dir = TempDir::new("app-torrc");
+        let torrc = dir.0.join("torrc");
+        let services = SystemdServices::new(
+            Arc::new(crate::testing::MockSupervisor::new()),
+            tor,
+            "ghostnector-tor.service",
+            &torrc,
+            TorSettings::default(),
+            Duration::from_secs(2),
+        );
+        services
+            .bring_up(
+                ProfileId::TorApp,
+                ports(),
+                Some(std::net::Ipv4Addr::new(10, 200, 0, 1)),
+            )
+            .expect("APP services come up");
+        let text = std::fs::read_to_string(&torrc).expect("torrc");
+        assert!(text.contains("TransPort 10.200.0.1:19040"), "{text}");
+        assert!(text.contains("SocksPort 10.200.0.1:19050"), "{text}");
+        assert!(!text.contains("0.0.0.0"), "{text}");
     }
 
     #[test]
@@ -272,7 +330,9 @@ mod tests {
         let tor = TorControl::new(address, cookie, Duration::from_secs(2));
         let services = ExternalServices::new(tor, Duration::from_secs(2));
 
-        assert!(services.bring_up(ProfileId::TorSystem, ports()).is_ok());
+        assert!(services
+            .bring_up(ProfileId::TorSystem, ports(), None)
+            .is_ok());
         let notes = services.notes(ProfileId::TorSystem);
         assert!(
             notes
@@ -282,7 +342,9 @@ mod tests {
         );
 
         // A profile that does not need Tor is not blocked by Tor's absence.
-        assert!(services.bring_up(ProfileId::FailClosed, ports()).is_ok());
+        assert!(services
+            .bring_up(ProfileId::FailClosed, ports(), None)
+            .is_ok());
     }
 
     #[test]

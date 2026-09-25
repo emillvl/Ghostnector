@@ -107,6 +107,7 @@ fn answer_kind(answer: &AppResponse) -> &'static str {
         AppResponse::Inspected { .. } => "inspection",
         AppResponse::Verified { .. } => "verification",
         AppResponse::Launched { .. } => "session",
+        AppResponse::Probed { .. } => "probe",
         AppResponse::Report(_) => "report",
         AppResponse::Error(_) => "error",
     }

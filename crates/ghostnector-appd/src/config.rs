@@ -19,6 +19,10 @@ pub const DEFAULT_IP: &str = "/usr/sbin/ip";
 pub const DEFAULT_BRIDGE_CTL: &str = "/usr/sbin/bridge";
 /// Default path of the privilege-dropping launch helper.
 pub const DEFAULT_LAUNCHER: &str = "/usr/libexec/ghostnector-appd-launch";
+/// Default path of the fixed verification probe.
+pub const DEFAULT_PROBE: &str = "/usr/libexec/ghostnector-appd-probe";
+/// Default unprivileged user the probe runs as.
+pub const DEFAULT_PROBE_USER: &str = "nobody";
 /// Default state directory: the registry and one directory per group.
 pub const DEFAULT_STATE_DIR: &str = "/run/ghostnector/apps";
 
@@ -37,6 +41,10 @@ pub struct Config {
     pub bridge_ctl: PathBuf,
     /// Absolute path to the privilege-dropping launch helper.
     pub launcher: PathBuf,
+    /// Absolute path to the fixed verification probe.
+    pub probe: PathBuf,
+    /// The unprivileged user the probe runs as.
+    pub probe_user: String,
     /// Where the registry and per-group files live.
     pub state_dir: PathBuf,
     /// The bridge carrying app links.
@@ -103,6 +111,8 @@ OPTIONS:
     --ip <PATH>            network tool               [default: /usr/sbin/ip]
     --bridge-ctl <PATH>    bridge control tool        [default: /usr/sbin/bridge]
     --launcher <PATH>      privilege-drop helper     [default: /usr/libexec/ghostnector-appd-launch]
+    --probe <PATH>         verification probe        [default: /usr/libexec/ghostnector-appd-probe]
+    --probe-user <NAME>    user the probe runs as    [default: nobody]
     --state-dir <PATH>     registry and per-group files
                                            [default: /run/ghostnector/apps]
     --bridge <NAME>        bridge carrying app links  [default: ghbr0]
@@ -125,6 +135,8 @@ OPTIONS:
         let mut ip = PathBuf::from(DEFAULT_IP);
         let mut bridge_ctl = PathBuf::from(DEFAULT_BRIDGE_CTL);
         let mut launcher = PathBuf::from(DEFAULT_LAUNCHER);
+        let mut probe = PathBuf::from(DEFAULT_PROBE);
+        let mut probe_user = DEFAULT_PROBE_USER.to_string();
         let mut state_dir = PathBuf::from(DEFAULT_STATE_DIR);
         let mut bridge = app::DEFAULT_APP_BRIDGE.to_string();
         let mut core = app::DEFAULT_APP_CORE_ADDRESS;
@@ -152,6 +164,34 @@ OPTIONS:
                 "--ip" => ip = absolute(&option, &value()?)?,
                 "--bridge-ctl" => bridge_ctl = absolute(&option, &value()?)?,
                 "--launcher" => launcher = absolute(&option, &value()?)?,
+                "--probe" => probe = absolute(&option, &value()?)?,
+                "--probe-user" => {
+                    let name = value()?;
+                    if name.is_empty()
+                        || name.len() > 32
+                        || !name
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+                    {
+                        return Err(ConfigError::Invalid {
+                            option: option.clone(),
+                            reason: "expected a user name of up to 32 characters".to_string(),
+                        });
+                    }
+                    if nix::unistd::User::from_name(&name)
+                        .map_err(|error| ConfigError::Invalid {
+                            option: option.clone(),
+                            reason: error.to_string(),
+                        })?
+                        .is_none()
+                    {
+                        return Err(ConfigError::Invalid {
+                            option: option.clone(),
+                            reason: format!("there is no user called '{name}'"),
+                        });
+                    }
+                    probe_user = name;
+                }
                 "--state-dir" => state_dir = absolute(&option, &value()?)?,
                 "--peer-uid" => {
                     let raw = value()?;
@@ -278,6 +318,8 @@ OPTIONS:
             ip,
             bridge_ctl,
             launcher,
+            probe,
+            probe_user,
             state_dir,
             bridge,
             core,
@@ -350,6 +392,11 @@ mod tests {
             config.launcher,
             PathBuf::from("/usr/libexec/ghostnector-appd-launch")
         );
+        assert_eq!(
+            config.probe,
+            PathBuf::from("/usr/libexec/ghostnector-appd-probe")
+        );
+        assert_eq!(config.probe_user, "nobody");
     }
 
     #[test]

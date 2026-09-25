@@ -287,15 +287,11 @@ observation is marked **closed**, with the case that closed it; a gap that chang
 | G12 | **New, availability.** A transient loss of connectivity can leave the machine `Blocked` until a person acts, because a verification failure is answered with the fail-closed baseline (observed in AN-1). This is deliberate, and it is a cost rather than a leak. | PC-06, PC-14 |
 | G13 | **New, residual.** The exemption list is derived from the rules that cite it and the invariant checker refuses an accept citing no listed exemption, but a one-by-one kernel-versus-report diff is not executed end to end. | PC-09 |
 
-## APP scope (M8): planned claims and their falsifiers
+## APP scope (M8): what was demonstrated
 
-This section is an **agenda, not evidence**. Nothing here is verified until the M8 campaign records
-the observation; until then these entries follow the same rule as every other unverified property in
-this document: not claimed, not passing.
-
-The APP scope is the second, stronger mode in the review's §3.4: each protected application runs in
-its own namespace whose default route terminates on a dead-end local `dummy` device, and the only
-mechanism that makes a destination reachable is a netns-local DNAT to the host-local core address.
+The APP scope is the review's second, stronger mode: each protected application runs in its own
+namespace whose default route terminates on a dead-end local `dummy` device, and the only mechanism
+that makes a destination reachable is a netns-local DNAT to the host-local core address.
 
 > The APP namespace has no route capable of carrying application traffic to an external network.
 > Its default route terminates on a dead-end local dummy interface. Netns-local DNAT is the only
@@ -304,29 +300,36 @@ mechanism that makes a destination reachable is a netns-local DNAT to the host-l
 > If the APP DNAT/ruleset disappears or is invalid, application traffic dies locally without
 > reaching the host veth, ARP/NDP, the host forwarding path, or an external network.
 
-| Claim | What it will say | Falsifier |
-|---|---|---|
-| **PC-17** | An application in a protected namespace reaches the clearnet only through the core address and Tor. No packet from its application address reaches an independent boundary except through the conduit. | Any packet from the application address observed outside the conduit |
-| **PC-18** | The dead-end property holds: with the namespace DNAT removed or invalid, the application's traffic dies locally and is not observable on the host veth, in ARP/NDP, or at any boundary. | One frame of application traffic on the host link, one ARP/NDP query caused by it, or one packet at a boundary while APP protection is reported |
-| **PC-19** | Source identity is preserved: Tor sees each application's own address as the Application Address, and no masquerade/SNAT exists anywhere on the path. | Two protected groups presented to Tor as the same source identity; a `masquerade`/`snat` rule in the host or namespace ruleset; the core or host address appearing as an application's source at Tor |
-| **PC-20** | DNS from inside an APP namespace reaches only the chokepoint (port 53, DNAT'ed to the core address), and an answer can only come from the configured upstream. | A port-53 datagram from the application address at a boundary; an answer from a resolver other than the chokepoint |
-| **PC-21** | Disconnect, panic and explicit stop destroy every namespace, veth, bridge port and ruleset; nothing stale remains and no app keeps a path. | One registered namespace still usable after teardown, or one leftover Ghostnector APP object |
-| update to **PC-05** | In APP scope IPv6 is absent by construction (no address, no route, disabled in-netns), so the denial is structural rather than a rule. | An IPv6 packet from an application address at a boundary |
-| update to **PC-08/PC-16** | The APP namespace's effective ruleset and shape are compared against what the helper installed, so a change no probe traverses is still detected. | A changed namespace ruleset, route table, address set or sysctl unnoticed for longer than one interval plus timeout |
+| Claim | What it says | Evidence | Falsifier |
+|---|---|---|---|
+| **PC-17** | An application in a protected namespace reaches the network only through the core address and Tor. | `core-app-test.sh`: a session's TCP is DNAT'ed to the core address and answered by Tor's TransPort; the APP host table admits only the app link to the core listeners (`app-policy-test.sh`); AA-3 shows an injected route creates no direct path | Any packet from the application address observed outside the conduit |
+| **PC-18** | The dead-end property holds: with the DNAT gone the application's traffic dies locally and is not observable on the host link. | `app-topology-test.sh` (no packet, no ARP, no host involvement with the DNAT removed; the rendered ruleset behaves the same in `app-policy-test.sh`); AA-1 and AA-12 (removed/flushed namespace policy is noticed and the APP scope denied) | One frame of application traffic on the host link, or one packet at a boundary while APP protection is reported |
+| **PC-19** | Source identity is preserved: Tor sees each application's own address, and no masquerade/SNAT exists anywhere on the path. | `core-app-test.sh`: Tor's TransPort saw the application's address (`10.232.0.2`); AA-6/AA-9: two applications presented distinct addresses and no masquerade rule existed; the IR has no source-rewriting verdict and the renderer test refuses `masquerade`/`snat`; AA-2: an injected masquerade rule is noticed and the APP scope denied | Two protected groups presented to Tor as the same source identity; a masquerade/SNAT rule in force; the core or host address appearing as an application's source at Tor |
+| **PC-20** | DNS from inside an APP namespace reaches only the chokepoint, and an answer can only come from the configured upstream. | `core-app-test.sh`: the session's resolver is the chokepoint, and its query was answered by Tor's DNSPort through the relay; AA-10: a query to a foreign resolver was answered by the chokepoint and **no query from an application address reached the resolver directly** | A port-53 datagram from the application address at a boundary; an answer from a resolver other than the chokepoint |
+| **PC-21** | Disconnect, panic and stop destroy every namespace, veth, bridge port and ruleset. | `core-app-test.sh` (stop-app, disconnect: namespaces, bridge and table gone); `appd-socket-test.sh` (destroy idempotent, revert removes everything); AA-7 (panic with applications running removes every namespace) | One registered namespace still usable after teardown, or one leftover Ghostnector APP object |
+| update to **PC-05** | In APP scope IPv6 is absent by construction: no address, no route, and `disable_ipv6=1`, checked on every verification pass. | `appd-socket-test.sh` step 3 (the namespace's IPv6 is disabled); the shape check refuses a namespace where it is not; `app-policy-test.sh` proves the namespace ruleset carries no IPv6 path | An IPv6 packet from an application address at a boundary |
+| update to **PC-08/PC-16** | The APP namespace's effective ruleset and shape are compared against what the helper installed, so a change no probe traverses is still detected. | `appd-socket-test.sh` (a changed ruleset and a changed `proxy_arp` are both reported); AA-12 (flushed ruleset), AA-4 (proxy ARP), AA-5 (extra interface), AA-1 (namespace removed), AA-2 (host table tampered) each deny the APP scope within the verification window | A changed namespace ruleset, route table, address set or sysctl unnoticed for longer than one interval plus timeout |
 
-Two boundaries on the reading, kept here so they cannot blur later:
+Two boundaries on the reading, kept here so they cannot blur:
 
 - **Distinct source addresses are not proof of distinct Tor circuits.** PC-19 claims the identity
-  Ghostnector supplies to Tor. Whether Tor maps that to different circuits is Tor's own
-  behaviour and needs Tor/external evidence; it is not claimed by this document.
+  Ghostnector supplies to Tor. Whether Tor maps that to different circuits is Tor's own behaviour
+  and needs Tor/external evidence; it is not claimed by this document.
 - **`Blocked` in APP scope is scoped.** It means the protected applications cannot reach the
   network. It does not claim the whole machine is denied unless a machine-wide state really denies
-  it. Zero protected applications can never produce `Protected`; the state is `Degraded` with an
-  explicit reason until at least one application has passing evidence.
+  it. Zero protected applications can never produce `Protected`: the state is `Degraded` with the
+  explicit reason "APP protection is configured, but no application currently has verification
+  evidence" until at least one application has passing evidence (`app_protection_is_never_claimed_without_per_app_evidence`).
 
-The preconditions this section depends on were fixed in M8.0 before any APP code: the chokepoint
-listens on the port an address-only `nameserver` line implies (defect D-22), and the dead-end
-topology is pinned against the real kernel by `scripts/app-topology-test.sh`.
+### APP gaps and narrowings (M8 qualification)
+
+| # | Gap | Claim |
+|---|---|---|
+| GA-1 | The adversarial suite has no independent boundary outside the host: the fake Tor stands in for the network, so "nothing crossed" is observed at the host link and at the fake endpoints, not at an ISP-facing vantage (the SYSTEM-scope G8 remains open for APP too). | PC-17, PC-20 |
+| GA-2 | Distinct Tor circuits are not demonstrated; only distinct source identities are (Tor's behaviour needs Tor/external evidence). | PC-19 |
+| GA-3 | PC-07 for APP is narrower than for SYSTEM: the probe compares the reported exit address against the namespace's own addresses and the core address, not against every host interface. | PC-07 |
+| GA-4 | Reboot/reconcile of APP intent is covered by unit tests (adopt as `Degraded`, refresh from the registry) and by the conservative machine-wide boot guard, not by an end-to-end reboot run. | PC-10, PC-16 |
+| GA-5 | `Protected` in APP scope still requires at least one configured check to pass (G9 applies unchanged): with no check endpoints configured, every group is inconclusive and the state stays `Degraded`. | definition of `Protected` |
 
 ## What RC1 got wrong, and what M7 changed
 

@@ -18,6 +18,10 @@ path = "src/main.rs"
 name = "ghostnector-appd-launch"
 path = "src/bin/launch.rs"
 
+[[bin]]
+name = "ghostnector-appd-probe"
+path = "src/bin/probe.rs"
+
 [dependencies]
 ghostnector-spec = { path = "../ghostnector-spec" }
 ghostnector-policy = { path = "../ghostnector-policy" }

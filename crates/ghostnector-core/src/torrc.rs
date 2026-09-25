@@ -35,6 +35,10 @@ pub struct TorSettings {
     pub cookie_path: PathBuf,
     /// Whether to enable Tor's own seccomp sandbox.
     pub sandbox: bool,
+    /// The host-local APP core address. When set, the transparent proxy and SOCKS listeners move
+    /// there so an APP namespace's DNAT has somewhere to deliver; the DNS and control listeners
+    /// stay on loopback. `None` keeps every listener on loopback (the machine-wide profiles).
+    pub app_core: Option<std::net::Ipv4Addr>,
 }
 
 impl Default for TorSettings {
@@ -49,6 +53,7 @@ impl Default for TorSettings {
             data_directory: PathBuf::from("/var/lib/tor"),
             cookie_path: PathBuf::from("/run/ghostnector/tor-control.cookie"),
             sandbox: true,
+            app_core: None,
         }
     }
 }
@@ -62,6 +67,16 @@ impl TorSettings {
     pub fn with_ports(mut self, ports: Ports) -> Self {
         self.trans_port = ports.trans;
         self.socks_port = ports.socks;
+        self
+    }
+
+    /// Move the transparent proxy and SOCKS listeners to the APP core address.
+    ///
+    /// This is what makes an APP session usable: the namespace's DNAT delivers to `core:trans`, and
+    /// the core address exists only on the host's private bridge. The DNS and control listeners stay
+    /// on loopback; there is no wildcard bind in either mode.
+    pub fn with_app_core(mut self, core: std::net::Ipv4Addr) -> Self {
+        self.app_core = Some(core);
         self
     }
 }
@@ -78,16 +93,25 @@ pub fn render(settings: &TorSettings) -> String {
     out.push_str("ClientOnly 1\n\n");
 
     out.push_str(
-        "# Transparent proxying. The listeners are loopback-only, because the firewall's redirect\n\
-         # targets 127.0.0.1 and the input chain drops anything arriving for these ports from\n\
-         # off-host. SOCKS keeps a per-credential circuit, which is how a browser profile gets its\n\
-         # own circuits without this file knowing about it.\n",
+        "# Transparent proxying. The listeners are loopback-only in the machine-wide profiles,\n\
+         # because the firewall's redirect targets 127.0.0.1 and the input chain drops anything\n\
+         # arriving for these ports from off-host. In APP scope they move to the private core\n\
+         # address that app namespaces DNAT to; never a wildcard. SOCKS keeps a per-credential\n\
+         # circuit, which is how a browser profile gets its own circuits without this file knowing\n\
+         # about it.\n",
     );
+    let proxy_address = match settings.app_core {
+        Some(core) => core.to_string(),
+        None => "127.0.0.1".to_string(),
+    };
     out.push_str(&format!(
-        "SocksPort 127.0.0.1:{} IsolateSOCKSAuth KeepAliveIsolateSOCKSAuth\n",
+        "SocksPort {proxy_address}:{} IsolateSOCKSAuth KeepAliveIsolateSOCKSAuth\n",
         settings.socks_port
     ));
-    out.push_str(&format!("TransPort 127.0.0.1:{}\n", settings.trans_port));
+    out.push_str(&format!(
+        "TransPort {proxy_address}:{}\n",
+        settings.trans_port
+    ));
     out.push_str(&format!("DNSPort 127.0.0.1:{}\n\n", settings.dns_port));
 
     out.push_str(
@@ -151,18 +175,26 @@ mod tests {
     }
 
     #[test]
-    fn every_listener_is_loopback_only() {
+    fn every_listener_is_loopback_only_unless_app_scope_moves_the_proxies() {
         let text = rendered();
         assert!(text.contains("SocksPort 127.0.0.1:9050"), "{text}");
         assert!(text.contains("TransPort 127.0.0.1:9040"), "{text}");
         assert!(text.contains("DNSPort 127.0.0.1:9053"), "{text}");
         assert!(text.contains("ControlPort 127.0.0.1:9051"), "{text}");
-        for line in text.lines().filter(|line| line.contains("Port ")) {
+        assert!(!text.contains("0.0.0.0"), "{text}");
+
+        // APP scope: the proxies move to the private core address; DNS and control stay loopback.
+        let app = render(&settings().with_app_core(std::net::Ipv4Addr::new(10, 200, 0, 1)));
+        assert!(app.contains("SocksPort 10.200.0.1:9050"), "{app}");
+        assert!(app.contains("TransPort 10.200.0.1:9040"), "{app}");
+        assert!(app.contains("DNSPort 127.0.0.1:9053"), "{app}");
+        assert!(app.contains("ControlPort 127.0.0.1:9051"), "{app}");
+        assert!(!app.contains("0.0.0.0"), "{app}");
+        for line in app.lines().filter(|line| line.contains("Port ")) {
             assert!(
-                line.contains("127.0.0.1"),
-                "a listener is not loopback-only: {line}"
+                line.contains("127.0.0.1") || line.contains("10.200.0.1"),
+                "a listener is neither loopback nor the core address: {line}"
             );
-            assert!(!line.contains("0.0.0.0"), "{line}");
         }
     }
 
@@ -250,6 +282,7 @@ mod tests {
             data_directory: PathBuf::from("/tmp/tor-data"),
             cookie_path: PathBuf::from("/tmp/tor-cookie"),
             sandbox: false,
+            app_core: None,
         });
         for expected in [
             "TransPort 127.0.0.1:19040",

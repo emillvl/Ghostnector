@@ -176,7 +176,9 @@ OPTIONS:
         let helper = Helper::new(config.helper.clone());
         let services = build_services(&config)?;
         let relay: Arc<dyn DnsRelay> = Arc::new(
-            ChildRelay::new(config.dns_helper.clone()).map_err(|error| error.to_string())?,
+            ChildRelay::new(config.dns_helper.clone())
+                .map_err(|error| error.to_string())?
+                .with_app_core(config.app_core),
         );
         let commands: Arc<dyn CommandRunner> = Arc::new(SystemCommands);
         let app_helper: Arc<dyn AppHelperLink> =

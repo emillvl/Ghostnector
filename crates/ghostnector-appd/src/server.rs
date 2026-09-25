@@ -23,7 +23,10 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ghostnector_policy::canonical_kernel_ruleset;
-use ghostnector_spec::appd::{AppEntry, AppReport, AppResponse, AppVerb, APP_PROTOCOL_VERSION};
+use ghostnector_spec::appd::{
+    AppEntry, AppReport, AppResponse, AppVerb, CheckStatus, ProbeConfig, ProbeOutcome,
+    APP_PROTOCOL_VERSION,
+};
 use ghostnector_spec::backend::Ports;
 use ghostnector_spec::ipc::{ErrorBody, ErrorCode};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
@@ -156,6 +159,10 @@ impl<B: Namespaces + 'static> Server<B> {
             },
             AppVerb::Launch { id, user_uid } => match self.launch(id, user_uid, peer_uid) {
                 Ok((entry, socket)) => AppResponse::Launched { entry, socket },
+                Err(body) => AppResponse::Error(body),
+            },
+            AppVerb::Probe { id, config } => match self.probe(id, config, peer_uid) {
+                Ok((outcome, details)) => AppResponse::Probed { outcome, details },
                 Err(body) => AppResponse::Error(body),
             },
             AppVerb::ReportRegistry => AppResponse::Report(self.report()),
@@ -572,6 +579,133 @@ impl<B: Namespaces + 'static> Server<B> {
             },
             socket_path.display().to_string(),
         ))
+    }
+
+    /// Run the fixed verification probe inside a group and turn its verdicts into one outcome.
+    fn probe(
+        &self,
+        id: u32,
+        mut config: ProbeConfig,
+        peer_uid: u32,
+    ) -> Result<(ProbeOutcome, Vec<String>), ErrorBody> {
+        let record = self
+            .registry
+            .get(id)
+            .ok_or_else(|| self.problem(ErrorCode::UnsafeState, format!("no group {id}")))?;
+        self.require_owner(&record, peer_uid)?;
+        if !self
+            .backend
+            .group_present(id)
+            .map_err(|error| self.backend_problem(error))?
+        {
+            return Err(self.problem(
+                ErrorCode::UnsafeState,
+                "the namespace or its link is missing".to_string(),
+            ));
+        }
+        // The core address is the helper's own, never the client's.
+        config.core = Some(self.config.core);
+        self.validate_probe_config(&config)?;
+
+        let user = User::from_name(&self.config.probe_user)
+            .map_err(|error| self.problem(ErrorCode::Internal, error.to_string()))?
+            .ok_or_else(|| {
+                self.problem(
+                    ErrorCode::UnsafeState,
+                    format!("the probe user '{}' does not exist", self.config.probe_user),
+                )
+            })?;
+        if user.uid.as_raw() == 0 {
+            return Err(self.problem(
+                ErrorCode::UnsafeState,
+                "the probe user must not be root".to_string(),
+            ));
+        }
+
+        let verdicts = self
+            .backend
+            .probe(id, user.uid.as_raw(), &config)
+            .map_err(|error| self.backend_problem(error))?;
+
+        let mut details = Vec::new();
+        let mut failure: Option<String> = None;
+        let mut passed = 0usize;
+        for verdict in &verdicts {
+            let label = match verdict.status {
+                CheckStatus::Passed => {
+                    passed += 1;
+                    "ok"
+                }
+                CheckStatus::Failed => {
+                    if failure.is_none() {
+                        failure = Some(verdict.detail.clone());
+                    }
+                    "failed"
+                }
+                CheckStatus::Inconclusive => "unknown",
+            };
+            details.push(format!("{label}: {}", verdict.detail));
+        }
+        let outcome = if let Some(reason) = failure {
+            ProbeOutcome::Failed { reason }
+        } else if passed == 0 {
+            ProbeOutcome::Inconclusive {
+                reason: "no check could reach a conclusion".to_string(),
+            }
+        } else {
+            ProbeOutcome::Passed
+        };
+        Ok((outcome, details))
+    }
+
+    /// The probe configuration is the operator's own verification settings, but the helper still
+    /// refuses anything that is not a bounded endpoint: a caller cannot smuggle a name, a path, or
+    /// a control character into a process this helper starts.
+    fn validate_probe_config(&self, config: &ProbeConfig) -> Result<(), ErrorBody> {
+        if config.timeout_seconds == 0 || config.timeout_seconds > 60 {
+            return Err(self.problem(
+                ErrorCode::InvalidProfile,
+                "the probe timeout must be between 1 and 60 seconds".to_string(),
+            ));
+        }
+        if let Some(http) = &config.http {
+            if http.host.is_empty()
+                || http.host.len() > 253
+                || !http
+                    .host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+            {
+                return Err(self.problem(
+                    ErrorCode::InvalidProfile,
+                    "the check endpoint's host is not a plain host name".to_string(),
+                ));
+            }
+            if !http.path.starts_with('/')
+                || http.path.len() > 512
+                || http.path.chars().any(char::is_control)
+            {
+                return Err(self.problem(
+                    ErrorCode::InvalidProfile,
+                    "the check endpoint's path must be a bounded absolute path".to_string(),
+                ));
+            }
+        }
+        if let Some(canary) = &config.canary {
+            if canary.name.is_empty()
+                || canary.name.len() > 253
+                || !canary
+                    .name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+            {
+                return Err(self.problem(
+                    ErrorCode::InvalidProfile,
+                    "the canary name is not a plain name".to_string(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn revert(&self) -> Result<AppReport, ErrorBody> {

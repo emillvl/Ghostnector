@@ -22,8 +22,10 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use ghostnector_spec::app::{APP_LINK_PREFIX, APP_NETNS_PREFIX, MAX_APP_GROUPS};
+use ghostnector_spec::appd::{CheckVerdict, ProbeConfig};
 use ghostnector_spec::backend::Ports;
 use nix::sched::{setns, CloneFlags};
 
@@ -137,6 +139,13 @@ pub trait Namespaces: Send + Sync {
     fn destroy(&self, id: u32) -> Result<(), BackendError>;
     /// The kernel's own report of the namespace's ruleset, or an empty string when absent.
     fn applied_policy(&self, id: u32) -> Result<String, BackendError>;
+    /// Run the fixed verification probe inside one group, as an unprivileged user.
+    fn probe(
+        &self,
+        id: u32,
+        uid: u32,
+        config: &ProbeConfig,
+    ) -> Result<Vec<CheckVerdict>, BackendError>;
     /// Everything about the namespace's shape that differs from what was installed. Empty means the
     /// shape is exactly right.
     fn shape_problems(&self, request: &GroupRequest) -> Result<Vec<String>, BackendError>;
@@ -148,6 +157,7 @@ pub struct SystemNamespaces {
     nft: PathBuf,
     ip: PathBuf,
     bridge_ctl: PathBuf,
+    probe: PathBuf,
     bridge: String,
     core: Ipv4Addr,
     prefix: u8,
@@ -161,6 +171,7 @@ impl SystemNamespaces {
         nft: PathBuf,
         ip: PathBuf,
         bridge_ctl: PathBuf,
+        probe: PathBuf,
         bridge: String,
         core: Ipv4Addr,
         prefix: u8,
@@ -168,10 +179,12 @@ impl SystemNamespaces {
         check_tool(&nft)?;
         check_tool(&ip)?;
         check_tool(&bridge_ctl)?;
+        check_tool(&probe)?;
         Ok(Self {
             nft,
             ip,
             bridge_ctl,
+            probe,
             bridge,
             core,
             prefix,
@@ -517,6 +530,91 @@ impl Namespaces for SystemNamespaces {
                 Ok(listing) => Ok(listing),
                 Err(BackendError::Command { .. }) => Ok(String::new()),
                 Err(error) => Err(error),
+            }
+        })
+    }
+
+    fn probe(
+        &self,
+        id: u32,
+        uid: u32,
+        config: &ProbeConfig,
+    ) -> Result<Vec<CheckVerdict>, BackendError> {
+        let name = netns_name(id)?;
+        if !Path::new(&format!("{NETNS_DIR}/{name}")).exists() {
+            return Err(BackendError::Refused(
+                "the namespace is missing".to_string(),
+            ));
+        }
+        let encoded = serde_json::to_vec(config).map_err(|error| BackendError::Io {
+            path: self.probe.clone(),
+            reason: error.to_string(),
+        })?;
+        let mut child = Command::new(&self.probe)
+            .arg("--id")
+            .arg(id.to_string())
+            .arg("--uid")
+            .arg(uid.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| BackendError::Io {
+                path: self.probe.clone(),
+                reason: error.to_string(),
+            })?;
+        {
+            let mut stdin = child.stdin.take().ok_or_else(|| BackendError::Io {
+                path: self.probe.clone(),
+                reason: "the probe did not accept input".to_string(),
+            })?;
+            stdin
+                .write_all(&encoded)
+                .map_err(|error| BackendError::Io {
+                    path: self.probe.clone(),
+                    reason: error.to_string(),
+                })?;
+        }
+
+        // A probe that hangs must not hold the helper: the budget is the check timeout plus slack.
+        let deadline = Instant::now()
+            + Duration::from_secs(config.timeout_seconds.clamp(1, 60).saturating_add(10));
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(BackendError::Refused(
+                        "the probe did not finish within its budget".to_string(),
+                    ));
+                }
+                Err(error) => {
+                    return Err(BackendError::Io {
+                        path: self.probe.clone(),
+                        reason: error.to_string(),
+                    })
+                }
+            }
+        }
+
+        let output = child.wait_with_output().map_err(|error| BackendError::Io {
+            path: self.probe.clone(),
+            reason: error.to_string(),
+        })?;
+        if !output.status.success() {
+            return Err(BackendError::Command {
+                tool: self.probe.display().to_string(),
+                reason: describe_failure(&output.stderr, output.status.code()),
+            });
+        }
+        serde_json::from_slice::<Vec<CheckVerdict>>(&output.stdout).map_err(|error| {
+            BackendError::Command {
+                tool: self.probe.display().to_string(),
+                reason: format!("the probe's answer was unreadable: {error}"),
             }
         })
     }
