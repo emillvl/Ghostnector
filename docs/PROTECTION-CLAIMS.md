@@ -331,6 +331,31 @@ Two boundaries on the reading, kept here so they cannot blur:
 | GA-4 | Reboot/reconcile of APP intent is covered by unit tests (adopt as `Degraded`, refresh from the registry) and by the conservative machine-wide boot guard, not by an end-to-end reboot run. | PC-10, PC-16 |
 | GA-5 | `Protected` in APP scope still requires at least one configured check to pass (G9 applies unchanged): with no check endpoints configured, every group is inconclusive and the state stays `Degraded`. | definition of `Protected` |
 
+## I2P scope (M9): what was demonstrated
+
+I2P is an independent, machine-wide network. There is no transparent-proxy equivalent, so the claim
+is worded exactly: **clearnet egress is denied, and I2P is reachable only through the router's local
+proxies**. Tor and I2P are alternatives, never layers: the validator refuses a request that enables
+both, and an I2P ruleset that cited any exemption other than the router's own uid is refused by the
+invariant checker.
+
+| Claim | What it says | Evidence | Falsifier |
+|---|---|---|---|
+| **PC-22** | I2P is independent: no mixed-network configuration exists, and the I2P ruleset carries exactly the router's own exemption plus DHCP — no Tor uid, no application identity, and no redirect at all. | `i2p-adversarial.sh`: the kernel table under I2P has no `out_nat` and exempts only the router's uid; the transition case shows the router's exemption is absent under the fail-closed baseline and returns only with I2P; unit tests refuse `MixedNetworks`, `I2pNeedsSystemScope`, `I2pWithLan`, a foreign exemption, and any NAT chain in an I2P ruleset | A Tor/APP exemption in force under I2P, both networks enabled at once, or a redirect claimed by an I2P policy |
+| **PC-23** | Every flow that is not the router's own is denied: an ordinary identity cannot reach the network over TCP or UDP, observed at the far end. | `i2p-adversarial.sh` (IA-1/IA-2): TCP refused and UDP refused, with **zero packets and zero connections at the far side**; the router's own uid does reach it (the exemption works); `policy-netns-test.sh` against the kernel: non-router uid blocked with zero packets, router uid allowed | One packet from a non-router identity at the boundary while I2P is reported |
+| **PC-24** | Applications reach I2P only through the router's loopback proxies, and those proxies are closed to the network. | `i2p-adversarial.sh` (IA-6): a connection from the far side to the HTTP proxy is refused; the `i2pd.conf` renderer refuses a wildcard bind and the extra control surfaces (console, SAM, UPnP, outproxy) | A proxy reachable from off-host, or a proxy bound to anything but loopback |
+| **PC-25** | I2P `Protected` requires evidence: clearnet TCP refused, the proxy answering, and the configured canary fetched through the proxy. Without a canary the state stays `Degraded`; a spoofed canary or a dead router alarms and the fail-closed baseline replaces the policy. | `i2p-adversarial.sh`: the canary through the proxy is what turns the state verified; the spoofed canary and the killed router each produce the fail-closed baseline; unit tests: `NoI2pEvidence` can never pass, a missing canary is inconclusive, a wrong answer and a dead proxy are alarms | `Protected` with no passing canary; a contradiction that does not apply the baseline |
+| **PC-26** | Disconnect removes the policy and the exemption, and the interface never names a destination or a boundary address. | `i2p-adversarial.sh` (IA-10 and teardown): `status` names neither the canary host nor the boundary address; disconnect leaves no table; panic removes the router's exemption (observed at the boundary) | A destination or address in the interface, or a surviving exemption after teardown |
+
+### I2P gaps and narrowings (M9 qualification)
+
+| # | Gap | Claim |
+|---|---|---|
+| GI-1 | The hermetic suite uses a fake router: it proves the product machinery and the policy with the router's real uid, not `i2pd`'s own behaviour. The separate real-`i2pd` qualification run (M9.5) is required before the freeze, and the claims state which run proved what (M9 decision 3). | PC-22…PC-26 |
+| GI-2 | Public I2P network integration (reseeding, peers, tunnels) is not claimed by the hermetic suite; the canary is local. | PC-25 |
+| GI-3 | APP+I2P is refused in M9; per-application I2P needs a conduit that does not exist yet. | PC-22 |
+| GI-4 | The `Protected` definition's G9 rule applies: with no canary configured, an I2P profile stays `Degraded` by construction. | definition of `Protected` |
+
 ## What RC1 got wrong, and what M7 changed
 
 RC1 (`v1.0.0-rc1`) is preserved as it was, and it was **not** a candidate whose claims all held. The

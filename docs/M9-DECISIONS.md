@@ -51,3 +51,13 @@ golden, kernel verification) → M9.2 the router service (managed `i2pd` + exter
 M9.4 fake-router end-to-end and adversarial (IA) suites, including boundary-observed transitions →
 M9.5 real-`i2pd` qualification run, claims and ledger, freeze. A clean, tested checkpoint is kept
 after each phase.
+
+## Phase records
+
+| Phase | Commit | Record |
+|---|---|---|
+| M9.0 | `23f0f30` | `I2pSystem` naming; `MixedNetworks`, `I2pNeedsSystemScope`, `I2pWithLan` refusals; CLI `--network`; full M1–M8 gate green |
+| M9.1 | `072c8e8` | `I2pMachine` shape (no NAT chain), router-only exemption invariant, `i2p_system.nft` golden, netd `--i2p-user`/ports; kernel proof: non-router uid blocked with zero packets at the boundary, router uid allowed |
+| M9.2 | `4d697df` | `i2pd.conf` renderer with refusal tests; managed supervision + real proxy readiness; external option; `ghostnector-i2pd.service` with no capabilities and a hardening oracle; helper reports the proxy ports |
+| M9.3 | `88aa8a0` | `connect --network i2p`; no DNS chokepoint; I2P verification (clearnet denied, proxy answers, canary required); contradiction applies the baseline; core+CLI failure path green |
+| M9.4 | pending commit | `scripts/i2p-adversarial.sh`: product path plus IA cases, every denial observed at a far-side boundary (separate netns, listener, counter); **26 held, 0 contradicted, 0 inconclusive** |

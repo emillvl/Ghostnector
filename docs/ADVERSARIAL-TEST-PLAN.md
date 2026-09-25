@@ -276,6 +276,39 @@ recorded here (the D-02 lesson: link noise is classified, never counted as a pas
 vantage (the SYSTEM-scope G8 remains open for APP, recorded as GA-1). "Distinct source identities"
 is what was demonstrated; distinct Tor circuits are Tor's behaviour and are not claimed (GA-2).
 
+## 13. M9 I2P scope: the IA class, executed
+
+The I2P campaign reuses the M7/M8 principle with a stronger observation point: the outside world is
+a **separate network namespace** ("the far side") reached over a veth pair, with its own listener and
+an nftables counter on the far end. Every "nothing crossed" assertion is made there — at the actual
+far end of the path — never by reading interface byte counters (the D-02 lesson). The stack is
+hermetic: a fake router answers only the configured canary, so the suite needs no I2P network.
+
+`scripts/i2p-adversarial.sh` executes both the product path and the IA cases:
+
+| ID | Injected action | Observed |
+|---|---|---|
+| IA-1/IA-2 | An ordinary (non-router) identity tries TCP and UDP to the far side while I2P is active | held: refused, and the far side counted **zero packets and zero connections** |
+| IA-3 | An `accept` rule injected into the I2P host table | held: noticed, fail-closed baseline applied, tampered policy replaced |
+| IA-4 | The router killed mid-protection | held: noticed within the window, machine denied |
+| IA-5 | Transitions: I2P → fail-closed → I2P, with a continuous boundary probe | held: the router's exemption exists only under I2P and is denied under the baseline; an ordinary identity never reached the boundary at any point |
+| IA-6 | A connection to the router's HTTP proxy from the far side | held: closed to the network (the input guard) |
+| IA-7 | The canary answered without the expected marker (spoofed) | held: noticed, machine denied |
+| IA-8 | `connect --network i2p --scope app` | held: refused with an explanation, and no namespace was created |
+| IA-10 | `Snapshot` read while I2P is protected | held: the interface names neither the canary destination nor a boundary address |
+
+The product path itself is asserted here too: `connect --network i2p` starts `Degraded`, the router's
+own uid reaches the far side (its exemption works), the kernel table has no NAT chain and exempts
+only the router's uid, and the canary fetched through the proxy is what turns the state into
+`Protected`.
+
+**Result: 26 held, 0 contradicted, 0 inconclusive.**
+
+**Boundary:** this suite uses a fake router, so it proves the product machinery and the policy with
+the router's real uid, not the behaviour of `i2pd` itself. The separate real-`i2pd` qualification run
+(M9.5) is required before the freeze, and the claims state which run proved what (M9 decision 3).
+Public I2P network integration is not claimed by this suite.
+
 ## Appendix A — defects found so far, and their regression tests
 
 Recorded because the same classes of mistake will recur.
