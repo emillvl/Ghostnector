@@ -22,8 +22,9 @@ NETD="${1:?usage: netd-socket-test.sh <path-to-ghostnector-netd>}"
 NS="gh-netd-test"
 RUNDIR="/run/ghostnector"
 SOCK="$RUNDIR/netd.sock"
-SOCK_PACKAGED="$RUNDIR/netd-packaged.sock"
-SOCK_NOCHOWN="$RUNDIR/netd-nochown.sock"
+CAPDIR="/run/ghostnector-cap"
+SOCK_PACKAGED="$CAPDIR/netd-packaged.sock"
+SOCK_NOCHOWN="$CAPDIR/netd-nochown.sock"
 PEER_USER="ghostnector-core"
 OUTSIDER_USER="ghostnector-outsider"
 CLIENT="/tmp/gh-netd-client.py"
@@ -35,7 +36,8 @@ cleanup() {
     if [ -n "$NETD_PID" ]; then kill "$NETD_PID" 2>/dev/null || true; fi
     if [ -n "$PACKAGED_PID" ]; then kill "$PACKAGED_PID" 2>/dev/null || true; fi
     ip netns del "$NS" 2>/dev/null || true
-    rm -f "$SOCK" "$SOCK_PACKAGED" "$SOCK_NOCHOWN" "$CLIENT"
+    rm -rf "$CAPDIR"
+    rm -f "$SOCK" "$CLIENT"
 }
 trap cleanup EXIT
 
@@ -191,8 +193,14 @@ ok "no other tables were created"
 
 # ---------------------------------------------------------------- the packaged capability set
 # D-23: the unit's job includes handing the socket to the control plane, which needs CAP_CHOWN.
-# Both directions are measured here, exactly as appd's gate does for its own unit.
+# Both directions are measured here, exactly as appd's gate does for its own unit. A dedicated
+# root-owned directory keeps this section independent of whatever earlier tests did to the shared
+# runtime directory: the capability-restricted helper can only unlink where root owns the directory.
 echo "[5] the packaged capability set is sufficient, and CAP_CHOWN is what hands over the socket"
+mkdir -p "$CAPDIR"
+chmod 0755 "$CAPDIR"
+chown root:root "$CAPDIR"
+rm -f "$SOCK_PACKAGED" "$SOCK_NOCHOWN"
 ip netns exec "$NS" setpriv --reuid=0 --regid=0 --clear-groups \
     --bounding-set=-all,+net_admin,+chown \
     --inh-caps +net_admin --ambient-caps +net_admin \
