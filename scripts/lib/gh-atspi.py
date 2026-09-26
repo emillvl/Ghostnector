@@ -126,7 +126,7 @@ def checked(name):
         return 1
 
 
-def coords(name):
+def coords(name, constant=None):
     """Print the centre of the first named node that has real screen extents.
 
     Non-label nodes come first: clicking a switch's text label does nothing, while clicking the
@@ -140,7 +140,7 @@ def coords(name):
     ordered += [node for node in candidates if node.getRoleName() == "label"]
     for node in ordered:
         try:
-            extents = node.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+            extents = node.queryComponent().getExtents(constant or pyatspi.DESKTOP_COORDS)
             if extents.width > 0 and extents.height > 0:
                 print(f"{extents.x + extents.width // 2} {extents.y + extents.height // 2}")
                 return 0
@@ -148,6 +148,34 @@ def coords(name):
             continue
     print(f"no screen extents for {name!r}")
     return 1
+
+
+def focused(name):
+    """Exit 0 when a node named NAME currently has keyboard focus."""
+    for node in find_all(name):
+        try:
+            if pyatspi.STATE_FOCUSED in node.getState().getStates():
+                return 0
+        except Exception:
+            continue
+    return 1
+
+
+def focus_report():
+    root = app()
+    if root is None:
+        return 1
+    found = 0
+    for node in walk(root):
+        try:
+            if pyatspi.STATE_FOCUSED in node.getState().getStates():
+                print(f"{node.getRoleName()}: {(node.name or '').strip()!r}")
+                found += 1
+        except Exception:
+            continue
+    if not found:
+        print("(nothing focused)")
+    return 0
 
 
 def main():
@@ -178,6 +206,12 @@ def main():
         return checked(sys.argv[2])
     if command == "coords":
         return coords(sys.argv[2])
+    if command == "coords-screen":
+        return coords(sys.argv[2], pyatspi.SCREEN_COORDS)
+    if command == "focused":
+        return focused(sys.argv[2])
+    if command == "focus-report":
+        return focus_report()
     if command == "has":
         return 0 if find(sys.argv[2], contains=True) else 1
     if command == "wait":
