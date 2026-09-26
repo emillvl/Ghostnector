@@ -9,7 +9,15 @@ After=ghostnector-netd.service
 Type=exec
 User=i2pd
 Group=i2pd
-ExecStart=/usr/bin/i2pd --conf=/run/ghostnector/i2pd.conf
+# The router resolves its home from $HOME and looks for `$HOME/.i2pd` before anything else. The
+# i2pd package's user has home /home/i2pd, which does not exist, and ProtectHome=yes below masks
+# /home anyway, so without this the router aborts with "filesystem error: status: Permission
+# denied [/home/i2pd/.i2pd]" and the unit crash-loops (D-40). Its own state directory is a home
+# that exists and is writable.
+Environment=HOME=/var/lib/ghostnector-i2pd
+# The package ships the certificates i2pd needs to verify reseed material; without --certsdir the
+# router looks under $HOME and reports that it cannot load them.
+ExecStart=/usr/bin/i2pd --conf=/run/ghostnector/i2pd.conf --certsdir=/usr/share/i2pd/certificates
 # The configuration is written by the control plane, which is why this unit does not own it.
 ReadOnlyPaths=/run/ghostnector/i2pd.conf
 

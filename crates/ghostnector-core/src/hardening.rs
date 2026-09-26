@@ -424,6 +424,22 @@ mod tests {
             problems
                 .push("the unit does not start i2pd with the generated configuration".to_string());
         }
+        // The router resolves its home from $HOME and stats `$HOME/.i2pd` before reading anything;
+        // ProtectHome=yes hides /home and the package user's home does not exist, so the unit must
+        // point HOME at the state directory or the router aborts at every start (D-40).
+        match line_value(text, "Environment") {
+            Some(found) if found.contains("HOME=/var/lib/ghostnector-i2pd") => {}
+            Some(found) => problems.push(format!(
+                "Environment is '{found}', expected HOME=/var/lib/ghostnector-i2pd (D-40)"
+            )),
+            None => problems
+                .push("Environment=HOME=/var/lib/ghostnector-i2pd is missing (D-40)".to_string()),
+        }
+        if !text.contains("--certsdir=/usr/share/i2pd/certificates") {
+            problems.push(
+                "the unit does not name the package's certificate directory (D-40)".to_string(),
+            );
+        }
         // No capability may appear anywhere: this process needs none.
         for key in ["CapabilityBoundingSet", "AmbientCapabilities"] {
             if line_value(text, key).is_some() {
