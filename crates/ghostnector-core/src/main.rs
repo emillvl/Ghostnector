@@ -327,6 +327,17 @@ OPTIONS:
                             ..I2pSettings::default()
                         },
                         budget: config.i2p_budget,
+                        // Siblings of the generated configuration: the unit bind-mounts both.
+                        resolv_conf_path: config
+                            .i2pd_config
+                            .parent()
+                            .unwrap_or_else(|| std::path::Path::new("/run/ghostnector"))
+                            .join("i2pd-resolv.conf"),
+                        nsswitch_path: config
+                            .i2pd_config
+                            .parent()
+                            .unwrap_or_else(|| std::path::Path::new("/run/ghostnector"))
+                            .join("i2pd-nsswitch.conf"),
                     }),
                 ))
             }

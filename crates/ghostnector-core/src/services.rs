@@ -7,6 +7,12 @@
 //! 3. this module waits until the service says it is ready,
 //! 4. only then does the engine open the real policy.
 //!
+//! I2P is the exception that is still deny-first: the I2P profile (itself a
+//! deny-everything-except-the-router policy) is applied *before* the router starts, because the
+//! router resolves its reseed hosts by name and the fail-closed baseline exempts only Tor's uid
+//! (D-41). Its name resolution is made to happen from its own exempt uid by the resolv.conf and
+//! nsswitch this module writes and the unit bind-mounts (D-42).
+//!
 //! Two implementations exist because the two deployment shapes are both legitimate: Ghostnector can
 //! own Tor (a systemd unit it starts and stops), or the operator can run Tor themselves and have
 //! Ghostnector use it. Neither is a test backdoor: readiness is required either way.
@@ -60,6 +66,13 @@ pub trait Services: Send + Sync {
     ) -> Result<(), ServiceError>;
     /// Stop whatever this profile needed. Best effort: failing here is a note, not a rollback.
     fn stand_down(&self, profile: ProfileId) -> Result<(), ServiceError>;
+    /// Write the resolver configuration the router reads, so its name resolution happens from its
+    /// own uid — the only identity I2P mode exempts (D-42). The engine calls this for I2P before
+    /// `bring_up`, because the unit bind-mounts these files and would fail to start without them.
+    fn configure_router_resolver(
+        &self,
+        nameservers: &[std::net::IpAddr],
+    ) -> Result<(), ServiceError>;
     /// Anything the user should know about this profile's services.
     fn notes(&self, profile: ProfileId) -> Vec<String> {
         let _ = profile;
@@ -120,6 +133,10 @@ pub struct I2pSupervision {
     pub settings: I2pSettings,
     /// How long to wait for the proxy to answer.
     pub budget: Duration,
+    /// Where to write the resolv.conf the router reads (bind-mounted into its unit).
+    pub resolv_conf_path: PathBuf,
+    /// Where to write the matching nsswitch.conf (same reason).
+    pub nsswitch_path: PathBuf,
 }
 
 /// The resolver's health cannot be checked yet, and saying so is better than implying it is fine.
@@ -245,6 +262,46 @@ impl Services for SystemdServices {
         self.supervisor.stop(&self.unit).map_err(ServiceError::from)
     }
 
+    fn configure_router_resolver(
+        &self,
+        nameservers: &[std::net::IpAddr],
+    ) -> Result<(), ServiceError> {
+        let Some(i2p) = self.i2p.as_ref() else {
+            return Err(ServiceError::Config(
+                "this control plane was not configured to supervise an I2P router".to_string(),
+            ));
+        };
+        let mut text = String::from(
+            "# Written by Ghostnector for the router. The router resolves names from its own\n\
+             # identity, because that is the only identity I2P mode exempts; do not edit.\n",
+        );
+        for address in nameservers {
+            text.push_str(&format!("nameserver {address}\n"));
+        }
+        if nameservers.is_empty() {
+            text.push_str("# no upstream nameserver was discovered\n");
+        }
+        write_atomic(&i2p.resolv_conf_path, text.as_bytes()).map_err(|error| {
+            ServiceError::Config(format!(
+                "'{}' could not be written: {error}",
+                i2p.resolv_conf_path.display()
+            ))
+        })?;
+        // The router's lookups must use the plain DNS module: a resolver daemon would perform the
+        // query under its own uid, which the I2P profile denies.
+        let nsswitch = "passwd:         files\n\
+                        group:          files\n\
+                        shadow:         files\n\
+                        hosts:          files dns\n";
+        write_atomic(&i2p.nsswitch_path, nsswitch.as_bytes()).map_err(|error| {
+            ServiceError::Config(format!(
+                "'{}' could not be written: {error}",
+                i2p.nsswitch_path.display()
+            ))
+        })?;
+        Ok(())
+    }
+
     fn notes(&self, profile: ProfileId) -> Vec<String> {
         if profile == ProfileId::DnsLockdown {
             vec![RESOLVER_NOTE.to_string()]
@@ -279,6 +336,17 @@ impl ExternalServices {
 }
 
 impl Services for ExternalServices {
+    fn configure_router_resolver(
+        &self,
+        _nameservers: &[std::net::IpAddr],
+    ) -> Result<(), ServiceError> {
+        // The router is the operator's, not this control plane's: there is no unit to configure and
+        // nothing to write. The policy still exempts the router's uid; an operator who runs it in a
+        // way that resolves through the system resolver will see reseed fail under the I2P policy,
+        // exactly as the packaged unit would without its bind-mounted resolver files (D-42).
+        Ok(())
+    }
+
     fn bring_up(
         &self,
         profile: ProfileId,
@@ -455,6 +523,8 @@ mod tests {
             config_path: config.clone(),
             settings: I2pSettings::default(),
             budget: Duration::from_secs(2),
+            resolv_conf_path: dir.0.join("i2pd-resolv.conf"),
+            nsswitch_path: dir.0.join("i2pd-nsswitch.conf"),
         });
 
         services
@@ -485,6 +555,55 @@ mod tests {
     }
 
     #[test]
+    fn the_router_resolver_files_are_written_for_its_own_identity() {
+        let dir = TempDir::new("i2p-resolver");
+        let resolv = dir.0.join("i2pd-resolv.conf");
+        let nsswitch = dir.0.join("i2pd-nsswitch.conf");
+        let services = SystemdServices::new(
+            Arc::new(crate::testing::MockSupervisor::new()),
+            TorControl::new(
+                "127.0.0.1:1".parse().expect("address"),
+                dir.0.join("cookie"),
+                Duration::from_millis(100),
+            ),
+            "ghostnector-tor.service",
+            dir.0.join("torrc"),
+            TorSettings::default(),
+            Duration::from_secs(1),
+        )
+        .with_i2p(I2pSupervision {
+            unit: "ghostnector-i2pd.service".to_string(),
+            config_path: dir.0.join("i2pd.conf"),
+            settings: I2pSettings::default(),
+            budget: Duration::from_secs(1),
+            resolv_conf_path: resolv.clone(),
+            nsswitch_path: nsswitch.clone(),
+        });
+
+        services
+            .configure_router_resolver(&[
+                "192.168.31.1".parse().expect("v4"),
+                "fd17::3".parse().expect("v6"),
+            ])
+            .expect("the resolver files are written");
+        let resolv_text = std::fs::read_to_string(&resolv).expect("resolv.conf");
+        assert!(
+            resolv_text.contains("nameserver 192.168.31.1"),
+            "{resolv_text}"
+        );
+        assert!(resolv_text.contains("nameserver fd17::3"), "{resolv_text}");
+        let nsswitch_text = std::fs::read_to_string(&nsswitch).expect("nsswitch.conf");
+        assert!(
+            nsswitch_text.contains("hosts:          files dns"),
+            "{nsswitch_text}"
+        );
+        assert!(
+            !nsswitch_text.contains("resolve"),
+            "the router must not resolve through the resolver daemon (D-42): {nsswitch_text}"
+        );
+    }
+
+    #[test]
     fn a_router_that_never_answers_fails_the_bring_up() {
         let dir = TempDir::new("i2p-unready");
         let services = SystemdServices::new(
@@ -504,6 +623,8 @@ mod tests {
             config_path: dir.0.join("i2pd.conf"),
             settings: I2pSettings::default(),
             budget: Duration::from_millis(300),
+            resolv_conf_path: dir.0.join("i2pd-resolv.conf"),
+            nsswitch_path: dir.0.join("i2pd-nsswitch.conf"),
         });
 
         // Nothing listens on this port, so the readiness check must fail rather than claim a

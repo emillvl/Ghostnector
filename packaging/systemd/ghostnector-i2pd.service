@@ -20,6 +20,12 @@ Environment=HOME=/var/lib/ghostnector-i2pd
 ExecStart=/usr/bin/i2pd --conf=/run/ghostnector/i2pd.conf --certsdir=/usr/share/i2pd/certificates
 # The configuration is written by the control plane, which is why this unit does not own it.
 ReadOnlyPaths=/run/ghostnector/i2pd.conf
+# The router resolves names from its own identity: the I2P profile exempts the router's uid and
+# denies the system resolver's egress, so resolving through the stub would put the query on the
+# wrong identity and reseed would fail (D-42). The control plane writes both files before it
+# starts this unit.
+BindReadOnlyPaths=/run/ghostnector/i2pd-resolv.conf:/etc/resolv.conf
+BindReadOnlyPaths=/run/ghostnector/i2pd-nsswitch.conf:/etc/nsswitch.conf
 
 # The router needs no capabilities at all. It is an ordinary unprivileged process; the policy is
 # what confines everything else, and the router's own egress is the one exemption that makes the

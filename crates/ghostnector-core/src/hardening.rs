@@ -440,6 +440,16 @@ mod tests {
                 "the unit does not name the package's certificate directory (D-40)".to_string(),
             );
         }
+        // The router's name resolution must happen from its own uid; the unit bind-mounts the
+        // resolver files the control plane writes (D-42).
+        for mount in [
+            "BindReadOnlyPaths=/run/ghostnector/i2pd-resolv.conf:/etc/resolv.conf",
+            "BindReadOnlyPaths=/run/ghostnector/i2pd-nsswitch.conf:/etc/nsswitch.conf",
+        ] {
+            if !text.contains(mount) {
+                problems.push(format!("the unit does not bind {mount} (D-42)"));
+            }
+        }
         // No capability may appear anywhere: this process needs none.
         for key in ["CapabilityBoundingSet", "AmbientCapabilities"] {
             if line_value(text, key).is_some() {

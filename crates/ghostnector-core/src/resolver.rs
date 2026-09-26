@@ -240,6 +240,51 @@ impl Resolver {
         })
     }
 
+    /// The nameservers the machine's resolver actually uses.
+    ///
+    /// This exists for the one service that must resolve names from its own identity: the I2P
+    /// router, whose uid is the only egress exemption in I2P mode. Resolving through the system
+    /// resolver would put the query on *that* service's uid, which the policy denies (D-42), so the
+    /// control plane writes these addresses into a resolv.conf the router reads directly.
+    ///
+    /// Loopback addresses are skipped: a stub listener would put the query back on the resolver's
+    /// own uid, which is exactly what this must avoid.
+    pub fn upstream_nameservers(&self) -> Vec<IpAddr> {
+        fn absorb(found: &mut Vec<IpAddr>, text: &str) {
+            for token in text.split_whitespace() {
+                if let Ok(address) = token.parse::<IpAddr>() {
+                    if !address.is_loopback() && !found.contains(&address) {
+                        found.push(address);
+                    }
+                }
+            }
+        }
+
+        let mut found: Vec<IpAddr> = Vec::new();
+        if self.detect() == Environment::SystemdResolved {
+            if let Ok(output) = self.runner.run(&self.layout.resolvectl, &["dns"]) {
+                // Lines look like `Link 2 (enp0s3): 192.168.31.1 fd17:...`; `Global:` lines carry
+                // the global servers.
+                for line in output.lines() {
+                    if let Some((_, servers)) = line.split_once(':') {
+                        absorb(&mut found, servers);
+                    }
+                }
+            }
+        }
+        if found.is_empty() {
+            if let Ok(contents) = std::fs::read_to_string(self.resolv_conf()) {
+                for line in contents.lines() {
+                    let line = line.trim_start();
+                    if let Some(rest) = line.strip_prefix("nameserver") {
+                        absorb(&mut found, rest);
+                    }
+                }
+            }
+        }
+        found
+    }
+
     /// Send the machine's own lookups at the chokepoint.
     pub fn point_at(
         &self,
@@ -509,6 +554,24 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn upstream_nameservers_reads_a_plain_file_and_skips_the_stub() {
+        let fixture = Fixture::new();
+        fixture.write_resolv_conf("nameserver 192.168.31.1\nnameserver 127.0.0.53\n");
+        assert_eq!(
+            fixture.resolver.upstream_nameservers(),
+            vec![IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 31, 1))],
+            "the router must be given a real upstream, never the loopback stub"
+        );
+    }
+
+    #[test]
+    fn upstream_nameservers_is_empty_when_there_is_nothing_to_read() {
+        let fixture = Fixture::new();
+        fixture.write_resolv_conf("# nothing here\n");
+        assert!(fixture.resolver.upstream_nameservers().is_empty());
     }
 
     const CHOKEPOINT: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));

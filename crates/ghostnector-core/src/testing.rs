@@ -388,6 +388,7 @@ pub struct MockServices {
     stood_down: Mutex<Vec<ProfileId>>,
     fail_bring_up: Mutex<Option<String>>,
     notes: Mutex<Vec<String>>,
+    router_nameservers: Mutex<Vec<std::net::IpAddr>>,
 }
 
 impl MockServices {
@@ -404,6 +405,11 @@ impl MockServices {
     /// Every profile whose services were stood down, in order.
     pub fn stood_down(&self) -> Vec<ProfileId> {
         self.stood_down.lock().expect("mock lock").clone()
+    }
+
+    /// The nameservers the engine asked to be written for the router.
+    pub fn router_nameservers(&self) -> Vec<std::net::IpAddr> {
+        self.router_nameservers.lock().expect("mock lock").clone()
     }
 
     /// Fail the next bring-up with this message.
@@ -434,6 +440,14 @@ impl Services for MockServices {
 
     fn stand_down(&self, profile: ProfileId) -> Result<(), ServiceError> {
         self.stood_down.lock().expect("mock lock").push(profile);
+        Ok(())
+    }
+
+    fn configure_router_resolver(
+        &self,
+        nameservers: &[std::net::IpAddr],
+    ) -> Result<(), ServiceError> {
+        *self.router_nameservers.lock().expect("mock lock") = nameservers.to_vec();
         Ok(())
     }
 

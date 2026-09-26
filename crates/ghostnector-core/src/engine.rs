@@ -682,8 +682,12 @@ impl Engine {
         }
 
         // I2P: the router's own policy before the router, because the baseline cannot carry the
-        // router's exemption and the router needs DNS to reseed (D-41).
+        // router's exemption and the router needs DNS to reseed (D-41). The resolver files make
+        // that DNS happen from the router's own (exempt) uid rather than the system resolver's
+        // (D-42); the unit bind-mounts them, so they must exist before it starts.
         let early_report = if target == ProfileId::I2pSystem {
+            let nameservers = self.resolver.upstream_nameservers();
+            self.services.configure_router_resolver(&nameservers)?;
             Some(self.apply(target, params)?)
         } else {
             None
@@ -2179,6 +2183,12 @@ mod tests {
             "the baseline is applied first and never carries the I2P uid"
         );
         assert_eq!(services.brought_up(), vec![ProfileId::I2pSystem]);
+        assert_eq!(
+            services.router_nameservers(),
+            vec!["192.0.2.53".parse::<std::net::IpAddr>().expect("address")],
+            "the router is given the machine's upstream nameserver, so its reseed queries leave \
+             from its own exempt uid (D-42)"
+        );
     }
 
     #[test]
