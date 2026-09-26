@@ -297,7 +297,9 @@ fn error(code: ErrorCode, message: impl Into<String>) -> Response {
 
 fn error_body(error: &EngineError) -> ErrorBody {
     let code = match error {
-        EngineError::InvalidProfile(_) | EngineError::NotSupported(_) => ErrorCode::InvalidProfile,
+        EngineError::InvalidProfile(_)
+        | EngineError::NotSupported(_)
+        | EngineError::Configuration(_) => ErrorCode::InvalidProfile,
         EngineError::Helper(_) | EngineError::NotApplied | EngineError::Services(_) => {
             ErrorCode::BackendFailure
         }
@@ -546,6 +548,16 @@ mod tests {
         assert!(body.contains("\"response\":\"error\""), "{body}");
         assert!(body.contains("\"code\":\"backend_failure\""), "{body}");
         assert!(body.contains("the kernel said no"), "{body}");
+    }
+
+    #[test]
+    fn a_configuration_refusal_is_a_profile_error_with_its_message() {
+        let body = error_body(&EngineError::Configuration(
+            "the local-network exception cannot be verified".to_string(),
+        ));
+        assert_eq!(body.code, ErrorCode::InvalidProfile);
+        assert!(body.message.contains("cannot be verified"));
+        assert!(!body.sensitive);
     }
 
     #[test]

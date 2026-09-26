@@ -37,6 +37,10 @@ CHOKEPOINT_PORT="53"
 UDP_CHECK_PORT="9999"
 OUTSIDE_NS="gh-outside"
 OUTSIDE_ADDR="10.77.0.1"
+# An address outside the local-network ranges (RFC2544 benchmarking). The D-26 section below proves
+# both directions: the same `connect --lan` is refused when the checks aim inside the LAN ranges and
+# verifies normally when they aim outside them.
+OUTSIDE_CHECK_ADDR="198.18.0.1"
 INSIDE_ADDR="10.77.0.2"
 FAKE_TOR="/tmp/gh-fake-tor.py"
 FAKE_DNS="/tmp/gh-fake-dns.py"
@@ -44,12 +48,14 @@ FAKE_UDP="/tmp/gh-fake-udp.py"
 DNS_PROBE="/tmp/gh-dns-probe.py"
 NETD_PID=""
 CORE_PID=""
+AUX_PID=""
 TOR_PID=""
 DNS_PID=""
 UDP_PID=""
 
 cleanup() {
     [ -n "$CORE_PID" ] && kill "$CORE_PID" 2>/dev/null || true
+    [ -n "$AUX_PID" ] && kill "$AUX_PID" 2>/dev/null || true
     [ -n "$NETD_PID" ] && kill "$NETD_PID" 2>/dev/null || true
     [ -n "$TOR_PID" ] && kill "$TOR_PID" 2>/dev/null || true
     [ -n "$DNS_PID" ] && kill "$DNS_PID" 2>/dev/null || true
@@ -445,5 +451,106 @@ ok "the fail-closed baseline is in the kernel"
 
 cli disconnect >/dev/null
 ok "and the machine can still be released deliberately"
+
+# ---------------------------------------------------------------- the LAN exception and the checks
+# D-26: with the exception requested, a check that aims at an exempt destination cannot conclude
+# anything - reaching it is the exception working. The request must be refused before the state or
+# the kernel changes. The same request must connect and verify when the checks aim outside the LAN
+# ranges.
+echo "[6] the LAN exception and where the checks aim (D-26)"
+ip -n "$OUTSIDE_NS" addr add "$OUTSIDE_CHECK_ADDR/24" dev veth-outside
+
+AUX_ROOT="$WORKDIR/root-aux"
+mkdir -p "$AUX_ROOT/etc"
+printf 'nameserver 192.0.2.53\n' >"$AUX_ROOT/etc/resolv.conf"
+chown -R "$CORE_UID" "$AUX_ROOT"
+
+start_aux_core() {
+    local check="$1" journal="$2"
+    printf '{"version":1,"protected":false,"generation":0}' >"$journal"
+    chown "$CORE_UID" "$journal"
+    ip netns exec "$NS" setpriv \
+        --reuid="$CORE_UID" --regid="$CORE_GID" --clear-groups \
+        --inh-caps +net_bind_service --ambient-caps +net_bind_service \
+        "$BINDIR/ghostnector-core" \
+        --socket "$RUNDIR/core-aux.sock" --helper "$RUNDIR/netd.sock" --journal "$journal" \
+        --services external --tor-cookie "$COOKIE" --tor-control-port "$CONTROL_PORT" \
+        --tor-bootstrap-seconds 10 \
+        --dns-helper "$BINDIR/ghostnector-dns" --tor-dns-port "$DNS_UPSTREAM_PORT" \
+        --resolv-conf-root "$AUX_ROOT" --resolver-state "$WORKDIR/aux-resolver.json" \
+        --udp-check "$check" \
+        --verify-interval 3 --verify-stale-after 120 --verify-timeout 3 \
+        >/tmp/gh-core-aux.log 2>&1 &
+    AUX_PID=$!
+    wait_for_socket "$RUNDIR/core-aux.sock" || fail "the auxiliary control plane did not start"
+}
+
+stop_aux_core() {
+    [ -n "$AUX_PID" ] && kill "$AUX_PID" 2>/dev/null || true
+    wait "$AUX_PID" 2>/dev/null || true
+    AUX_PID=""
+    rm -f "$RUNDIR/core-aux.sock"
+}
+
+aux_cli() {
+    as_user "$CORE_UID" "$CORE_GID" "$BINDIR/ghostnector" --socket "$RUNDIR/core-aux.sock" "$@"
+}
+
+# 6a. The check endpoint is inside 10.0.0.0/8, so `connect --lan` must be refused, untouched.
+start_aux_core "$OUTSIDE_ADDR:$UDP_CHECK_PORT" "$WORKDIR/intent-aux.json"
+if REFUSED="$(aux_cli connect --lan 2>&1)"; then
+    fail "connect --lan was accepted with the UDP check endpoint inside the local network: $REFUSED"
+fi
+case "$REFUSED" in
+*"local-network exception"*"10.0.0.0/8"*)
+    ok "an in-LAN check endpoint is refused, and the range is named"
+    ;;
+*) fail "the refusal did not explain itself: $REFUSED" ;;
+esac
+case "$REFUSED" in
+*"do not request the exception"*)
+    ok "the refusal names the ways out"
+    ;;
+*) fail "the refusal is missing the ways out: $REFUSED" ;;
+esac
+case "$(aux_cli status)" in
+*"traffic is not protected"*) ok "the refusal left the machine off" ;;
+*) fail "the refusal changed the state: $(aux_cli status)" ;;
+esac
+if in_ns nft list tables 2>/dev/null | grep -q ghostnector; then
+    fail "the refusal left a policy in the kernel"
+fi
+ok "the refusal happened before any state or kernel change"
+stop_aux_core
+
+# 6b. The same request with a check endpoint outside the LAN ranges must connect and verify.
+start_aux_core "$OUTSIDE_CHECK_ADDR:$UDP_CHECK_PORT" "$WORKDIR/intent-aux.json"
+if ! LAN_OK="$(aux_cli connect --lan 2>&1)"; then
+    echo "$LAN_OK"
+    fail "a valid allow_lan configuration was refused"
+fi
+if ! in_ns nft list tables 2>/dev/null | grep -q ghostnector; then
+    fail "the valid allow_lan connect left no policy in the kernel"
+fi
+LAN_VERIFIED=""
+for _ in $(seq 1 20); do
+    AUX_STATUS="$(aux_cli status)"
+    case "$AUX_STATUS" in
+    *"and verified"*)
+        LAN_VERIFIED=1
+        break
+        ;;
+    *"no traffic can leave"*) break ;;
+    esac
+    sleep 1
+done
+[ -n "$LAN_VERIFIED" ] || fail "a valid allow_lan configuration did not verify: $AUX_STATUS"
+ok "the same request with a non-LAN endpoint connects and verifies"
+aux_cli disconnect >/dev/null
+stop_aux_core
+if in_ns nft list tables 2>/dev/null | grep -q ghostnector; then
+    fail "the auxiliary stack left a policy behind"
+fi
+ok "and it disconnects cleanly"
 
 echo "PASS: core + cli"

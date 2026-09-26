@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 ghostnector-spec = { path = "../ghostnector-spec" }
+ghostnector-policy = { path = "../ghostnector-policy" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

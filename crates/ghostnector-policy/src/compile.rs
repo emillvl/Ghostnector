@@ -32,14 +32,67 @@ use crate::ir::{
 /// Address ranges considered "the local network" when the LAN exception is enabled.
 ///
 /// Loopback is deliberately absent: it is handled by a rule that applies in every profile, so
-/// including it here would be redundant noise in the policy.
-const LAN4: [&str; 4] = [
+/// including it here would be redundant noise in the policy. Public so the control plane can refuse
+/// a configuration whose verification endpoint falls inside the exception (D-26).
+pub const LAN4: [&str; 4] = [
     "10.0.0.0/8",
     "172.16.0.0/12",
     "192.168.0.0/16",
     "169.254.0.0/16",
 ];
-const LAN6: [&str; 3] = ["fc00::/7", "fe80::/10", "ff00::/8"];
+/// The IPv6 half of the local-network exception.
+pub const LAN6: [&str; 3] = ["fc00::/7", "fe80::/10", "ff00::/8"];
+
+/// The local-network range an address falls in, if the opt-in LAN exception would allow it.
+///
+/// The ranges are the same strings the renderer emits, parsed here rather than restated, so the
+/// answer the control plane refuses a configuration with cannot drift from the policy the kernel
+/// receives. Returns the range so an error message can name it.
+pub fn local_network_range(address: std::net::IpAddr) -> Option<&'static str> {
+    LAN4.iter()
+        .chain(LAN6.iter())
+        .find(|range| cidr_contains(range, address))
+        .copied()
+}
+
+fn cidr_contains(range: &&str, address: std::net::IpAddr) -> bool {
+    let Some((network, prefix)) = range.split_once('/') else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u32>() else {
+        return false;
+    };
+    match address {
+        std::net::IpAddr::V4(address) => {
+            let Ok(network) = network.parse::<std::net::Ipv4Addr>() else {
+                return false;
+            };
+            if prefix > 32 {
+                return false;
+            }
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            (u32::from(network) & mask) == (u32::from(address) & mask)
+        }
+        std::net::IpAddr::V6(address) => {
+            let Ok(network) = network.parse::<std::net::Ipv6Addr>() else {
+                return false;
+            };
+            if prefix > 128 {
+                return false;
+            }
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            (u128::from(network) & mask) == (u128::from(address) & mask)
+        }
+    }
+}
 
 /// The `nat` chain must run *before* the filter chains, or the redirect never happens and the
 /// filter's default deny rejects the traffic instead.
@@ -1062,6 +1115,44 @@ mod tests {
             .iter()
             .map(|exemption| exemption.subject.clone())
             .collect()
+    }
+
+    #[test]
+    fn the_lan_exception_says_exactly_which_ranges_it_allows() {
+        // The ranges are the constants the renderer emits; this test pins the predicate to them,
+        // including both boundary ends of every range and addresses that must stay outside.
+        for (address, expected) in [
+            ("10.0.0.0", Some("10.0.0.0/8")),
+            ("10.255.255.255", Some("10.0.0.0/8")),
+            ("11.0.0.1", None),
+            ("172.16.0.0", Some("172.16.0.0/12")),
+            ("172.31.255.255", Some("172.16.0.0/12")),
+            ("172.15.255.255", None),
+            ("172.32.0.0", None),
+            ("192.168.0.0", Some("192.168.0.0/16")),
+            ("192.168.255.255", Some("192.168.0.0/16")),
+            ("192.169.0.1", None),
+            ("169.254.0.1", Some("169.254.0.0/16")),
+            ("169.255.0.1", None),
+            ("127.0.0.1", None),
+            ("198.18.0.1", None),
+            ("203.0.113.9", None),
+            ("fc00::", Some("fc00::/7")),
+            ("fdff:ffff::1", Some("fc00::/7")),
+            ("fe80::1", Some("fe80::/10")),
+            ("febf:ffff::1", Some("fe80::/10")),
+            ("fec0::1", None),
+            ("ff02::1", Some("ff00::/8")),
+            ("2001:db8::1", None),
+            ("::1", None),
+        ] {
+            let address: std::net::IpAddr = address.parse().expect("test address");
+            assert_eq!(
+                local_network_range(address),
+                expected,
+                "{address} should map to {expected:?}"
+            );
+        }
     }
 
     fn chain<'a>(policy: &'a CompiledPolicy, name: &str) -> &'a Chain {

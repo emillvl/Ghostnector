@@ -47,6 +47,10 @@ H_MUT_ADDR2="10.88.0.9"
 # the same policy as the first.
 H_MUT2_ADDR="10.99.0.2"
 H_OUT2_ADDR="10.99.0.1"
+# An address outside the local-network exception (198.18.0.0/15 is the benchmarking range). The
+# verifier's check endpoints point here: a check aimed inside the LAN exception could not conclude
+# anything when the exception is on (D-26), so the checks and the exception never collide.
+H_CHECK_ADDR="198.18.0.1"
 H_TOR_USER="debian-tor"
 
 H_WORK="/tmp/gh-harness"
@@ -118,6 +122,7 @@ gh_setup() {
     ip link set veth-mut netns "$H_MUT"
 
     ip -n "$H_OUT" addr add "$H_OUT_ADDR/24" dev veth-out
+    ip -n "$H_OUT" addr add "$H_CHECK_ADDR/24" dev veth-out
     ip -n "$H_MUT" addr add "$H_MUT_ADDR/24" dev veth-mut
     # The conduit's own address: the only source the outside world should ever see.
     ip -n "$H_MUT" addr add "$H_CONDUIT_ADDR/32" dev veth-mut
@@ -370,11 +375,16 @@ udp_server()
 PY
 
     cat >"$H_BIN/internet.py" <<'PY'
-"""The outside world: recording endpoints, one per protocol, and a JSON-Lines event log."""
+"""The outside world: recording endpoints, one per protocol, and a JSON-Lines event log.
+
+It listens on every address it is given. The verifier's check endpoints are given an address outside
+the local-network ranges (198.18.0.0/15), while the machine's probes still aim at the on-link address;
+a check aimed inside the LAN exception could not prove confinement (D-26).
+"""
 import json, socket, sys, threading, time
 
-address, tcp_port, udp_port, http_port, log_path = (
-    sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5],
+addresses, tcp_port, udp_port, http_port, log_path = (
+    sys.argv[1].split(","), int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5],
 )
 log = open(log_path, "a", buffering=1)
 
@@ -385,7 +395,7 @@ def record(kind, **fields):
     log.write(json.dumps(fields) + "\n")
 
 
-def tcp_server(port, kind):
+def tcp_server(address, port, kind):
     server = socket.socket()
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((address, port))
@@ -406,7 +416,7 @@ def tcp_session(conn):
         conn.close()
 
 
-def http_server(port):
+def http_server(address, port):
     server = socket.socket()
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((address, port))
@@ -430,7 +440,7 @@ def http_session(conn):
         conn.close()
 
 
-def udp_server(port):
+def udp_server(address, port):
     server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     server.bind((address, port))
     while True:
@@ -450,10 +460,11 @@ def dhcp_recorder(address):
         record("dhcp", peer=f"{peer[0]}:{peer[1]}", length=len(data))
 
 
-threading.Thread(target=tcp_server, args=(tcp_port, "tcp"), daemon=True).start()
-threading.Thread(target=http_server, args=(http_port,), daemon=True).start()
-threading.Thread(target=udp_server, args=(udp_port,), daemon=True).start()
-threading.Thread(target=dhcp_recorder, args=(address,), daemon=True).start()
+for address in addresses:
+    threading.Thread(target=tcp_server, args=(address, tcp_port, "tcp"), daemon=True).start()
+    threading.Thread(target=http_server, args=(address, http_port), daemon=True).start()
+    threading.Thread(target=udp_server, args=(address, udp_port), daemon=True).start()
+    threading.Thread(target=dhcp_recorder, args=(address,), daemon=True).start()
 while True:
     time.sleep(3600)
 PY
@@ -657,7 +668,7 @@ gh_internet_start() {
     : >"$H_EVENTS"
     chmod 0666 "$H_EVENTS"
     ip netns exec "$H_OUT" python3 "$H_BIN/internet.py" \
-        "$H_OUT_ADDR" "$H_TCP_PORT" "$H_UDP_PORT" "$H_HTTP_PORT" "$H_EVENTS" \
+        "$H_OUT_ADDR,$H_CHECK_ADDR" "$H_TCP_PORT" "$H_UDP_PORT" "$H_HTTP_PORT" "$H_EVENTS" \
         >"$H_LOG/internet.log" 2>&1 &
     H_INTERNET_PID=$!
     sleep 0.3
@@ -742,8 +753,8 @@ gh_start_stack() {
         --services external --tor-cookie "$H_COOKIE" --tor-control-port 9051 \
         --tor-bootstrap-seconds 5 --tor-dns-port 9053 \
         --dns-helper "$H_BIN/ghostnector-dns" \
-        --udp-check "$H_OUT_ADDR:$H_UDP_PORT" \
-        --check-url "http://$H_OUT_ADDR:$H_HTTP_PORT/" \
+        --udp-check "$H_CHECK_ADDR:$H_UDP_PORT" \
+        --check-url "http://$H_CHECK_ADDR:$H_HTTP_PORT/" \
         --canary "canary.test@$H_CANARY_ADDR" --canary-resolver "127.0.0.1:53" \
         --verify-interval 3 --verify-stale-after 60 --verify-timeout 2 \
         >"$H_LOG/core.log" 2>&1 &

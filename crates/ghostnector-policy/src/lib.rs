@@ -24,7 +24,10 @@ pub mod ir;
 pub mod render;
 
 pub use canonical::canonical_kernel_ruleset;
-pub use compile::{compile, compile_app_namespace, CompiledPolicy, Environment, PolicyError};
+pub use compile::{
+    compile, compile_app_namespace, local_network_range, CompiledPolicy, Environment, PolicyError,
+    LAN4, LAN6,
+};
 pub use invariants::{check, CheckContext, InvariantViolation, ViolationCode};
 pub use ir::{
     Chain, ChainKind, CtState, Expr, Family, Hook, Mechanism, Proto, RejectKind, Rule, RuleOrigin,

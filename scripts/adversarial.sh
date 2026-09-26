@@ -746,8 +746,10 @@ case_AE2() {
 }
 
 case_AE3() {
-    # The local network is an opt-in address exception: it must not exist unless it is asked for, and
-    # when it is asked for it must carry traffic directly.
+    # The local network is an opt-in address exception: it must not exist unless it is asked for,
+    # and when it is asked for it must carry traffic directly while verification stays honest. The
+    # verifier's own endpoints are outside the LAN ranges (H_CHECK_ADDR), so this is decided by the
+    # steady state, not by a race against the verifier's 2 s settle (D-26).
     gh_setup yes
     gh_start_tor
     gh_start_dns_upstream
@@ -771,7 +773,29 @@ case_AE3() {
         echo "  setup: the opt-in connect did not put a policy in place: $(printf '%s' "$lan_answer" | head -3)"
         return 2
     fi
-    sleep 2
+
+    # Wait for a verification run to finish. With the check endpoints outside the LAN ranges the
+    # profile must verify; the old D-26 behaviour (the verifier's own probe reaching the exempt LAN
+    # destination and being read as a leak) would show up as a Blocked machine here.
+    local state=""
+    local waited=0
+    while [ "$waited" -lt 15 ]; do
+        state="$(gh_status | head -1)"
+        case "$state" in
+        *"and verified"* | *"no traffic can leave"*) break ;;
+        esac
+        sleep 1
+        waited=$((waited + 1))
+    done
+    gh_note "state after verification settled: $state"
+    case "$state" in
+    *"and verified"*) ;;
+    *)
+        gh_bad "a valid allow_lan configuration did not verify: $state"
+        return 1
+        ;;
+    esac
+
     local before_lan answer after_lan
     before_lan="$(gh_events_from tcp "$H_MUT_ADDR")"
     gh_mark "with the LAN exception: a direct probe"
@@ -787,7 +811,7 @@ case_AE3() {
     *ok*) ;;
     *) gh_inc "the direct connection was seen but not answered, so the positive half is not complete"; return 2 ;;
     esac
-    gh_ok "the local network was unreachable by default and directly reachable when asked for"
+    gh_ok "the local network was unreachable by default, directly reachable when asked for, and verification stayed honest"
 }
 
 case_AE4() {

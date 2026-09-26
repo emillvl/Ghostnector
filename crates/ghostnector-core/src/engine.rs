@@ -97,6 +97,12 @@ pub enum EngineError {
     /// The requested profile is not one that can be enforced.
     #[error("the requested profile is not valid: {0}")]
     InvalidProfile(#[from] ProfileError),
+    /// The request would be valid, but this daemon's own check configuration cannot verify it.
+    ///
+    /// Not a profile error: the same profile is fine on a daemon configured with check endpoints
+    /// outside the local network. Refused before any state change, so nothing is half-applied.
+    #[error("{0}")]
+    Configuration(String),
     /// The profile is valid in principle but not implemented in this milestone.
     #[error("cannot do that yet: {0}")]
     NotSupported(String),
@@ -296,6 +302,7 @@ impl Engine {
         let requested = profile.clone();
         let valid = profile.validate()?;
         let (target, params) = plan(&valid, requester_uid)?;
+        refuse_unverifiable_lan(&valid, &self.config.verification)?;
 
         self.set_state(
             ProtectionState::Applying,
@@ -1326,6 +1333,51 @@ fn report_from(answer: ghostnector_spec::HelperResponse) -> Result<Report, Engin
     }
 }
 
+/// Refuse `allow_lan` when a configured check destination lies inside the exception (D-26).
+///
+/// The LAN exception deliberately permits the RFC1918/ULA/link-local ranges, so a check whose
+/// destination is inside one of them cannot conclude anything: reaching it is the exception
+/// working, not a leak. (The HTTP check has the same problem - an in-LAN endpoint answers over the
+/// direct path, not through the protected path.) The refusal happens before any state change, so
+/// the machine is left exactly as it was.
+fn refuse_unverifiable_lan(
+    valid: &ValidProfile,
+    verification: &VerificationConfig,
+) -> Result<(), EngineError> {
+    if !valid.profile().allow_lan {
+        return Ok(());
+    }
+
+    let mut destinations: Vec<(&str, std::net::IpAddr)> = Vec::new();
+    if let Some(endpoint) = verification.udp_endpoint {
+        destinations.push(("the UDP check endpoint", endpoint.ip()));
+    }
+    if let Some(endpoint) = &verification.http_endpoint {
+        destinations.push(("the check endpoint", endpoint.address.ip()));
+    }
+    if let Some(canary) = &verification.canary {
+        destinations.push(("the canary resolver", canary.resolver.ip()));
+    }
+
+    for (kind, address) in destinations {
+        let Some(range) = ghostnector_policy::local_network_range(address) else {
+            continue;
+        };
+        let consequence = if kind.contains("canary") {
+            "a query to an exempt resolver cannot prove that DNS went through the chokepoint"
+        } else {
+            "reaching an exempt destination cannot prove that traffic is confined"
+        };
+        return Err(EngineError::Configuration(format!(
+            "the local-network exception cannot be verified with {kind} inside the local network: \
+             {address} is in {range}, and {consequence}. Configure {kind} outside the local \
+             network, or do not request the exception"
+        )));
+    }
+
+    Ok(())
+}
+
 /// Translate a validated profile into the helper's vocabulary.
 fn plan(valid: &ValidProfile, requester_uid: u32) -> Result<(ProfileId, Params), EngineError> {
     let mut params = Params {
@@ -1624,6 +1676,142 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason.as_str().contains("degraded rather than protected")));
+    }
+
+    fn verification_with(
+        udp: Option<&str>,
+        http: Option<&str>,
+        canary_resolver: Option<&str>,
+    ) -> VerificationConfig {
+        VerificationConfig {
+            udp_endpoint: udp.map(|value| value.parse().expect("udp endpoint")),
+            http_endpoint: http.map(|value| crate::verify::HttpEndpoint {
+                address: value.parse().expect("http endpoint"),
+                host: "check.example".to_string(),
+                path: "/".to_string(),
+            }),
+            canary: canary_resolver.map(|value| crate::verify::Canary {
+                name: "canary.test".to_string(),
+                expected: "203.0.113.9".parse().expect("canary address"),
+                resolver: value.parse().expect("canary resolver"),
+            }),
+            ..VerificationConfig::default()
+        }
+    }
+
+    fn engine_with_checks(verification: VerificationConfig) -> (Arc<MockHelper>, Engine, PathBuf) {
+        let helper = Arc::new(MockHelper::new());
+        let (engine, directory) = engine_with(
+            Arc::clone(&helper),
+            Arc::new(MockServices::new()),
+            Arc::new(MockRelay::new()),
+            Arc::new(MockVerification::new()),
+            verification,
+        );
+        (helper, engine, directory)
+    }
+
+    fn lan_profile() -> Profile {
+        Profile {
+            scope: Scope::System,
+            networks: ghostnector_spec::Networks::tor(),
+            allow_lan: true,
+            ..Profile::default()
+        }
+    }
+
+    #[test]
+    fn allow_lan_is_refused_when_a_check_endpoint_is_inside_the_exception() {
+        // D-26: with the exception on, reaching one of these is the exception working, so a check
+        // aimed at it cannot conclude anything. The refusal names the endpoint and the range, and
+        // happens before any state change or policy work.
+        for (kind, udp, http, canary, range) in [
+            (
+                "the UDP check endpoint",
+                Some("10.88.0.1:18081"),
+                None,
+                None,
+                "10.0.0.0/8",
+            ),
+            (
+                "the check endpoint",
+                None,
+                Some("192.168.1.10:8080"),
+                None,
+                "192.168.0.0/16",
+            ),
+            (
+                "the canary resolver",
+                None,
+                None,
+                Some("172.16.0.53:53"),
+                "172.16.0.0/12",
+            ),
+            (
+                "the UDP check endpoint",
+                Some("[fd00::1]:18081"),
+                None,
+                None,
+                "fc00::/7",
+            ),
+        ] {
+            let (helper, engine, _directory) =
+                engine_with_checks(verification_with(udp, http, canary));
+            let error = engine
+                .connect(lan_profile(), USER_UID)
+                .expect_err("the combination must be refused");
+            let text = error.to_string();
+            assert!(matches!(error, EngineError::Configuration(_)), "{error}");
+            assert!(text.contains(kind), "{text}");
+            assert!(text.contains(range), "{text}");
+            assert!(
+                text.contains("do not request the exception"),
+                "the two ways out must be in the message: {text}"
+            );
+
+            let snapshot = engine.snapshot();
+            assert_eq!(snapshot.state, ProtectionState::Off);
+            assert!(!snapshot.health.policy_applied);
+            assert!(
+                helper.verbs().is_empty(),
+                "nothing may be asked of the helper before the refusal"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_lan_with_check_endpoints_outside_the_exception_connects_normally() {
+        // The opposite direction: the same profile is fine when the checks point outside the local
+        // network, and the exception is then part of the applied policy.
+        let (helper, engine, _directory) = engine_with_checks(verification_with(
+            Some("198.18.0.1:18081"),
+            Some("198.18.0.1:18082"),
+            Some("127.0.0.1:53"),
+        ));
+        engine.connect(lan_profile(), USER_UID).expect("connect");
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.state, ProtectionState::Degraded);
+        assert!(snapshot.health.policy_applied);
+        assert!(helper.verbs().iter().any(|verb| matches!(
+            verb,
+            Verb::ApplyProfile { params, .. } if params.allow_lan
+        )));
+    }
+
+    #[test]
+    fn lan_check_endpoints_are_fine_without_the_exception() {
+        // The refusal is specific to the combination: the same endpoints are unremarkable when the
+        // LAN exception is not requested.
+        let (helper, engine, _directory) =
+            engine_with_checks(verification_with(Some("10.88.0.1:18081"), None, None));
+        engine
+            .connect(system_tor_profile(), USER_UID)
+            .expect("connect");
+        assert_eq!(engine.snapshot().state, ProtectionState::Degraded);
+        assert!(helper.verbs().iter().any(|verb| matches!(
+            verb,
+            Verb::ApplyProfile { params, .. } if !params.allow_lan
+        )));
     }
 
     #[test]
