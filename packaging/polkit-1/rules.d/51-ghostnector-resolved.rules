@@ -1,14 +1,20 @@
 // Let the Ghostnector control plane manage the system resolver while protection is on.
 //
-// On connect the control plane repoints systemd-resolved at its DNS chokepoint and on disconnect it
+// On connect the control plane repoints the resolver at its DNS chokepoint and on disconnect it
 // reverts that change (crates/ghostnector-core/src/resolver.rs). On a real install `resolvectl` is
-// refused by polkit (the resolve1 actions default to `auth_admin`), so the daemon honestly reported
-// that the resolver was not repointed (D-38). The firewall's port-53 redirect remains the
-// enforcement; this rule only lets the daemon do what it already documents.
+// refused by polkit (these actions default to `auth_admin`), so the daemon honestly reported that
+// the resolver was not repointed (D-38). The firewall's port-53 redirect remains the enforcement;
+// this rule only lets the daemon do what it already documents.
 //
-// It is bounded to the ghostnector service account and to exactly the three actions resolvectl
-// uses. Everything else about the resolver (mDNS, LLMNR, DNSSEC, default-route, registering
-// services) stays refused, and every other user stays refused.
+// There are two action families because the resolver has two layouts: on a link managed by
+// systemd-networkd, systemd-resolved forwards the change to networkd, which performs its own
+// polkit check (`org.freedesktop.network1.*`); on a link resolved manages itself, the check is
+// `org.freedesktop.resolve1.*`. Both are allowed here, and only for the three operations
+// `resolvectl dns`, `resolvectl domain` and `resolvectl revert` use.
+//
+// It is bounded to the ghostnector service account. Everything else about the resolver (mDNS,
+// LLMNR, DNSSEC, default-route, NTP, registering services) stays refused, and every other user
+// stays refused.
 polkit.addRule(function(action, subject) {
     if (subject.user !== "ghostnector") {
         return polkit.Result.NOT_HANDLED;
@@ -16,7 +22,10 @@ polkit.addRule(function(action, subject) {
     var allowed = [
         "org.freedesktop.resolve1.set-dns-servers",
         "org.freedesktop.resolve1.set-domains",
-        "org.freedesktop.resolve1.revert"
+        "org.freedesktop.resolve1.revert",
+        "org.freedesktop.network1.set-dns-servers",
+        "org.freedesktop.network1.set-domains",
+        "org.freedesktop.network1.revert-dns"
     ];
     if (allowed.indexOf(action.id) !== -1) {
         return polkit.Result.YES;

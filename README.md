@@ -98,9 +98,10 @@ Two operational notes that matter in real use:
   command from the console, or drive it from a detached script that disconnects when it is done.
 * The install ships two bounded polkit rules: one lets the `ghostnector` service account start and
   stop exactly `ghostnector-tor.service` and `ghostnector-i2pd.service` (start/stop only, nothing
-  else); the other lets it repoint systemd-resolved at the DNS chokepoint on connect and revert
-  that on disconnect (the three `resolve1` actions `resolvectl` uses, nothing else). Without them
-  the unprivileged control plane could not manage its own routers or its own resolver. The firewall
+  else); the other lets it repoint the resolver at the DNS chokepoint on connect and revert that on
+  disconnect — exactly the `resolve1` and `network1` actions `resolvectl` uses (resolved forwards
+  link changes to networkd on networkd-managed links), and nothing else. Without them the
+  unprivileged control plane could not manage its own routers or its own resolver. The firewall
   remains the enforcement in both cases.
 
 ## Build and test

@@ -364,6 +364,9 @@ mod tests {
             "org.freedesktop.resolve1.set-dns-servers",
             "org.freedesktop.resolve1.set-domains",
             "org.freedesktop.resolve1.revert",
+            "org.freedesktop.network1.set-dns-servers",
+            "org.freedesktop.network1.set-domains",
+            "org.freedesktop.network1.revert-dns",
         ];
         for action in allowed {
             assert!(text.contains(action), "the rule must allow {action}");
@@ -373,7 +376,7 @@ mod tests {
             if trimmed.starts_with("//") || trimmed.is_empty() {
                 continue;
             }
-            if let Some(start) = line.find("org.freedesktop.resolve1.") {
+            if let Some(start) = line.find("org.freedesktop.") {
                 let rest = &line[start..];
                 let end = rest
                     .find(|character: char| {
