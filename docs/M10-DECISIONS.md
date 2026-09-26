@@ -275,3 +275,11 @@ have to re-derive them:
    already running (the daemon owns the group, the kernel owns the policy).
 7. **Known limit:** a group launched by another client (or before this window started) is listed by
    a neutral ordinal, because `Snapshot` deliberately carries no command line the GUI could show.
+8. **User-facing vocabulary (D-27).** Failure reasons are plain sentences: the interface never shows
+   ports, paths, unit names or addresses. Core's error `Display` strings are the user-facing text
+   (shared by CLI and GUI), and the technical detail (proxy address, cookie path, `systemctl` output)
+   goes to the daemon log. Regression tests refuse a path, address or unit name in those strings.
+9. **Diagnostics window close.** The stored window reference is dropped only after the close event
+   has been processed; destroying it inside its own close handler makes X11 report `BadDrawable`.
+   With a window manager and the real `WM_DELETE_WINDOW` path, closing diagnostics leaves the
+   application running (proved on the VM).

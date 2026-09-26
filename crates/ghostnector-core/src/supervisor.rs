@@ -34,10 +34,15 @@ impl ServiceState {
 }
 
 /// Why a service operation failed.
+///
+/// The `Display` strings here reach the interface (through the engine's reasons and the client's
+/// error frames), so they stay free of paths, unit names and ports; the technical detail is written
+/// to the daemon's log where a support engineer can find it. `ghostnector-spec::display` and this
+/// module are the two places that decide what a user reads.
 #[derive(Debug, thiserror::Error)]
 pub enum SupervisorError {
     /// The service manager binary is not something we are willing to trust.
-    #[error("service manager '{}' is not usable: {reason}", path.display())]
+    #[error("the service manager is not usable: {reason}")]
     ToolUnusable {
         /// The path involved.
         path: PathBuf,
@@ -48,7 +53,7 @@ pub enum SupervisorError {
     #[error("'{0}' is not a usable unit name")]
     BadUnit(String),
     /// The service manager could not be run.
-    #[error("running '{}' failed: {reason}", path.display())]
+    #[error("the service manager could not be run: {reason}")]
     Io {
         /// The path involved.
         path: PathBuf,
@@ -56,9 +61,9 @@ pub enum SupervisorError {
         reason: String,
     },
     /// The service manager refused.
-    #[error("{action} '{unit}' failed: {reason}")]
+    #[error("the service could not be {action}")]
     Refused {
-        /// What was attempted.
+        /// What was attempted: "started" or "stopped".
         action: &'static str,
         /// The unit.
         unit: String,
@@ -97,9 +102,15 @@ impl SystemdUnits {
         let output = Command::new(&self.systemctl)
             .args(arguments)
             .output()
-            .map_err(|error| SupervisorError::Io {
-                path: self.systemctl.clone(),
-                reason: error.to_string(),
+            .map_err(|error| {
+                eprintln!(
+                    "ghostnector-core: '{}' could not be run: {error}",
+                    self.systemctl.display()
+                );
+                SupervisorError::Io {
+                    path: self.systemctl.clone(),
+                    reason: error.to_string(),
+                }
             })?;
 
         let mut combined = String::from_utf8_lossy(&output.stdout).to_string();
@@ -115,8 +126,9 @@ impl Supervisor for SystemdUnits {
         if ok {
             Ok(())
         } else {
+            eprintln!("ghostnector-core: systemctl start {unit} failed: {output}");
             Err(SupervisorError::Refused {
-                action: "starting",
+                action: "started",
                 unit: unit.to_string(),
                 reason: output,
             })
@@ -129,8 +141,9 @@ impl Supervisor for SystemdUnits {
         if ok {
             Ok(())
         } else {
+            eprintln!("ghostnector-core: systemctl stop {unit} failed: {output}");
             Err(SupervisorError::Refused {
-                action: "stopping",
+                action: "stopped",
                 unit: unit.to_string(),
                 reason: output,
             })
@@ -207,6 +220,32 @@ mod tests {
     fn a_unit_name_cannot_smuggle_an_option() {
         let error = validate_unit("--help").unwrap_err();
         assert!(matches!(error, SupervisorError::BadUnit(_)), "{error}");
+    }
+
+    #[test]
+    fn the_user_facing_failure_does_not_leak_paths_or_unit_names() {
+        for error in [
+            SupervisorError::ToolUnusable {
+                path: PathBuf::from("/usr/bin/systemctl"),
+                reason: "it is writable by others".to_string(),
+            },
+            SupervisorError::Io {
+                path: PathBuf::from("/usr/bin/systemctl"),
+                reason: "permission denied".to_string(),
+            },
+            SupervisorError::Refused {
+                action: "started",
+                unit: "ghostnector-tor.service".to_string(),
+                reason: "Unit not found".to_string(),
+            },
+        ] {
+            let text = error.to_string();
+            assert!(!text.contains('/'), "a path reached the user: {text}");
+            assert!(
+                !text.contains(".service"),
+                "a unit name reached the user: {text}"
+            );
+        }
     }
 
     #[test]

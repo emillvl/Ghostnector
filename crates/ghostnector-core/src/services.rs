@@ -92,8 +92,14 @@ fn wait_for_proxy(address: SocketAddr, budget: Duration) -> Result<(), ServiceEr
             Ok(_) => return Ok(()),
             Err(error) => {
                 if Instant::now() >= deadline {
+                    // The address and the OS error are for the daemon log; the interface gets the
+                    // plain sentence (ports and loopback addresses do not belong in it).
+                    eprintln!(
+                        "ghostnector-core: the router's proxy at {address} did not answer: {error}"
+                    );
                     return Err(ServiceError::Router(format!(
-                        "nothing accepted a connection on {address} within {}s: {error}",
+                        "the router's proxy did not answer within {}s, so the network cannot be \
+                         used yet",
                         budget.as_secs()
                     )));
                 }
@@ -517,7 +523,11 @@ mod tests {
             matches!(error, ServiceError::Router(_)),
             "expected a router failure, got {error}"
         );
-        assert!(error.to_string().contains("nothing accepted"), "{error}");
+        assert!(error.to_string().contains("did not answer"), "{error}");
+        assert!(
+            !error.to_string().contains("127.0.0.1"),
+            "the user-facing failure must not name the proxy: {error}"
+        );
     }
 
     #[test]

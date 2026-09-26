@@ -52,10 +52,14 @@ impl Bootstrap {
 }
 
 /// Why Tor's health could not be established.
+///
+/// The `Display` strings reach the interface through the engine's reasons and the client's error
+/// frames, so they stay free of paths and ports. The log line written where each error is built
+/// keeps the technical detail.
 #[derive(Debug, thiserror::Error)]
 pub enum TorControlError {
     /// Nothing is listening on the control port yet.
-    #[error("Tor's control port at {address} is not answering: {reason}")]
+    #[error("Tor's control port is not answering yet")]
     Unreachable {
         /// The address tried.
         address: SocketAddr,
@@ -63,10 +67,10 @@ pub enum TorControlError {
         reason: String,
     },
     /// The cookie is not there yet, which is normal while Tor starts.
-    #[error("Tor has not written its control cookie at '{}' yet", .0.display())]
+    #[error("Tor has not written its control cookie yet")]
     CookieMissing(PathBuf),
     /// The cookie exists but cannot be used.
-    #[error("Tor's control cookie at '{}' cannot be used: {reason}", path.display())]
+    #[error("Tor's control cookie cannot be used")]
     Cookie {
         /// The path tried.
         path: PathBuf,
@@ -119,25 +123,14 @@ impl TorControl {
     pub fn bootstrap(&self) -> Result<Bootstrap, TorControlError> {
         let cookie = self.read_cookie_hex()?;
 
-        let stream =
-            TcpStream::connect_timeout(&self.address, self.command_timeout).map_err(|error| {
-                TorControlError::Unreachable {
-                    address: self.address,
-                    reason: error.to_string(),
-                }
-            })?;
+        let stream = TcpStream::connect_timeout(&self.address, self.command_timeout)
+            .map_err(|error| self.unreachable(&error))?;
         stream
             .set_read_timeout(Some(self.command_timeout))
-            .map_err(|error| TorControlError::Unreachable {
-                address: self.address,
-                reason: error.to_string(),
-            })?;
+            .map_err(|error| self.unreachable(&error))?;
         stream
             .set_write_timeout(Some(self.command_timeout))
-            .map_err(|error| TorControlError::Unreachable {
-                address: self.address,
-                reason: error.to_string(),
-            })?;
+            .map_err(|error| self.unreachable(&error))?;
 
         let mut writer = stream
             .try_clone()
@@ -180,8 +173,8 @@ impl TorControl {
                         return Err(error);
                     }
                     // An operator needs to know *why* Tor never came up, and "not ready" is not a
-                    // why.
-                    format!("no answer from Tor's control port: {reason}")
+                    // why. `reason` is the sanitized display text; the detail is in the log.
+                    reason
                 }
             };
 
@@ -199,6 +192,11 @@ impl TorControl {
         match std::fs::read(&self.cookie_path) {
             Ok(bytes) => {
                 if bytes.len() != 32 {
+                    eprintln!(
+                        "ghostnector-core: Tor's control cookie at '{}' is {} bytes, not 32",
+                        self.cookie_path.display(),
+                        bytes.len()
+                    );
                     return Err(TorControlError::Cookie {
                         path: self.cookie_path.clone(),
                         reason: format!("expected 32 bytes, found {}", bytes.len()),
@@ -209,10 +207,29 @@ impl TorControl {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 Err(TorControlError::CookieMissing(self.cookie_path.clone()))
             }
-            Err(error) => Err(TorControlError::Cookie {
-                path: self.cookie_path.clone(),
-                reason: error.to_string(),
-            }),
+            Err(error) => {
+                eprintln!(
+                    "ghostnector-core: Tor's control cookie at '{}' could not be read: {error}",
+                    self.cookie_path.display()
+                );
+                Err(TorControlError::Cookie {
+                    path: self.cookie_path.clone(),
+                    reason: error.to_string(),
+                })
+            }
+        }
+    }
+
+    /// One place for the unreachable-control-port error, so the log keeps the address and reason
+    /// while the user-facing text stays plain.
+    fn unreachable(&self, error: &std::io::Error) -> TorControlError {
+        eprintln!(
+            "ghostnector-core: Tor's control port at {} could not be used: {error}",
+            self.address
+        );
+        TorControlError::Unreachable {
+            address: self.address,
+            reason: error.to_string(),
         }
     }
 }
@@ -544,6 +561,28 @@ mod tests {
         let control = client(address, dir.cookie(&[1u8; 32]));
         let error = control.bootstrap().unwrap_err();
         assert!(matches!(error, TorControlError::Protocol(_)), "{error}");
+    }
+
+    #[test]
+    fn the_user_facing_failure_does_not_leak_paths_or_ports() {
+        for error in [
+            TorControlError::Unreachable {
+                address: "127.0.0.1:9051".parse().expect("address"),
+                reason: "Connection refused (os error 111)".to_string(),
+            },
+            TorControlError::CookieMissing(PathBuf::from("/run/ghostnector/tor-control.auth")),
+            TorControlError::Cookie {
+                path: PathBuf::from("/run/ghostnector/tor-control.auth"),
+                reason: "expected 32 bytes, found 16".to_string(),
+            },
+        ] {
+            let text = error.to_string();
+            assert!(!text.contains('/'), "a path reached the user: {text}");
+            assert!(
+                !text.contains("127.0.0.1"),
+                "an address reached the user: {text}"
+            );
+        }
     }
 
     #[test]

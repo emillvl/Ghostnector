@@ -771,6 +771,7 @@ gh_start_stack() {
         --services external --tor-cookie "$H_COOKIE" --tor-control-port 9051 \
         --tor-bootstrap-seconds 5 --tor-dns-port 9053 \
         --dns-helper "$H_BIN/ghostnector-dns" \
+        --i2p-ready-seconds 2 \
         --udp-check "$H_CHECK_ADDR:$H_UDP_PORT" \
         --check-url "http://$H_CHECK_ADDR:$H_HTTP_PORT/" \
         --canary "canary.test@$H_CANARY_ADDR" --canary-resolver "127.0.0.1:53" \

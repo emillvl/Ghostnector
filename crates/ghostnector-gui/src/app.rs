@@ -115,7 +115,8 @@ impl Ui {
             .build();
 
         let header = HeaderBar::new();
-        let diagnostics_button = Button::with_label("Diagnostics");
+        let diagnostics_button = Button::with_label("_Diagnostics");
+        diagnostics_button.set_use_underline(true);
         {
             let ui = Rc::clone(self);
             diagnostics_button.connect_clicked(move |_| ui.open_diagnostics());
@@ -785,7 +786,13 @@ impl Ui {
         window.set_child(Some(&root));
         let ui = Rc::clone(self);
         window.connect_close_request(move |_| {
-            *ui.diagnostics.borrow_mut() = None;
+            // Drop our reference only after this close event has been fully processed: destroying
+            // the underlying window from inside its own close handler makes X complain
+            // (BadDrawable) and can take the process down with it.
+            let ui = Rc::clone(&ui);
+            gtk::glib::idle_add_local_once(move || {
+                *ui.diagnostics.borrow_mut() = None;
+            });
             gtk::glib::Propagation::Proceed
         });
         *self.diagnostics.borrow_mut() = Some(window.clone());
