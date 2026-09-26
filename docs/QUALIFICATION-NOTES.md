@@ -143,3 +143,29 @@ machine:
 The qualification is safe to run over SSH because it is detached, bounded, logs durably, and always
 ends in `disconnect` (with the documented rescue as a fallback): the run cut SSH for ~90 seconds and
 restored it without any manual step.
+
+## Installed I2P: D-40, D-41, D-42
+
+The GUI qualification's I2P selection exposed that installed I2P mode was dead, and fixing it took
+three defects in sequence (each only visible after the previous one was fixed):
+
+1. **D-40** — the packaged `ghostnector-i2pd.service` could not start: i2pd stats `$HOME/.i2pd`
+   before reading its configuration, the package user's home `/home/i2pd` does not exist, and
+   `ProtectHome=yes` turns that into `EACCES`; the unit also omitted the package's certificate
+   directory. Fixed with `Environment=HOME=/var/lib/ghostnector-i2pd` and
+   `--certsdir=/usr/share/i2pd/certificates`.
+2. **D-41** — the router starts under the fail-closed baseline, which (correctly) exempts only
+   Tor's uid, so the I2P profile (itself a deny-everything-except-the-router policy) is now applied
+   *before* the router starts. The baseline never carries the I2P uid; PC-22's mutually-exclusive
+   exemption model is unchanged.
+3. **D-42** — the router's name resolution ran as `systemd-resolve` through resolved's stub, an
+   identity I2P mode denies, so reseed failed with `Host not found` even under the router's own
+   policy. The engine now discovers the machine's upstream nameservers and writes
+   `/run/ghostnector/i2pd-resolv.conf` and a minimal `i2pd-nsswitch.conf`; the unit bind-mounts them,
+   so the router's queries leave from its own exempt uid.
+
+Verified on the installed VM after a rebuild: `connect --network i2p` applies `I2pSystem`
+(`i2pd unit: active`, a proxy listener on 4444, exactly one `skuid` exemption), and `disconnect`
+returns to `off`. The state is `Degraded` rather than `Protected` because the shipped unit has no
+I2P canary configured; the canary path was qualified natively in M9.5 (real i2pd, real canary) and
+can be configured per machine with the operator's canary.
