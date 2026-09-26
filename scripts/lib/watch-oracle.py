@@ -51,6 +51,17 @@ def main(argv):
     states = load_states(argv[1])
     findings = []
 
+    if not states:
+        # No timeline means the observation never started; that is not a pass.
+        print("no state timeline was recorded, so nothing can be attributed")
+        return 0
+
+    # The window opens with the first recorded state. Packets captured earlier (setup traffic, ARP
+    # resolution, DHCP) are outside the observation and are classified as such on stderr, never
+    # counted as a pass and never blamed on a claim that did not exist yet (the D-02 lesson).
+    window_start = states[0][0]
+    before_window = 0
+
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -63,6 +74,10 @@ def main(argv):
             findings.append("unparseable capture line: %s" % line)
             continue
 
+        if when < window_start:
+            before_window += 1
+            continue
+
         state = None
         for recorded, text in states:
             if recorded <= when:
@@ -71,12 +86,19 @@ def main(argv):
                 break
 
         if state is None:
+            # Cannot happen once the window has opened, but never let it pass silently.
             findings.append("unattributed crossing at %.6f: %s" % (when, packet))
         elif protected(state[1]):
             findings.append(
                 "crossed while reporting: %s (packet at %.6f, state recorded at %.6f): %s"
                 % (state[1].strip(), when, state[0], packet)
             )
+
+    if before_window:
+        sys.stderr.write(
+            "watch-oracle: %d packet(s) before the observation window were classified as "
+            "outside it and not judged\n" % before_window
+        )
 
     for finding in findings:
         print(finding)

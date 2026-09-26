@@ -637,12 +637,17 @@ gh_state_log() {
 
 # Per-packet attribution. Empty output is the pass. A missing capture is reported rather than
 # treated as "nothing crossed", because a capture that cannot be read proves nothing (D-21).
+#
+# Only IP traffic is judged. ARP is link-layer adjacency, not payload, and counts as environmental
+# control traffic (the D-02 lesson: a counter cannot tell policy failure from link noise); the
+# oracle also classifies packets captured before the observation window opened rather than blaming
+# them on a claim that did not exist yet.
 gh_watch_violations() {
     if [ ! -s "$H_LOG/crossed.pcap" ]; then
         echo "no capture was available to attribute crossings"
         return 0
     fi
-    tcpdump -r "$H_LOG/crossed.pcap" -tt -n "src $H_MUT_ADDR" 2>/dev/null |
+    tcpdump -r "$H_LOG/crossed.pcap" -tt -n "src $H_MUT_ADDR and (ip or ip6)" 2>/dev/null |
         python3 scripts/lib/watch-oracle.py "$H_LOG/state"
 }
 

@@ -78,14 +78,33 @@ else
     ok "a packet that crossed while Blocked is not a protection violation"
 fi
 
-# 5. A packet before any recorded state: unattributed, and never a silent pass.
-cat >"$WORK/unattributed" <<'EOF'
+# 5. A packet captured before the observation window opened: outside it, not a violation, and it
+#    is classified on stderr rather than silently dropped.
+cat >"$WORK/before-window" <<'EOF'
 999.000000 IP 10.88.0.2.34416 > 10.88.0.1.18080: Flags [S], length 0
 EOF
-if run "$WORK/unattributed" | grep -q "unattributed crossing"; then
-    ok "a packet with no earlier state record is reported, not passed"
+if python3 "$ORACLE" "$WORK/state" <"$WORK/before-window" \
+    >"$WORK/before-window.out" 2>"$WORK/before-window.err"; then
+    if [ -s "$WORK/before-window.out" ]; then
+        fail "a packet from before the window was reported as a violation"
+    else
+        ok "a packet captured before the observation window is not judged"
+    fi
 else
-    fail "a packet with no earlier state record passed silently"
+    fail "the oracle failed on a pre-window packet"
+fi
+if grep -q "before the observation window" "$WORK/before-window.err"; then
+    ok "the pre-window packets are classified, not silently ignored"
+else
+    fail "the pre-window classification was not recorded: $(cat "$WORK/before-window.err")"
+fi
+
+# 5b. No timeline at all is not a pass.
+: >"$WORK/empty-state"
+if python3 "$ORACLE" "$WORK/empty-state" <"$WORK/before" | grep -q "no state timeline"; then
+    ok "a missing state timeline is reported"
+else
+    fail "a missing state timeline passed silently"
 fi
 
 # 6. A real crossing inside a protected window is not hidden by an earlier Off sample.
