@@ -5,6 +5,7 @@ Subcommands:
   labels                 print every visible label text, one per line
   banner                 print the label that carries the state wording
   click NAME             activate the first widget named NAME (button, check box, menu item)
+  actions NAME           print the roles and action names for every node named NAME
   state NAME             print checked/unchecked for a check box
   wait NAME SECONDS      wait until a widget named NAME exists
   has NAME               exit 0 if a widget named NAME exists
@@ -37,19 +38,56 @@ def walk(node):
         return
 
 
-def find(name, role=None, contains=False):
+def find_all(name, role=None, contains=False):
     root = app()
     if root is None:
-        return None
+        return []
+    matches = []
     for node in walk(root):
         try:
             text = (node.name or "").strip()
             matched = name.lower() in text.lower() if contains else text == name
             if matched and (role is None or node.getRoleName() == role):
-                return node
+                matches.append(node)
         except Exception:
             continue
-    return None
+    return matches
+
+
+def find(name, role=None, contains=False):
+    matches = find_all(name, role, contains)
+    return matches[0] if matches else None
+
+
+def action_names(node):
+    try:
+        action = node.queryAction()
+        return [action.getName(index) for index in range(action.nActions)]
+    except Exception:
+        return []
+
+
+def click(name, role=None):
+    candidates = find_all(name, role)
+    if not candidates:
+        print(f"not found: {name!r}")
+        return 1
+    preferred = ("click", "toggle", "activate", "press", "check", "select")
+    for node in candidates:
+        names = action_names(node)
+        for index, label in enumerate(names):
+            if label in preferred:
+                node.queryAction().doAction(index)
+                print(f"clicked {name!r} ({node.getRoleName()}) via {label}")
+                return 0
+    for node in candidates:
+        names = action_names(node)
+        if names:
+            node.queryAction().doAction(0)
+            print(f"clicked {name!r} ({node.getRoleName()}) via action 0 ({names[0]})")
+            return 0
+    print(f"no action on any node named {name!r} (roles: {[c.getRoleName() for c in candidates]})")
+    return 1
 
 
 def labels():
@@ -66,27 +104,6 @@ def labels():
         except Exception:
             pass
     return out
-
-
-def click(name, role=None):
-    node = find(name, role)
-    if node is None:
-        print(f"not found: {name!r}")
-        return 1
-    try:
-        action = node.queryAction()
-        for index in range(action.nActions):
-            label = action.getName(index)
-            if label in ("click", "toggle", "activate", "press"):
-                action.doAction(index)
-                print(f"clicked {name!r} via {label}")
-                return 0
-        action.doAction(0)
-        print(f"clicked {name!r} via action 0")
-        return 0
-    except Exception as error:
-        print(f"cannot click {name!r}: {error}")
-        return 1
 
 
 def checked(name):
@@ -123,6 +140,10 @@ def main():
         return 1
     if command == "click":
         return click(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)
+    if command == "actions":
+        for node in find_all(sys.argv[2]):
+            print(f"{node.getRoleName()}: {action_names(node)}")
+        return 0
     if command == "state":
         return checked(sys.argv[2])
     if command == "has":
