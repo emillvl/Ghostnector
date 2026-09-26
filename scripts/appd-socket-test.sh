@@ -208,8 +208,15 @@ ip netns exec "ghapp$ID1" ip -o addr show | grep -q "$ADDR1/32" ||
     fail "the app address is not configured"
 ip netns exec "ghapp$ID1" ip route show | grep -q "$CORE dev ghlink0" ||
     fail "the core route is missing"
-ip netns exec "ghapp$ID1" ip route show | grep -q "default dev $DEAD" ||
+# Strict, and self-diagnosing: an intermittent failure was observed here (three times across
+# ~40 runs, never reproducible afterwards), and the plain pipeline hid whether `ip` failed or the
+# route was missing. Capture both and print them before failing.
+ROUTE_RC=0
+ROUTE_OUT="$(ip netns exec "ghapp$ID1" ip route show 2>&1)" || ROUTE_RC=$?
+if [ "$ROUTE_RC" != "0" ] || ! printf '%s\n' "$ROUTE_OUT" | grep -q "default dev $DEAD"; then
+    note "route-show rc=$ROUTE_RC: $ROUTE_OUT"
     fail "the default route does not point at the dead end"
+fi
 [ "$(ip netns exec "ghapp$ID1" cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" = "1" ] ||
     fail "IPv6 is not disabled in the namespace"
 ok "two namespaces, distinct addresses, dead-end route, IPv6 off"
