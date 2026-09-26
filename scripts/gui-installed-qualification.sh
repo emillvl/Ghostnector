@@ -145,6 +145,7 @@ cleanup() {
         rm -f /var/lib/ghostnector/intent.json
     fi
     pkill -f '/usr/bin/ghostnector-gui' 2>/dev/null || true
+    pkill -f 'dbus-run-session' 2>/dev/null || true
     pkill -x xfwm4 2>/dev/null || true
     pkill -f 'Xvfb :90' 2>/dev/null || true
     echo "== final state =="
@@ -192,15 +193,22 @@ echo "verification configuration: $(cat /etc/ghostnector/core.env)"
 # ---------------------------------------------------------------- display and window
 echo
 echo "-- the display and the real window --"
+pkill -f '/usr/bin/ghostnector-gui' 2>/dev/null || true
 pkill -f 'Xvfb :90' 2>/dev/null || true
 pkill -x xfwm4 2>/dev/null || true
 sleep 0.5
-Xvfb :90 -screen 0 1280x900x24 -ac >/dev/null 2>&1 &
+# Everything detached (setsid, </dev/null) so the SSH session that starts this run is never held
+# open by the display stack, and the window manager and GUI outlive it if it is cut.
+setsid nohup Xvfb :90 -screen 0 1280x900x24 -ac </dev/null >/tmp/gui-xvfb.log 2>&1 &
 sleep 1
-xfwm4 --compositor=off >/dev/null 2>&1 &
-sleep 1
-runuser -u "$GUI_USER" -- env DISPLAY=:90 HOME=/home/ghost XDG_RUNTIME_DIR=/run/user/1000 \
-    GSK_RENDERER=cairo GDK_BACKEND=x11 /usr/bin/ghostnector-gui >/tmp/gui-stdout.log 2>&1 &
+setsid nohup runuser -u "$GUI_USER" -- env DISPLAY=:90 HOME=/home/ghost \
+    xfwm4 --compositor=off </dev/null >/tmp/gui-xfwm4.log 2>&1 &
+sleep 2
+# GApplication needs a session bus to reach "activate"; without one the real window is never
+# mapped (only GTK's 1x1 leader appears).
+setsid nohup runuser -u "$GUI_USER" -- dbus-run-session -- env DISPLAY=:90 HOME=/home/ghost \
+    XDG_RUNTIME_DIR=/run/user/1000 GSK_RENDERER=cairo GDK_BACKEND=x11 \
+    /usr/bin/ghostnector-gui </dev/null >/tmp/gui-stdout.log 2>&1 &
 for _ in $(seq 1 40); do wmctrl -l 2>/dev/null | grep -q Ghostnector && break; sleep 0.5; done
 if wmctrl -l 2>/dev/null | grep -q Ghostnector; then
     ok "the window is on screen ($(wmctrl -l | grep Ghostnector | head -1 | cut -c1-60))"
