@@ -69,7 +69,7 @@ def action_names(node):
 
 
 def click(name, role=None):
-    candidates = find_all(name, role)
+    candidates = find_all(name, role, contains=True)
     if not candidates:
         print(f"not found: {name!r}")
         return 1
@@ -132,7 +132,7 @@ def coords(name, constant=None):
     Non-label nodes come first: clicking a switch's text label does nothing, while clicking the
     switch itself (or a check button's indicator) toggles it.
     """
-    candidates = find_all(name)
+    candidates = find_all(name, contains=True)
     if not candidates:
         print(f"not found: {name!r}")
         return 1

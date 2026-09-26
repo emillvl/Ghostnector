@@ -51,6 +51,7 @@ protected_now() { cli_line | grep -qE '^state:[[:space:]]+protected'; }
 wait_off()       { local i; for i in $(seq 1 "$1"); do off_now && return 0; sleep 1; done; return 1; }
 wait_protected() { local i; for i in $(seq 1 "$1"); do protected_now && return 0; sleep 1; done; return 1; }
 wait_profile()   { local i; for i in $(seq 1 "$2"); do cli_state | grep -q "$1" && return 0; sleep 1; done; return 1; }
+wait_not_applying() { local i; for i in $(seq 1 "$1"); do cli_line | grep -q "applying" || return 0; sleep 1; done; return 1; }
 wait_profile_verbose() { # pattern seconds: logs the state every 30s while waiting
     local i
     for i in $(seq 1 "$2"); do
@@ -138,6 +139,7 @@ focus_gui() { wmctrl -a Ghostnector 2>/dev/null || true; sleep 0.4; }
 
 protection_on() {
     focus_gui
+    wait_not_applying 90
     ui_click Protection >/dev/null 2>&1 || true
     sleep 1
     if off_now; then
@@ -148,6 +150,7 @@ protection_on() {
 }
 protection_off() {
     focus_gui
+    wait_not_applying 90
     ui_click Protection >/dev/null 2>&1 || true
     sleep 1
     if ! off_now; then
@@ -297,11 +300,7 @@ sleep 0.5
 LABELS="$(ui_labels)"
 case "$LABELS" in
 *"I2P protects the whole system"*) ok "the selected-applications refusal is shown" ;;
-*"chosen applications"*)
-    # The refusal text only appears when the scope is the invalid pair; what must always hold is
-    # that the control is refused (disabled) under I2P.
-    ok "the selected-applications control is refused under I2P" ;;
-*) bad "no selected-applications refusal for I2P" ;;
+*) note "the refusal text appears only when the scope is the refused one; the control state is checked next" ;;
 esac
 case "$(atspi enabled "Selected applications")" in
 disabled) ok "the selected-applications control is disabled under I2P" ;;
@@ -363,27 +362,29 @@ shot gui-03-protected
 # ---------------------------------------------------------------- T4: selection changes are confirmed
 echo
 echo "-- T4: changing the selection while protected asks first --"
+dialog_open() { ui_labels | grep -q "Change what is protected"; }
+wait_dialog_gone() { local i; for i in $(seq 1 40); do dialog_open || return 0; sleep 0.25; done; return 1; }
 ui_click I2P >/dev/null 2>&1 || bad "could not select I2P while protected"
 sleep 1
-LABELS="$(ui_labels)"
-case "$LABELS" in
-*"Change what is protected"*) ok "the confirmation dialog appears" ;;
-*) bad "no confirmation dialog when the selection changed while protected" ;;
-esac
+if dialog_open; then ok "the confirmation dialog appears"; else bad "no confirmation dialog when the selection changed while protected"; fi
 ui_click Cancel >/dev/null 2>&1 || key Escape
-sleep 0.5
+wait_dialog_gone || note "the dialog label lingered in the accessible tree"
 case "$(cli_state)" in
 *"through Tor"*) ok "cancelling keeps the reported Tor selection" ;;
 *) bad "cancelling did not restore the Tor selection" ;;
 esac
 ui_click I2P >/dev/null 2>&1 || true
 sleep 1
-ui_click Apply >/dev/null 2>&1 || key Return
-sleep 1
-if ui_labels | grep -q "Change what is protected"; then
-    note "the confirmation is still open; activating its default button"
-    key Return
+if ! dialog_open; then
+    note "the confirmation did not appear on the second selection; using the keyboard path"
+    select_radio "I2P" "Tor" Right >/dev/null 2>&1 || true
     sleep 1
+fi
+if dialog_open; then
+    ui_click Apply >/dev/null 2>&1 && note "Apply clicked" || key Return
+    wait_dialog_gone || note "the dialog label lingered after Apply"
+else
+    bad "the confirmation did not appear for the I2P selection"
 fi
 if wait_profile_verbose "through I2P" 300; then
     ok "applying the I2P selection re-applied protection"
@@ -393,11 +394,9 @@ else
 fi
 ui_click Tor >/dev/null 2>&1 || true
 sleep 1
-ui_click Apply >/dev/null 2>&1 || key Return
-sleep 1
-if ui_labels | grep -q "Change what is protected"; then
-    key Return
-    sleep 1
+if dialog_open; then
+    ui_click Apply >/dev/null 2>&1 || key Return
+    wait_dialog_gone || true
 fi
 if wait_profile "through Tor" 300; then
     ok "returning to Tor re-applied protection"
@@ -423,10 +422,13 @@ else
     bad "the APP scope did not apply: $(cli_state | head -3)"
 fi
 focus_gui
+# Any leftover confirmation from T4 must be closed before the Add button is reachable.
+if dialog_open; then key Escape; sleep 0.5; fi
 ui_click "Add application" >/dev/null 2>&1 || bad "could not find Add application"
-sleep 1.5
-# The file chooser is a dialog of this window (GTK's own chooser when no portal backend is present).
-DIALOG="$(wmctrl -l 2>/dev/null | grep -iE 'choose|application' | head -1 | cut -d' ' -f1)"
+sleep 2
+# The chooser is a second window; its title depends on the GTK/portal path, so pick any window
+# that is not the main one.
+DIALOG="$(wmctrl -l 2>/dev/null | grep -v 'Ghostnector$' | head -1 | cut -d' ' -f1)"
 if [ -n "$DIALOG" ]; then
     wmctrl -i -a "$DIALOG" 2>/dev/null || true
 fi
@@ -436,9 +438,13 @@ sleep 0.5
 xdotool type --delay 15 "/usr/local/bin/gh-qual-app"
 sleep 0.5
 key Return
-sleep 2
+sleep 3
 APPS="$(runuser -u "$GUI_USER" -g ghostnector -- /usr/bin/ghostnector apps 2>&1)"
 echo "apps: $APPS"
+if ! printf '%s' "$APPS" | grep -q "gh-qual-app"; then
+    note "windows: $(wmctrl -l | tr '\n' ' ')"
+    note "dialog-ish labels: $(ui_labels | grep -iE 'choose|name|location|open|select' | head -5 | tr '\n' ' ')"
+fi
 case "$APPS" in
 *"no protected applications"*) bad "the chosen application did not appear: $APPS" ;;
 *"running"*) ok "the chosen application is listed as running" ;;
@@ -461,14 +467,22 @@ echo "apps after stop: $APPS"
 # ---------------------------------------------------------------- T6: panic behind a confirmation
 echo
 echo "-- T6: panic needs the menu and a confirmation --"
-ui_click "More actions" >/dev/null 2>&1 || bad "could not open the header menu"
-sleep 1
-LABELS="$(ui_labels)"
-case "$LABELS" in
-*"Deny all traffic now"*) ok "the panic entry is in the menu" ;;
-*) bad "the panic entry is not in the menu" ;;
-esac
-ui_click "Deny all traffic now" >/dev/null 2>&1 || bad "could not activate the panic entry"
+focus_gui
+if focus_by_tab "More actions"; then
+    key space
+    sleep 1
+fi
+if ! ui_labels | grep -q "Deny all traffic"; then
+    note "the popover items are not exposed; opening and activating by keyboard"
+    key Return
+    sleep 1
+fi
+if ui_labels | grep -q "Deny all traffic"; then
+    ok "the panic entry is in the menu"
+    ui_click "Deny all traffic now" >/dev/null 2>&1 || key Return
+else
+    bad "the panic entry is not in the menu"
+fi
 sleep 1
 LABELS="$(ui_labels)"
 case "$LABELS" in
@@ -498,7 +512,8 @@ nft list table inet ghostnector >/dev/null 2>&1 && bad "a table survived the pan
 echo
 echo "-- T7: the window survives a core restart and reconnects --"
 systemctl stop ghostnector-core.service
-sleep 2
+for _ in $(seq 1 60); do systemctl is-active --quiet ghostnector-core.service || break; sleep 1; done
+sleep 1
 DIAG="$(diag_copy)"
 echo "$DIAG" | head -6
 case "$DIAG" in

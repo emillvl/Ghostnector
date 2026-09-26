@@ -686,6 +686,12 @@ impl Engine {
         // that DNS happen from the router's own (exempt) uid rather than the system resolver's
         // (D-42); the unit bind-mounts them, so they must exist before it starts.
         let early_report = if target == ProfileId::I2pSystem {
+            // I2P has no chokepoint. If a Tor profile pointed the machine's resolver at the
+            // chokepoint, put it back first: otherwise the upstream discovery sees only the
+            // loopback stub, the router is handed an empty resolv.conf, and its reseed fails
+            // (D-43). It is also the honest state: I2P never starts the chokepoint, so a resolver
+            // left pointing at it would be a broken resolver.
+            self.stand_down_dns();
             let nameservers = self.resolver.upstream_nameservers();
             self.services.configure_router_resolver(&nameservers)?;
             Some(self.apply(target, params)?)
@@ -2188,6 +2194,35 @@ mod tests {
             vec!["192.0.2.53".parse::<std::net::IpAddr>().expect("address")],
             "the router is given the machine's upstream nameserver, so its reseed queries leave \
              from its own exempt uid (D-42)"
+        );
+    }
+
+    #[test]
+    fn switching_from_tor_to_i2p_restores_the_resolver_and_gives_the_router_its_upstream() {
+        let (_helper, services, engine, directory) = engine_and_services();
+        engine
+            .connect(system_tor_profile(), USER_UID)
+            .expect("Tor connect");
+        let pointed =
+            std::fs::read_to_string(directory.join("etc/resolv.conf")).expect("read resolv.conf");
+        assert!(
+            pointed.contains("127.0.0.1"),
+            "Tor points the resolver at the chokepoint: {pointed}"
+        );
+
+        engine
+            .connect(i2p_profile(), USER_UID)
+            .expect("I2P connect");
+        let restored =
+            std::fs::read_to_string(directory.join("etc/resolv.conf")).expect("read resolv.conf");
+        assert!(
+            restored.contains("192.0.2.53"),
+            "I2P restores the machine's resolver, because it starts no chokepoint (D-43): {restored}"
+        );
+        assert_eq!(
+            services.router_nameservers(),
+            vec!["192.0.2.53".parse::<std::net::IpAddr>().expect("address")],
+            "the router discovers the real upstream, not the chokepoint's loopback address"
         );
     }
 
