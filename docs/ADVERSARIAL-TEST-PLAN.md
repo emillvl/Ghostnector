@@ -306,12 +306,12 @@ only the router's uid, and the canary fetched through the proxy is what turns th
 
 **Boundary:** this suite uses a fake router, so it proves the product machinery and the policy with
 the router's real uid, not the behaviour of `i2pd` itself. The separate real-`i2pd` qualification run
-(M9.5, `scripts/i2p-real-router-test.sh`) starts real i2pd 2.49.0 under the product's rendered
-configuration, as its real uid, with its real proxy and a real canary destination — and records what
-it could not complete: in this WSL environment i2pd stalls in reseed or aborts within one to two
-minutes under peer traffic, and without peers it cannot publish a LeaseSet, so the canary through the
-real proxy is **inconclusive** (2 held, 0 contradicted, 4 inconclusive). The strongest real-router
-claim is not demonstrated; the claims state which run proved what (M9 decision 3).
+(M9.5, `scripts/i2p-real-router-test.sh`) was completed natively: on a clean Ubuntu 24.04.5 VM with
+real i2pd 2.61.0 it passed **29 held, 0 contradicted, 0 inconclusive** — bootstrap and stability, the
+real canary through the real proxy, boundary denial of ordinary TCP/UDP/DNS, proxy exposure, router
+death, tampering, and Tor→I2P→Tor transitions (699 samples, never both exemptions). The earlier WSL
+attempt is preserved as environment-inconclusive: the distro's i2pd 2.49.0 crashes under load, which
+is an upstream version issue, not a Ghostnector defect.
 
 ## Appendix A — defects found so far, and their regression tests
 

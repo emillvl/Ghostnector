@@ -36,6 +36,15 @@ BIN="$(pwd)/target/debug"
     echo "=== build bins ==="
     cargo build --workspace --bins
     echo "build rc=$?"
+    # The privileged helpers verify that the tools they execute are root-owned and not writable by
+    # anyone else. On a machine where the build ran as another user, the artifacts are handed to
+    # root before any suite runs; this is an environment step, not a product change.
+    chown root:root target/debug/ghostnector* 2>/dev/null || true
+    chmod go-w target/debug/ghostnector* 2>/dev/null || true
+    # The packaged capability set drops CAP_DAC_OVERRIDE, so an unprivileged root must be able to
+    # traverse the repository path; a 0750 home directory would otherwise deny the tool check.
+    for dir in "$(pwd)" "$(dirname "$(pwd)")"; do chmod o+x "$dir" 2>/dev/null || true; done
+    echo "ownership handed to root, path traversable"
     echo "=== app-topology-test ==="
     bash scripts/app-topology-test.sh
     echo "app-topology rc=$?"

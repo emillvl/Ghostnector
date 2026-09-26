@@ -197,6 +197,41 @@ sleep 1
 [ "$(stat -c %u /proc/$I2PD_PID 2>/dev/null)" = "$I2PD_UID" ] &&
     ok "the real router is running as uid $I2PD_UID" ||
     bad "the real router did not start as the i2pd user"
+
+# Real Tor starts here, in parallel with the I2P phases, so its bootstrap overlaps the canary wait.
+# This is the product's documented external-services shape (the operator runs Tor); the
+# qualification-only `ClientUseIPv6 0` avoids the slow IPv6 attempts a NAT'd VM makes, and the
+# product's own policy is what denies IPv6.
+cat >"$WORKDIR/torrc" <<EOF
+ClientOnly 1
+ClientUseIPv6 0
+SocksPort 0
+ControlPort 127.0.0.1:$TOR_CONTROL_PORT
+CookieAuthentication 1
+CookieAuthFile $WORKDIR/tor-cookie/control.cookie
+CookieAuthFileGroupReadable 1
+DataDirectory $WORKDIR/tor-data
+Log notice stdout
+SafeLogging 1
+EOF
+chmod 644 "$WORKDIR/torrc"
+setpriv --reuid="$TOR_UID" --regid="$TOR_UID" --clear-groups \
+    /usr/bin/tor -f "$WORKDIR/torrc" >"$WORKDIR/tor.log" 2>&1 &
+TOR_PID=$!
+# Wait for Tor's control port, then take the cookie: Tor writes it before it listens, and taking it
+# earlier races Tor's own write and leaves it unreadable by the control plane.
+for _ in $(seq 1 120); do
+    ss -ltn 2>/dev/null | grep -q "127.0.0.1:$TOR_CONTROL_PORT " && break
+    sleep 0.5
+done
+ss -ltn 2>/dev/null | grep -q "127.0.0.1:$TOR_CONTROL_PORT " ||
+    fail_setup "Tor never opened its control port"
+chown "$CORE_UID:$CORE_GID" "$WORKDIR/tor-cookie/control.cookie"
+chmod 600 "$WORKDIR/tor-cookie/control.cookie"
+setpriv --reuid="$CORE_UID" --regid="$CORE_GID" --clear-groups \
+    cat "$WORKDIR/tor-cookie/control.cookie" >/dev/null 2>&1 ||
+    fail_setup "the control plane cannot read Tor's cookie"
+
 PROXY_UP=""
 for _ in $(seq 1 60); do
     if python3 -c 'import socket
@@ -326,36 +361,6 @@ NETD_PID=$!
 for _ in $(seq 1 60); do [ -S "$RUNDIR/netd.sock" ] && break; sleep 0.1; done
 [ -S "$RUNDIR/netd.sock" ] || fail_setup "the firewall helper did not start"
 
-# Real Tor, for the transition phase: the product's external-services shape.
-cat >"$WORKDIR/torrc" <<EOF
-ClientOnly 1
-SocksPort 0
-ControlPort 127.0.0.1:$TOR_CONTROL_PORT
-CookieAuthentication 1
-CookieAuthFile $WORKDIR/tor-cookie/control.cookie
-CookieAuthFileGroupReadable 1
-DataDirectory $WORKDIR/tor-data
-Log notice stdout
-SafeLogging 1
-EOF
-chmod 644 "$WORKDIR/torrc"
-setpriv --reuid="$TOR_UID" --regid="$TOR_UID" --clear-groups \
-    /usr/bin/tor -f "$WORKDIR/torrc" >"$WORKDIR/tor.log" 2>&1 &
-TOR_PID=$!
-# Wait for Tor's control port, then take the cookie: Tor writes it before it listens, and taking it
-# earlier races Tor's own write and leaves it unreadable by the control plane.
-for _ in $(seq 1 120); do
-    ss -ltn 2>/dev/null | grep -q "127.0.0.1:$TOR_CONTROL_PORT " && break
-    sleep 0.5
-done
-ss -ltn 2>/dev/null | grep -q "127.0.0.1:$TOR_CONTROL_PORT " ||
-    fail_setup "Tor never opened its control port"
-chown "$CORE_UID:$CORE_GID" "$WORKDIR/tor-cookie/control.cookie"
-chmod 600 "$WORKDIR/tor-cookie/control.cookie"
-setpriv --reuid="$CORE_UID" --regid="$CORE_GID" --clear-groups \
-    cat "$WORKDIR/tor-cookie/control.cookie" >/dev/null 2>&1 ||
-    fail_setup "the control plane cannot read Tor's cookie"
-
 setpriv --reuid="$CORE_UID" --regid="$CORE_GID" --clear-groups \
     --inh-caps +net_bind_service --ambient-caps +net_bind_service \
     "$BINDIR/ghostnector-core" \
@@ -363,7 +368,7 @@ setpriv --reuid="$CORE_UID" --regid="$CORE_GID" --clear-groups \
     --journal "$WORKDIR/core/intent.json" --resolver-state "$WORKDIR/core/resolver.json" \
     --resolv-conf-root "$WORKDIR/root" \
     --services external --tor-cookie "$WORKDIR/tor-cookie/control.cookie" \
-    --tor-control-port "$TOR_CONTROL_PORT" --tor-bootstrap-seconds 120 \
+    --tor-control-port "$TOR_CONTROL_PORT" --tor-bootstrap-seconds 300 \
     --dns-helper "$BINDIR/ghostnector-dns" \
     --i2p-ready-seconds 20 \
     --i2p-canary "$CANARY_HOST" --i2p-canary-path / --i2p-canary-expect i2p-ok \
