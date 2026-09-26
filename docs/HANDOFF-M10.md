@@ -23,6 +23,17 @@ M10 before its architecture questions are answered and reviewed** (see §6).
 - **17-section release gate** (`scripts/m9-release-gate.sh`, runnable on any Linux host): fmt, check,
   clippy `-D warnings`, tests, build, then every script suite. On the native VM all 17 sections were
   `rc=0`.
+
+> **Correction (2026-09-26, Phase-1 verification).** The `adversarial.sh` **26 held / 0 contradicted
+> / 1 inconclusive** number below is the **WSL** result. The recorded **native** M1–M7 run
+> (`m9-native-gate.log`, the run `b9499af` describes) produced **24 held / 2 contradicted / 1
+> inconclusive**: AL-1 and the script's AE-3 (the plan's AE-6, the LAN exemption) failed. Phase 1
+> reproduced both and classified them as **D-25** (the sampling oracle attributes pre-protection
+> packets to the next state sample — a test defect) and **D-26** (`allow_lan` with a check endpoint
+> inside the LAN sets makes the verifier report its own allowed path as a leak — a product defect;
+> fail-closed, but wrong). See `M10-DECISIONS.md` §0 and `ADVERSARIAL-TEST-PLAN.md` Appendix A. The
+> gate's `rc=0` lines are per-section exit codes, not verdict counts: a green gate also requires
+> reading the adversarial summaries.
 - Hermetic script suites: `app-topology-test.sh`, `app-policy-test.sh`, `appd-socket-test.sh`,
   `core-app-test.sh`, `app-adversarial.sh` (13/0/0), `policy-netns-test.sh` (Tor and I2P goldens
   against the kernel), `i2p-adversarial.sh` (**26 held / 0 contradicted / 0 inconclusive**),
