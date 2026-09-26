@@ -65,6 +65,8 @@ run_case() {
         gh_leaks | sed 's/^/    /'
         echo "  ── when, against what the case was doing ──"
         gh_timeline | sed 's/^/    /'
+        echo "  ── what the machine was reporting, as it changed ──"
+        gh_state_log | sed 's/^/    /'
         echo "  ── what the machine said ──"
         gh_status | head -8 | sed 's/^/    /'
         echo "  ── what the components said ──"
@@ -272,6 +274,31 @@ case_AL7() {
         return 1
     fi
     gh_ok "no crossing was ever attributed to a machine reporting protection"
+}
+
+case_AL8() {
+    # The negative control for the lifecycle oracle. AL-1/4/7 pass when the oracle reports nothing;
+    # that only means something if the oracle still reports a crossing that really happens while
+    # protection is claimed. A UDP hole is injected into the live policy, the storm keeps running,
+    # and the oracle must name the packets it catches. The engine's own tamper detection will also
+    # fail closed during the window -- that is expected, and it is not what this case measures.
+    bring_up || return 2
+    gh_storm_start 12
+    sleep 1
+    gh_watch_start
+    gh_mark "oracle control: injecting a UDP hole while protected"
+    gh_inject_rule udp dport "$H_UDP_PORT" counter accept comment '"oracle negative control"'
+    sleep 4
+    gh_storm_stop
+    gh_watch_stop
+    local crossings
+    crossings="$(gh_watch_violations)"
+    if [ -z "$crossings" ]; then
+        gh_bad "the oracle did not report traffic that crossed a live protection claim"
+        return 1
+    fi
+    gh_note "the oracle reported: $(printf '%s' "$crossings" | head -1)"
+    gh_ok "the oracle catches a real crossing inside a protected window"
 }
 
 # ---------------------------------------------------------------- failures
@@ -885,6 +912,7 @@ run_case case_AS6 "steady state: DNS over TCP is carried by the chokepoint"
 run_case case_AL1 "lifecycle: nothing crosses while connecting under load"
 run_case case_AL4 "lifecycle: nothing crosses while disconnecting under load"
 run_case case_AL7 "lifecycle: nothing crosses while blocking everything"
+run_case case_AL8 "lifecycle: the oracle catches a crossing inside a protected window (negative control)"
 run_case case_AF1 "failure: Tor dying opens nothing"
 run_case case_AF2 "failure: the DNS relay dying opens nothing"
 run_case case_AF3 "failure: the control plane dying loosens nothing"

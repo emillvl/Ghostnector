@@ -597,40 +597,53 @@ gh_crossed_count() {
 # reporting at that moment. A before/after count cannot tell "traffic crossed while the machine said
 # it was protected" from "traffic crossed after the user was told protection was gone", and those are
 # different findings.
+#
+# The observation is per-packet: a subscriber records every state change with a timestamp, and the
+# outside capture carries timestamps on the same clock. `gh_watch_violations` (and
+# scripts/lib/watch-oracle.py, which has its own deterministic test) attributes each packet to the
+# state in force at the packet's own timestamp. A count sampled every 0.2 s cannot do that, and a
+# transition that takes most of a second proved it (D-25).
 gh_watch_start() {
-    : >"$H_LOG/watch"
+    : >"$H_LOG/state"
+    # The daemon does not send the current snapshot on Subscribe; it sends changes. Record the state
+    # in force when the watch starts, so packets before the first change are still attributed.
     (
-        while true; do
-            printf '%s|%s\n' "$(gh_from_machine)" "$(gh_status | head -1)" >>"$H_LOG/watch"
-            sleep 0.2
+        gh_cli watch | while IFS= read -r line; do
+            case "$line" in
+            state:*) printf '%s|%s\n' "$(date +%s.%N)" "$line" >>"$H_LOG/state" ;;
+            esac
         done
     ) &
     H_WATCH_PID=$!
+    sleep 0.3
+    printf '%s|%s\n' "$(date +%s.%N)" "$(gh_status | head -1)" >>"$H_LOG/state"
 }
 
 gh_watch_stop() {
-    [ -n "$H_WATCH_PID" ] && kill "$H_WATCH_PID" 2>/dev/null || true
-    sleep 0.3
+    if [ -n "$H_WATCH_PID" ]; then
+        kill "$H_WATCH_PID" 2>/dev/null || true
+        pkill -P "$H_WATCH_PID" 2>/dev/null || true
+        sleep 0.2
+    fi
+    # The watch client can outlive the wrapper subshell; it is ours, identified by our socket path.
+    pkill -f "$H_BIN/ghostnector --socket $H_RUNDIR/core.sock watch" 2>/dev/null || true
     H_WATCH_PID=""
 }
 
-# Crossings that happened while the machine was still reporting protection. Empty is the pass.
-gh_watch_violations() {
-    python3 - "$H_LOG/watch" <<'PY'
-import sys
+# The state timeline the oracle used, for the failure dump.
+gh_state_log() {
+    [ -f "$H_LOG/state" ] && cat "$H_LOG/state" || echo "(no state log)"
+}
 
-previous = None
-for line in open(sys.argv[1]):
-    count, _, state = line.strip().partition("|")
-    try:
-        count = int(count)
-    except ValueError:
-        continue
-    protected = "protected, but unverified" in state or "and verified" in state
-    if previous is not None and count > previous and protected:
-        print(f"crossed while reporting: {state.strip()}")
-    previous = count
-PY
+# Per-packet attribution. Empty output is the pass. A missing capture is reported rather than
+# treated as "nothing crossed", because a capture that cannot be read proves nothing (D-21).
+gh_watch_violations() {
+    if [ ! -s "$H_LOG/crossed.pcap" ]; then
+        echo "no capture was available to attribute crossings"
+        return 0
+    fi
+    tcpdump -r "$H_LOG/crossed.pcap" -tt -n "src $H_MUT_ADDR" 2>/dev/null |
+        python3 scripts/lib/watch-oracle.py "$H_LOG/state"
 }
 
 gh_timeline() {
