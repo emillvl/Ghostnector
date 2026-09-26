@@ -6,6 +6,7 @@ Subcommands:
   banner                 print the label that carries the state wording
   click NAME             activate the first widget named NAME (button, check box, menu item)
   actions NAME           print the roles and action names for every node named NAME
+  coords NAME            print the centre of the first named node with real screen extents
   state NAME             print checked/unchecked for a check box
   wait NAME SECONDS      wait until a widget named NAME exists
   has NAME               exit 0 if a widget named NAME exists
@@ -120,6 +121,24 @@ def checked(name):
         return 1
 
 
+def coords(name):
+    """Print the centre of the first named node that has real screen extents."""
+    candidates = find_all(name)
+    if not candidates:
+        print(f"not found: {name!r}")
+        return 1
+    for node in candidates:
+        try:
+            extents = node.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+            if extents.width > 0 and extents.height > 0:
+                print(f"{extents.x + extents.width // 2} {extents.y + extents.height // 2}")
+                return 0
+        except Exception:
+            continue
+    print(f"no screen extents for {name!r}")
+    return 1
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -146,6 +165,8 @@ def main():
         return 0
     if command == "state":
         return checked(sys.argv[2])
+    if command == "coords":
+        return coords(sys.argv[2])
     if command == "has":
         return 0 if find(sys.argv[2], contains=True) else 1
     if command == "wait":

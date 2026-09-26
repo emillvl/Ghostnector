@@ -52,6 +52,20 @@ wait_off()       { local i; for i in $(seq 1 "$1"); do off_now && return 0; slee
 wait_protected() { local i; for i in $(seq 1 "$1"); do protected_now && return 0; sleep 1; done; return 1; }
 wait_profile()   { local i; for i in $(seq 1 "$2"); do cli_state | grep -q "$1" && return 0; sleep 1; done; return 1; }
 atspi() { runuser -u "$GUI_USER" -- env DISPLAY=:90 DBUS_SESSION_BUS_ADDRESS="$BUS" python3 "$ATSPI" "$@" 2>/dev/null; }
+# GTK4 check buttons expose no AT-SPI action, so the reliable path is: AT-SPI finds the widget's
+# screen coordinates, xdotool clicks there. Buttons that do expose an action are clicked through
+# AT-SPI first (the fallback below).
+ui_click() {
+    local name="$1" xy
+    xy="$(atspi coords "$name")"
+    if [ -n "$xy" ]; then
+        xdotool mousemove --sync "${xy% *}" "${xy#* }" click 1
+        sleep 0.4
+        return 0
+    fi
+    runuser -u "$GUI_USER" -- env DISPLAY=:90 DBUS_SESSION_BUS_ADDRESS="$BUS" \
+        python3 "$ATSPI" click "$name" 2>/dev/null
+}
 ui_labels() { atspi labels; }
 shot() { import -window root "$SHOTS/$1.png" 2>/dev/null; }
 key() { xdotool key --clearmodifiers "$@"; sleep 0.4; }
@@ -59,28 +73,28 @@ focus_gui() { wmctrl -a Ghostnector 2>/dev/null || true; sleep 0.4; }
 
 protection_on() {
     focus_gui
-    atspi click Protection >/dev/null 2>&1 || true
+    ui_click Protection >/dev/null 2>&1 || true
     sleep 1
     if off_now; then
         note "the first switch activation did not take; trying once more"
-        atspi click Protection >/dev/null 2>&1 || true
+        ui_click Protection >/dev/null 2>&1 || true
         sleep 1
     fi
 }
 protection_off() {
     focus_gui
-    atspi click Protection >/dev/null 2>&1 || true
+    ui_click Protection >/dev/null 2>&1 || true
     sleep 1
     if ! off_now; then
         note "the first switch activation did not take; trying once more"
-        atspi click Protection >/dev/null 2>&1 || true
+        ui_click Protection >/dev/null 2>&1 || true
         sleep 1
     fi
 }
 diag_copy() {
-    atspi click Diagnostics >/dev/null 2>&1 || true
+    ui_click Diagnostics >/dev/null 2>&1 || true
     atspi wait "Copy details" 10 >/dev/null 2>&1 || true
-    atspi click "Copy details" >/dev/null 2>&1 || true
+    ui_click "Copy details" >/dev/null 2>&1 || true
     sleep 0.6
     DISPLAY=:90 xclip -selection clipboard -o 2>/dev/null
     wmctrl -c "Ghostnector diagnostics" 2>/dev/null || true
@@ -212,21 +226,21 @@ shot gui-01-off
 # ---------------------------------------------------------------- T2: refusals in plain words
 echo
 echo "-- T2: unsupported combinations are refused in plain words --"
-atspi click I2P >/dev/null 2>&1 || bad "could not select I2P"
+ui_click I2P >/dev/null 2>&1 || bad "could not select I2P"
 sleep 0.5
 LABELS="$(ui_labels)"
 case "$LABELS" in
 *"I2P protects the whole system"*) ok "the selected-applications refusal is shown" ;;
 *) bad "no selected-applications refusal for I2P" ;;
 esac
-atspi click "Allow access to the local network" >/dev/null 2>&1 || bad "could not try the local-network switch"
+ui_click "Allow access to the local network" >/dev/null 2>&1 || bad "could not try the local-network switch"
 sleep 0.5
 LABELS="$(ui_labels)"
 case "$LABELS" in
 *"I2P has no local-network exception"*) ok "the local-network refusal is shown" ;;
 *) bad "no local-network refusal for I2P" ;;
 esac
-atspi click Tor >/dev/null 2>&1 || bad "could not return to Tor"
+ui_click Tor >/dev/null 2>&1 || bad "could not return to Tor"
 sleep 0.5
 shot gui-02-refusals
 
@@ -261,31 +275,31 @@ shot gui-03-protected
 # ---------------------------------------------------------------- T4: selection changes are confirmed
 echo
 echo "-- T4: changing the selection while protected asks first --"
-atspi click I2P >/dev/null 2>&1 || bad "could not select I2P while protected"
+ui_click I2P >/dev/null 2>&1 || bad "could not select I2P while protected"
 sleep 1
 LABELS="$(ui_labels)"
 case "$LABELS" in
 *"Change what is protected"*) ok "the confirmation dialog appears" ;;
 *) bad "no confirmation dialog when the selection changed while protected" ;;
 esac
-atspi click Cancel >/dev/null 2>&1 || key Escape
+ui_click Cancel >/dev/null 2>&1 || key Escape
 sleep 0.5
 case "$(cli_state)" in
 *"through Tor"*) ok "cancelling keeps the reported Tor selection" ;;
 *) bad "cancelling did not restore the Tor selection" ;;
 esac
-atspi click I2P >/dev/null 2>&1 || true
+ui_click I2P >/dev/null 2>&1 || true
 sleep 1
-atspi click Apply >/dev/null 2>&1 || key Return
+ui_click Apply >/dev/null 2>&1 || key Return
 if wait_profile "through I2P" 240; then
     ok "applying the I2P selection re-applied protection"
     note "I2P state: $(cli_line)"
 else
     inc "I2P did not settle within 240s: $(cli_line)"
 fi
-atspi click Tor >/dev/null 2>&1 || true
+ui_click Tor >/dev/null 2>&1 || true
 sleep 1
-atspi click Apply >/dev/null 2>&1 || key Return
+ui_click Apply >/dev/null 2>&1 || key Return
 if wait_profile "through Tor" 240; then
     ok "returning to Tor re-applied protection"
 else
@@ -300,16 +314,16 @@ cat >/usr/local/bin/gh-qual-app <<'EOF'
 sleep 600
 EOF
 chmod 0755 /usr/local/bin/gh-qual-app
-atspi click "Selected applications" >/dev/null 2>&1 || bad "could not select the APP scope"
+ui_click "Selected applications" >/dev/null 2>&1 || bad "could not select the APP scope"
 sleep 1
-atspi click Apply >/dev/null 2>&1 || key Return
+ui_click Apply >/dev/null 2>&1 || key Return
 if wait_profile "selected applications" 240; then
     ok "the APP scope applied through the window"
 else
     bad "the APP scope did not apply: $(cli_state | head -3)"
 fi
 focus_gui
-atspi click "Add application" >/dev/null 2>&1 || bad "could not find Add application"
+ui_click "Add application" >/dev/null 2>&1 || bad "could not find Add application"
 sleep 1.5
 # The file chooser is a dialog of this window (GTK's own chooser when no portal backend is present).
 DIALOG="$(wmctrl -l 2>/dev/null | grep -iE 'choose|application' | head -1 | cut -d' ' -f1)"
@@ -338,7 +352,7 @@ case "$LABELS" in
 *) bad "the window does not list the application" ;;
 esac
 shot gui-04-app
-atspi click Stop >/dev/null 2>&1 || bad "could not find the Stop button"
+ui_click Stop >/dev/null 2>&1 || bad "could not find the Stop button"
 sleep 1.5
 ps -eo args= | grep -q '[g]h-qual-app' && bad "the application is still running after Stop" || ok "Stop ended the application"
 APPS="$(runuser -u "$GUI_USER" -g ghostnector -- /usr/bin/ghostnector apps 2>&1)"
@@ -347,21 +361,21 @@ echo "apps after stop: $APPS"
 # ---------------------------------------------------------------- T6: panic behind a confirmation
 echo
 echo "-- T6: panic needs the menu and a confirmation --"
-atspi click "More actions" >/dev/null 2>&1 || bad "could not open the header menu"
+ui_click "More actions" >/dev/null 2>&1 || bad "could not open the header menu"
 sleep 1
 LABELS="$(ui_labels)"
 case "$LABELS" in
 *"Deny all traffic now"*) ok "the panic entry is in the menu" ;;
 *) bad "the panic entry is not in the menu" ;;
 esac
-atspi click "Deny all traffic now" >/dev/null 2>&1 || bad "could not activate the panic entry"
+ui_click "Deny all traffic now" >/dev/null 2>&1 || bad "could not activate the panic entry"
 sleep 1
 LABELS="$(ui_labels)"
 case "$LABELS" in
 *"Deny all traffic now"*"blocked until you turn protection off"*) ok "panic asks for confirmation and explains" ;;
 *) bad "panic does not show the confirmation" ;;
 esac
-atspi click "Deny everything" >/dev/null 2>&1 || bad "could not confirm panic"
+ui_click "Deny everything" >/dev/null 2>&1 || bad "could not confirm panic"
 BLOCKED=0
 for _ in $(seq 1 30); do
     "${CLI[@]}" status 2>/dev/null | head -1 | grep -q "no traffic can leave" && { BLOCKED=1; break; }
