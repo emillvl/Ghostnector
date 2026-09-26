@@ -54,25 +54,47 @@ wait_profile()   { local i; for i in $(seq 1 "$2"); do cli_state | grep -q "$1" 
 atspi() { runuser -u "$GUI_USER" -- env DISPLAY=:90 DBUS_SESSION_BUS_ADDRESS="$BUS" python3 "$ATSPI" "$@" 2>/dev/null; }
 # Clicks, in order of preference:
 #   1. an AT-SPI action (switches, buttons, menu items) — works without focus;
-#   2. keyboard: Tab until the named control has AT-SPI focus, then Space;
+#   2. keyboard: Tab to the control (radio groups need arrow navigation: only the selected member
+#      is a tab stop), then Space;
 #   3. fixed layout coordinates for this exact window (460x640 at 0,0), taken from a screenshot.
+focus_by_tab() { # NAME [MAX]
+    local i
+    for i in $(seq 1 "${2:-40}"); do
+        atspi focused "$1" >/dev/null 2>&1 && return 0
+        xdotool key --clearmodifiers Tab
+        sleep 0.12
+    done
+    return 1
+}
+select_radio() { # NAME SIBLING ARROW
+    local name="$1" sibling="$2" arrow="$3"
+    focus_by_tab "$sibling" || return 1
+    xdotool key --clearmodifiers "$arrow"
+    sleep 0.3
+    atspi focused "$name" >/dev/null 2>&1 || return 1
+    xdotool key --clearmodifiers space
+    sleep 0.3
+    return 0
+}
 ui_click() {
-    local name="$1" i xy
+    local name="$1" xy
     if atspi click "$name" >/dev/null 2>&1; then
         sleep 0.3
         return 0
     fi
     xdotool windowactivate --sync "$(xdotool search --name '^Ghostnector$' | head -1)" 2>/dev/null || true
     sleep 0.2
-    for i in $(seq 1 40); do
-        if atspi focused "$name" >/dev/null 2>&1; then
-            xdotool key --clearmodifiers space
-            sleep 0.4
-            return 0
-        fi
-        xdotool key --clearmodifiers Tab
-        sleep 0.12
-    done
+    case "$name" in
+    "I2P") select_radio "I2P" "Tor" Right && return 0 ;;
+    "Tor") select_radio "Tor" "I2P" Left && return 0 ;;
+    "Selected applications") select_radio "Selected applications" "Whole system" Right && return 0 ;;
+    "Whole system") select_radio "Whole system" "Selected applications" Left && return 0 ;;
+    esac
+    if focus_by_tab "$name"; then
+        xdotool key --clearmodifiers space
+        sleep 0.4
+        return 0
+    fi
     xy="$(fixed_coords "$name")"
     if [ -n "$xy" ]; then
         xdotool mousemove --sync "${xy% *}" "${xy#* }" click 1
