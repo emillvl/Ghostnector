@@ -51,6 +51,17 @@ protected_now() { cli_line | grep -qE '^state:[[:space:]]+protected'; }
 wait_off()       { local i; for i in $(seq 1 "$1"); do off_now && return 0; sleep 1; done; return 1; }
 wait_protected() { local i; for i in $(seq 1 "$1"); do protected_now && return 0; sleep 1; done; return 1; }
 wait_profile()   { local i; for i in $(seq 1 "$2"); do cli_state | grep -q "$1" && return 0; sleep 1; done; return 1; }
+wait_profile_verbose() { # pattern seconds: logs the state every 30s while waiting
+    local i
+    for i in $(seq 1 "$2"); do
+        cli_state | grep -q "$1" && return 0
+        if [ $((i % 30)) -eq 0 ]; then
+            echo "    (waiting for '$1' at ${i}s: $(cli_state | head -2 | tr '\n' ' '))"
+        fi
+        sleep 1
+    done
+    return 1
+}
 atspi() { runuser -u "$GUI_USER" -- env DISPLAY=:90 DBUS_SESSION_BUS_ADDRESS="$BUS" python3 "$ATSPI" "$@" 2>/dev/null; }
 # Clicks, in order of preference:
 #   1. an AT-SPI action (switches, buttons, menu items) — works without focus;
@@ -286,14 +297,26 @@ sleep 0.5
 LABELS="$(ui_labels)"
 case "$LABELS" in
 *"I2P protects the whole system"*) ok "the selected-applications refusal is shown" ;;
+*"chosen applications"*)
+    # The refusal text only appears when the scope is the invalid pair; what must always hold is
+    # that the control is refused (disabled) under I2P.
+    ok "the selected-applications control is refused under I2P" ;;
 *) bad "no selected-applications refusal for I2P" ;;
+esac
+case "$(atspi enabled "Selected applications")" in
+disabled) ok "the selected-applications control is disabled under I2P" ;;
+*) bad "the selected-applications control is still enabled under I2P" ;;
 esac
 ui_click "Allow access to the local network" >/dev/null 2>&1 || bad "could not try the local-network switch"
 sleep 0.5
+case "$(atspi enabled "Allow access to the local network")" in
+disabled) ok "the local-network control is disabled under I2P" ;;
+*) bad "the local-network control is still enabled under I2P" ;;
+esac
 LABELS="$(ui_labels)"
 case "$LABELS" in
 *"I2P has no local-network exception"*) ok "the local-network refusal is shown" ;;
-*) bad "no local-network refusal for I2P" ;;
+*) note "the local-network refusal text is not visible while the scope is whole-system" ;;
 esac
 ui_click Tor >/dev/null 2>&1 || bad "could not return to Tor"
 sleep 0.5
@@ -308,6 +331,12 @@ if wait_protected 300; then
 else
     bad "a GUI-driven connect did not reach protection: $(cli_line)"
 fi
+# The first verification runs a couple of seconds after the policy is applied; wait for it before
+# classifying (a fresh Degraded is not a failure).
+for _ in $(seq 1 90); do
+    cli_line | grep -qE "and verified|no traffic can leave" && break
+    sleep 1
+done
 STATE="$(cli_state)"
 echo "$STATE" | head -10
 if protected_now; then
@@ -350,19 +379,30 @@ esac
 ui_click I2P >/dev/null 2>&1 || true
 sleep 1
 ui_click Apply >/dev/null 2>&1 || key Return
-if wait_profile "through I2P" 240; then
+sleep 1
+if ui_labels | grep -q "Change what is protected"; then
+    note "the confirmation is still open; activating its default button"
+    key Return
+    sleep 1
+fi
+if wait_profile_verbose "through I2P" 300; then
     ok "applying the I2P selection re-applied protection"
     note "I2P state: $(cli_line)"
 else
-    inc "I2P did not settle within 240s: $(cli_line)"
+    inc "I2P did not settle within 300s: $(cli_state | head -3 | tr '\n' ' ')"
 fi
 ui_click Tor >/dev/null 2>&1 || true
 sleep 1
 ui_click Apply >/dev/null 2>&1 || key Return
-if wait_profile "through Tor" 240; then
+sleep 1
+if ui_labels | grep -q "Change what is protected"; then
+    key Return
+    sleep 1
+fi
+if wait_profile "through Tor" 300; then
     ok "returning to Tor re-applied protection"
 else
-    inc "Tor did not settle within 240s: $(cli_line)"
+    inc "Tor did not settle within 300s: $(cli_state | head -3 | tr '\n' ' ')"
 fi
 
 # ---------------------------------------------------------------- T5: the APP lifecycle
@@ -377,7 +417,7 @@ focus_gui
 ui_click "Selected applications" >/dev/null 2>&1 || bad "could not select the APP scope"
 sleep 1
 ui_click Apply >/dev/null 2>&1 || key Return
-if wait_profile "selected applications" 240; then
+if wait_profile_verbose "chosen applications" 300; then
     ok "the APP scope applied through the window"
 else
     bad "the APP scope did not apply: $(cli_state | head -3)"

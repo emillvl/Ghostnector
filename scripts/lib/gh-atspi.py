@@ -178,6 +178,22 @@ def focus_report():
     return 0
 
 
+def enabled(name):
+    """Print enabled/disabled for the first node named NAME."""
+    for node in find_all(name):
+        try:
+            states = node.getState().getStates()
+            if pyatspi.STATE_SENSITIVE in states and pyatspi.STATE_ENABLED in states:
+                print("enabled")
+            else:
+                print("disabled")
+            return 0
+        except Exception:
+            continue
+    print("missing")
+    return 1
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -212,6 +228,8 @@ def main():
         return focused(sys.argv[2])
     if command == "focus-report":
         return focus_report()
+    if command == "enabled":
+        return enabled(sys.argv[2])
     if command == "has":
         return 0 if find(sys.argv[2], contains=True) else 1
     if command == "wait":
