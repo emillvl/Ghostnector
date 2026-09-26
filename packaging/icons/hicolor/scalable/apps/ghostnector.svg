@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Ghostnector's own mark: a shield with a routed path through it. Drawn for this project; no
+     third-party marks. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="shield" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2f6f4f"/>
+      <stop offset="1" stop-color="#1d4632"/>
+    </linearGradient>
+  </defs>
+  <path d="M64 8 L112 26 V62 C112 92 92 112 64 120 C36 112 16 92 16 62 V26 Z"
+        fill="url(#shield)" stroke="#12301f" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M40 78 C52 78 52 50 64 50 C76 50 76 78 88 78"
+        fill="none" stroke="#f2f7f3" stroke-width="7" stroke-linecap="round"/>
+  <circle cx="40" cy="78" r="7" fill="#f2f7f3"/>
+  <circle cx="88" cy="78" r="7" fill="#f2f7f3"/>
+</svg>

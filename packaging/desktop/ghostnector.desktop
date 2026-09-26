@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Ghostnector
+GenericName=Network Privacy
+Comment=Protect network traffic with Tor or I2P
+Exec=ghostnector-gui
+Icon=ghostnector
+Terminal=false
+Categories=Network;Security;GTK;
+Keywords=privacy;tor;i2p;network;protection;
+StartupNotify=true

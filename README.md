@@ -1,11 +1,15 @@
 # Ghostnector
 
 Network-level privacy for Linux: transparent Tor routing, encrypted DNS, isolated I2P, and a
-fail-closed default-deny policy that cannot silently return traffic to the clearnet.
+fail-closed default-deny policy that cannot silently return traffic to the clearnet. A simple GTK4
+window renders the control plane's authoritative state; the command line does everything else.
 
-**Status:** M1–M7 complete and frozen at `v1.0.0-rc2`; M8 (`APP` scope) in progress.
+**Status:** M1–M10 implemented. `v1.0.0-rc4` is the frozen M1–M9 checkpoint; the M10 candidate is
+under final qualification (native clean install, whole-product adversarial campaign, anonymity and
+performance qualification). Nothing is claimed beyond the evidence in
+[`docs/PROTECTION-CLAIMS.md`](docs/PROTECTION-CLAIMS.md).
 **Architecture:** [`ARCHITECTURE-REVIEW.md`](ARCHITECTURE-REVIEW.md) — read this first; every decision
-in the code cites it. **M8 decisions:** [`docs/M8-DECISIONS.md`](docs/M8-DECISIONS.md).
+in the code cites it. **M10 GUI:** [`docs/M10-DECISIONS.md`](docs/M10-DECISIONS.md).
 **Plan:** [`docs/IMPLEMENTATION-PLAN.md`](docs/IMPLEMENTATION-PLAN.md).
 
 ## Platform: Linux only
@@ -25,6 +29,7 @@ The code is deliberately split so that everything except the kernel-facing backe
 | `ghostnector-appd` — the privileged helper that owns APP namespaces | Linux only |
 | `ghostnector-core` — the control plane: state machine, journal, orchestration | Linux only |
 | `ghostnector-cli` | Linux only |
+| `ghostnector-gui` — the GTK4 window | Linux only (GTK 4.12+) |
 | `ghostnector-bootguard` — early fail-closed baseline after reboot | Linux only |
 | `ghostnector-dns` — the DNS chokepoint relay | Linux only |
 
@@ -41,11 +46,30 @@ crates/
   ghostnector-appd/       privileged helper: APP namespaces, dead ends, namespace verification
   ghostnector-core/       state machine, journal, orchestration, verification, IPC server
   ghostnector-cli/        command-line client
+  ghostnector-gui/        GTK4 presentation client (renders Snapshot; decides nothing)
   ghostnector-bootguard/  early fail-closed baseline after reboot
   ghostnector-dns/        the DNS chokepoint relay
 docs/
-packaging/                systemd units, sysusers, tmpfiles
+packaging/                systemd units, sysusers, tmpfiles, desktop entry, icon, install scripts
 ```
+
+## Install and use
+
+```
+sudo packaging/install.sh <target-dir>        # files, sysusers, tmpfiles, units, desktop entry
+sudo usermod -aG ghostnector $USER            # then log back in
+ghostnector connect                            # Tor, whole system (needs the group)
+ghostnector connect --network i2p              # I2P, whole system
+ghostnector connect --scope app && ghostnector run -- firefox
+ghostnector status | watch | disconnect | panic
+ghostnector-gui                                # the window: on/off, Tor/I2P, scope, apps, state
+```
+
+The GUI is an unprivileged client of `ghostnector-core`: it shows the daemon's authoritative
+`Snapshot` (never its own guess), holds no capability, and is never exempt from policy. The window
+covers protection on/off, Tor or I2P, whole system or selected applications, per-application
+add/list/stop, a confirmed deny-everything action, and a secondary diagnostics view. Technical
+information (exemptions, health, verification age, versions) lives there, not in normal use.
 
 ## Build and test
 
@@ -79,6 +103,14 @@ bash scripts/netd-socket-test.sh "$CARGO_TARGET_DIR/debug/ghostnector-netd"
 # Prove the whole stack (cli -> core -> netd -> kernel) in a throwaway namespace:
 cargo build --workspace --bins
 bash scripts/core-cli-test.sh "$CARGO_TARGET_DIR/debug"
+```
+
+The GUI is behind a feature so the workspace builds without a display stack. On Linux with GTK
+4.12+ development files (`libgtk-4-dev` on Ubuntu 24.04):
+
+```bash
+cargo build -p ghostnector-gui --features gtk
+xvfb-run -a ./target/debug/ghostnector-gui --socket /run/ghostnector/core.sock   # headless check
 ```
 
 `CARGO_TARGET_DIR` keeps build artefacts on the Linux filesystem; building directly into `/mnt/c`

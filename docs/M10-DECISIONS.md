@@ -1,8 +1,8 @@
 # M10 decisions — the GTK4 interface
 
-Status: **proposal, for review before implementation** (2026-09-26). No M10 code exists yet. This
-document answers the architecture questions in `docs/HANDOFF-M10.md` §6 and records the Phase-1
-findings that must be fixed before the M10 candidate can be qualified.
+Status: **implemented** (M10.1, commit `b92e994`), pending the native VM real-display qualification
+and the clean-install test in Phase 3. The architecture below was reviewed before implementation;
+"as built" notes are at the end. No M1–M9 backend boundary was widened.
 
 ---
 
@@ -247,3 +247,31 @@ runs under Xvfb on the VM, never in the hermetic gate.
 * It does not persist anything except ordinary window state; app labels are session-local. No
   destinations, queries or flows are ever stored or displayed.
 * I2P is whole-system only in this version (unchanged from M9).
+
+---
+
+## As built (M10.1, commit `b92e994`)
+
+The implementation follows the decisions above with these specifics, recorded so later work does not
+have to re-derive them:
+
+1. **Subscribe is on the event connection.** The protocol turns a connection into a stream when it
+   receives `Subscribe`, and the control connection stays request/response. The worker owns both and
+   reconnects them together under a new epoch.
+2. **Selection changes while protection is on are confirmed, not locked.** Changing network, scope
+   or the local-network switch while protected re-applies protection; the window asks first, and a
+   cancelled change puts the controls back to what core last reported. While `Applying`, controls are
+   frozen.
+3. **GTK 4.12 or newer.** The window uses `FileDialog`/`AlertDialog` (4.10) and
+   `CssProvider::load_from_string` (4.12). Ubuntu 24.04 ships 4.14. The dependency is behind the
+   `gtk` cargo feature so the rest of the workspace builds everywhere.
+4. **One wording module.** `ghostnector-spec::display` holds the state/scope/network/verification
+   lines; the CLI renders through it unchanged and the GUI uses the same functions.
+5. **Panic and diagnostics.** Panic is a header-menu action behind a confirmation dialog. The
+   diagnostics view shows the last known snapshot clearly labelled as such when the core is
+   unreachable, and copies as text; it never shows destinations, queries, or per-flow data.
+6. **Session lifetime.** The window holds each launched application's session socket open with a
+   drain thread and closes its end on Stop; closing the window does not stop an application that is
+   already running (the daemon owns the group, the kernel owns the policy).
+7. **Known limit:** a group launched by another client (or before this window started) is listed by
+   a neutral ordinal, because `Snapshot` deliberately carries no command line the GUI could show.
