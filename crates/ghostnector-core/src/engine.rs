@@ -647,14 +647,21 @@ impl Engine {
     /// Deny before opening anything, bring up what the profile needs, then open exactly what was
     /// asked for.
     ///
-    /// The order is the security property (DR-4): the machine is denied while Tor bootstraps, and
-    /// Tor can bootstrap because the baseline exempts its uid. Nothing is opened until the service
-    /// says it is ready.
+    /// The order is the security property (DR-4): the machine is denied while a service comes up,
+    /// and the service can become ready because the policy in force exempts its own uid. Nothing is
+    /// opened until the service says it is ready.
     ///
-    /// `APP` scope is the exception that proves the rule: it never applies the machine-wide
-    /// baseline, because it does not protect the machine. Its deny-first step is the APP host table
-    /// itself — the bridge exists but admits nothing until a namespace's DNAT creates a flow, and
-    /// no namespace exists yet.
+    /// I2P is the exception that is still deny-first: the router resolves its reseed hosts by name,
+    /// which the fail-closed baseline denies (it exempts only Tor's uid), so the I2P profile — a
+    /// deny-everything-except-the-router policy — is applied *before* the router is started. At
+    /// that moment the exemption belongs to a process that does not exist yet and everything else
+    /// is denied; the baseline never carries the I2P uid, which is the M9 mutually-exclusive
+    /// exemption model (D-41).
+    ///
+    /// `APP` scope is the other exception: it never applies the machine-wide baseline, because it
+    /// does not protect the machine. Its deny-first step is the APP host table itself — the bridge
+    /// exists but admits nothing until a namespace's DNAT creates a flow, and no namespace exists
+    /// yet.
     fn bring_up_then_open(
         &self,
         target: ProfileId,
@@ -673,6 +680,15 @@ impl Engine {
             // The bridge is created only after the host table exists: deny first, then the path.
             self.ensure_app_bridge(ports)?;
         }
+
+        // I2P: the router's own policy before the router, because the baseline cannot carry the
+        // router's exemption and the router needs DNS to reseed (D-41).
+        let early_report = if target == ProfileId::I2pSystem {
+            Some(self.apply(target, params)?)
+        } else {
+            None
+        };
+
         self.services.bring_up(
             target,
             ports,
@@ -680,7 +696,10 @@ impl Engine {
             i2p_ports,
         )?;
 
-        let report = self.apply(target, params)?;
+        let report = match early_report {
+            Some(report) => report,
+            None => self.apply(target, params)?,
+        };
 
         // DNS last: the policy is already redirecting port 53 at this point, so a relay started any
         // earlier would have been serving queries under the previous rules. I2P has no chokepoint:
@@ -2100,6 +2119,66 @@ mod tests {
             "the baseline must be applied before the services start, and before anything is opened"
         );
         assert_eq!(services.brought_up(), vec![ProfileId::TorSystem]);
+    }
+
+    #[test]
+    fn an_i2p_connect_applies_the_router_policy_before_the_router_is_ready() {
+        // The router resolves its reseed hosts by name and the fail-closed baseline denies that
+        // (it exempts only Tor's uid). If the router could not be brought up, the I2P policy must
+        // still have been applied already — that is the ordering that lets it bootstrap — and the
+        // failure must withdraw it (D-41).
+        let (helper, services, engine, _dir) = engine_and_services();
+        services.fail_bring_up_with("the router's proxy did not answer");
+
+        let error = engine
+            .connect(i2p_profile(), USER_UID)
+            .expect_err("connect must fail");
+        assert!(error.to_string().contains("did not answer"), "{error}");
+
+        let sequence: Vec<String> = helper
+            .verbs()
+            .iter()
+            .map(|verb| match verb {
+                Verb::ApplyProfile { profile, .. } => format!("apply:{profile:?}"),
+                Verb::Report => "report".to_string(),
+                Verb::Revert => "revert".to_string(),
+                Verb::FlushConntrack => "flush".to_string(),
+                Verb::Verify => "verify".to_string(),
+                Verb::Hello { .. } => "hello".to_string(),
+            })
+            .collect();
+        assert_eq!(
+            sequence,
+            vec![
+                "apply:FailClosed".to_string(),
+                "report".to_string(),
+                "apply:I2pSystem".to_string(),
+                "revert".to_string(),
+            ],
+            "the I2P policy is applied before the router is brought up, and a failure withdraws it"
+        );
+        assert_eq!(engine.snapshot().state, ProtectionState::Off);
+    }
+
+    #[test]
+    fn an_i2p_connect_opens_only_the_router_policy_and_never_the_baseline_for_i2p() {
+        let (helper, services, engine, _dir) = engine_and_services();
+        engine.connect(i2p_profile(), USER_UID).expect("connect");
+
+        let profiles: Vec<ProfileId> = helper
+            .verbs()
+            .iter()
+            .filter_map(|verb| match verb {
+                Verb::ApplyProfile { profile, .. } => Some(*profile),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            profiles,
+            vec![ProfileId::FailClosed, ProfileId::I2pSystem],
+            "the baseline is applied first and never carries the I2P uid"
+        );
+        assert_eq!(services.brought_up(), vec![ProfileId::I2pSystem]);
     }
 
     #[test]

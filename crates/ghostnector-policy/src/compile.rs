@@ -874,7 +874,11 @@ fn filter_chain(rules: Vec<Rule>) -> Chain {
 /// Deny everything except loopback, Tor's own egress, and DHCP.
 ///
 /// This is the state the machine sits in *before* services start, so there is no window during a
-/// transition where traffic can escape (DR-4).
+/// transition where traffic can escape (DR-4). The I2P router is the one service that cannot be
+/// started here: it resolves its reseed hosts by name, which this baseline denies, so the engine
+/// applies the I2P profile (itself a deny-everything-except-the-router policy) before starting it
+/// (D-41). This keeps the M9 mutually-exclusive exemption model: the baseline never carries the
+/// I2P uid.
 fn fail_closed_chains(env: &Environment) -> Result<Vec<Chain>, PolicyError> {
     let tor_uid = require_tor(env)?;
     let mut rules = vec![
