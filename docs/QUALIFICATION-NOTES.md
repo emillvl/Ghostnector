@@ -116,5 +116,30 @@ result cuts, writing evidence to `/tmp`, and having no detached cleanup.
   the control plane's directory (D-34).
 * The installed qualification also requires `systemd-analyze verify` to be clean for all six units
   (it found D-35/D-36) and asserts that the control plane can read `/proc/net/route` (D-37) and is
-  authorized to repoint systemd-resolved (D-38); the machine carries two bounded polkit rules for
+  authorized to repoint the resolver (D-38); the machine carries two bounded polkit rules for
   exactly those two jobs.
+
+## Installed-stack qualification record (2026-09-26, after D-29–D-38)
+
+Run as a transient unit (`systemd-run --unit=ghostnector-qual --property=RuntimeMaxSec=1500`),
+real Tor 0.4.9.11 from the packaged `ghostnector-tor.service`, public HTTP check
+(`checkip.amazonaws.com` pinned to an IPv4 literal), UDP check to the host NAT endpoint, durable log
+at `/var/log/ghostnector-qual/20260926T192852Z.log` (the run before the resolver fixes) and
+`latest.log`. The final run: **22 held, 0 contradicted, 0 inconclusive**. It proved, on the installed
+machine:
+
+* all six units verify clean with `systemd-analyze verify`;
+* both sockets exist, are trusted, and are owned as the units say (D-29);
+* the polkit bound: the service account may start/stop the two routers, and is refused `cron`,
+  `restart` and an ordinary-user attempt (D-30);
+* managed Tor bootstraps to 100% and the control cookie is `debian-tor:ghostnector 0640` (D-31);
+* the namespace helper and `/run/netns` work on a fresh boot (D-33/D-34);
+* connect reaches `protected — and verified` through real Tor, with UDP denied, the protected path
+  answering with an address that is not this machine, and the effective policy compared;
+* systemd-resolved is repointed at the chokepoint (`resolvectl` shows `127.0.0.1`) and the
+  `/proc/net/route` note is gone (D-37/D-38);
+* disconnect returns the machine to `off`, with no table applied, and SSH returns by itself.
+
+The qualification is safe to run over SSH because it is detached, bounded, logs durably, and always
+ends in `disconnect` (with the documented rescue as a fallback): the run cut SSH for ~90 seconds and
+restored it without any manual step.
