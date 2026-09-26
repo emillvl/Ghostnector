@@ -50,6 +50,8 @@ install -D -m 0644 "$here/sysusers.d/ghostnector.conf" /usr/lib/sysusers.d/ghost
 install -D -m 0644 "$here/tmpfiles.d/ghostnector.conf" /usr/lib/tmpfiles.d/ghostnector.conf
 install -D -m 0644 "$here/polkit-1/rules.d/50-ghostnector.rules" \
     /usr/share/polkit-1/rules.d/50-ghostnector.rules
+install -D -m 0644 "$here/polkit-1/rules.d/51-ghostnector-resolved.rules" \
+    /usr/share/polkit-1/rules.d/51-ghostnector-resolved.rules
 install -d -m 0755 /etc/ghostnector
 install -m 0644 "$here/core.env.example" /etc/ghostnector/core.env.example
 

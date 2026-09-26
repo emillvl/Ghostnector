@@ -115,5 +115,6 @@ result cuts, writing evidence to `/tmp`, and having no detached cleanup.
   `/run/ghostnector/appd/`, because it runs as root without `CAP_DAC_OVERRIDE` and cannot write in
   the control plane's directory (D-34).
 * The installed qualification also requires `systemd-analyze verify` to be clean for all six units
-  (it found D-35/D-36) and asserts that the control plane can read `/proc/net/route` so
-  systemd-resolved is actually repointed (D-37).
+  (it found D-35/D-36) and asserts that the control plane can read `/proc/net/route` (D-37) and is
+  authorized to repoint systemd-resolved (D-38); the machine carries two bounded polkit rules for
+  exactly those two jobs.

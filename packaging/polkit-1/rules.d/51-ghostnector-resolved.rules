@@ -1,0 +1,25 @@
+// Let the Ghostnector control plane manage the system resolver while protection is on.
+//
+// On connect the control plane repoints systemd-resolved at its DNS chokepoint and on disconnect it
+// reverts that change (crates/ghostnector-core/src/resolver.rs). On a real install `resolvectl` is
+// refused by polkit (the resolve1 actions default to `auth_admin`), so the daemon honestly reported
+// that the resolver was not repointed (D-38). The firewall's port-53 redirect remains the
+// enforcement; this rule only lets the daemon do what it already documents.
+//
+// It is bounded to the ghostnector service account and to exactly the three actions resolvectl
+// uses. Everything else about the resolver (mDNS, LLMNR, DNSSEC, default-route, registering
+// services) stays refused, and every other user stays refused.
+polkit.addRule(function(action, subject) {
+    if (subject.user !== "ghostnector") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    var allowed = [
+        "org.freedesktop.resolve1.set-dns-servers",
+        "org.freedesktop.resolve1.set-domains",
+        "org.freedesktop.resolve1.revert"
+    ];
+    if (allowed.indexOf(action.id) !== -1) {
+        return polkit.Result.YES;
+    }
+    return polkit.Result.NOT_HANDLED;
+});

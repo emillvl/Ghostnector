@@ -22,6 +22,13 @@ mod tests {
             .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()))
     }
 
+    fn resolved_polkit_rule_file() -> String {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packaging/polkit-1/rules.d/51-ghostnector-resolved.rules");
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()))
+    }
+
     fn packaging_file(relative: &str) -> String {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../packaging")
@@ -337,6 +344,46 @@ mod tests {
                     line.contains("ghostnector-tor.service")
                         || line.contains("ghostnector-i2pd.service"),
                     "the rule names a unit it must not: {line}"
+                );
+            }
+        }
+    }
+
+    /// The second polkit rule is the authorization for the control plane to repoint
+    /// systemd-resolved at its chokepoint on connect and to revert that on disconnect (D-38). It is
+    /// a privilege surface: it must stay bounded to that user and to exactly the three actions
+    /// resolvectl uses, and this test fails if the text drifts.
+    #[test]
+    fn the_resolved_rule_grants_only_the_resolver_actions_to_the_control_plane() {
+        let text = resolved_polkit_rule_file();
+        assert!(
+            text.contains("subject.user !== \"ghostnector\""),
+            "the rule must be bounded to the ghostnector service account"
+        );
+        let allowed = [
+            "org.freedesktop.resolve1.set-dns-servers",
+            "org.freedesktop.resolve1.set-domains",
+            "org.freedesktop.resolve1.revert",
+        ];
+        for action in allowed {
+            assert!(text.contains(action), "the rule must allow {action}");
+        }
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.is_empty() {
+                continue;
+            }
+            if let Some(start) = line.find("org.freedesktop.resolve1.") {
+                let rest = &line[start..];
+                let end = rest
+                    .find(|character: char| {
+                        !(character.is_ascii_alphanumeric() || character == '.' || character == '-')
+                    })
+                    .unwrap_or(rest.len());
+                let action = &rest[..end];
+                assert!(
+                    allowed.contains(&action),
+                    "the rule names an action it must not: {action}"
                 );
             }
         }

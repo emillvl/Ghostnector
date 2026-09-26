@@ -260,11 +260,19 @@ else
     bad "Tor did not write a control cookie"
 fi
 echo
-echo "-- D-37: the resolver can be repointed (needs /proc/net/route) --"
-if status_text | grep -q "proc/net/route"; then
-    bad "the control plane could not read /proc/net/route, so the resolver was not repointed"
+echo "-- D-37/D-38: the resolver can be repointed (needs /proc/net/route and resolvectl authorization) --"
+if status_text | grep -qE "proc/net/route|resolvectl.*refused"; then
+    bad "the control plane could not repoint the resolver: $(status_text | grep 'not repointed' | head -1)"
 else
-    ok "the resolver note is absent; repointing worked or the layout needs no change"
+    ok "no resolver-repointing failure is reported"
+fi
+if systemctl is-active --quiet systemd-resolved; then
+    LINK="$(ip route show default 2>/dev/null | awk '{print $5; exit}')"
+    if [ -n "$LINK" ] && resolvectl dns "$LINK" 2>/dev/null | grep -q "127.0.0.1"; then
+        ok "systemd-resolved sends queries to the chokepoint ($(resolvectl dns "$LINK" 2>/dev/null | tr -d '\n'))"
+    else
+        bad "systemd-resolved does not show the chokepoint as its DNS server"
+    fi
 fi
 echo
 echo "-- managed Tor --"
