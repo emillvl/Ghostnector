@@ -1,0 +1,27 @@
+[package]
+name = "ghostnector-gui"
+description = "The GTK4 presentation client: it renders the control plane's snapshot and asks it to change; it decides nothing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+name = "ghostnector_gui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ghostnector-gui"
+path = "src/main.rs"
+required-features = ["gtk"]
+
+[features]
+# The GTK dependency is opt-in so every host and the hermetic gate can build and test the model and
+# the real core client without a display stack. The Linux release build enables it explicitly.
+default = []
+gtk = ["dep:gtk4"]
+
+[dependencies]
+ghostnector-spec = { path = "../ghostnector-spec" }
+serde_json = { workspace = true }
+gtk4 = { version = "0.11", optional = true, features = ["v4_10", "v4_12"] }

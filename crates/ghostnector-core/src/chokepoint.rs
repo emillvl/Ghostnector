@@ -200,7 +200,21 @@ mod tests {
         let relay = ChildRelay::new(program).expect("acceptable program");
         let (listen, upstream) = addresses();
 
-        relay.start(listen, upstream).expect("start");
+        // A freshly written script can be reported as "Text file busy" if a concurrently forked
+        // child of another test still holds the write descriptor between fork and exec. That is an
+        // artifact of running the whole test binary in parallel, not a property of the relay: retry
+        // the transient condition, and still fail if the relay never starts.
+        let mut attempts = 0;
+        loop {
+            match relay.start(listen, upstream) {
+                Ok(()) => break,
+                Err(error) if attempts < 50 && error.to_string().contains("Text file busy") => {
+                    attempts += 1;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("start: {error:?}"),
+            }
+        }
         assert!(relay.is_running(), "it should be running");
 
         relay.stop().expect("stop");

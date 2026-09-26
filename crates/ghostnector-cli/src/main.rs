@@ -12,7 +12,7 @@ mod inner {
     use std::process::ExitCode;
 
     use ghostnector_spec::ipc::{ErrorBody, Frame, Request, Response, PROTOCOL_VERSION};
-    use ghostnector_spec::{AppStatus, Networks, Profile, ProtectionState, Scope, Snapshot};
+    use ghostnector_spec::{display, AppStatus, Networks, Profile, Scope, Snapshot};
 
     const DEFAULT_SOCKET: &str = "/run/ghostnector/core.sock";
     const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -277,18 +277,15 @@ OPTIONS:
 
     fn render(snapshot: &Snapshot) -> String {
         let mut out = String::new();
-        out.push_str(&format!("state:        {}\n", describe_state(snapshot)));
+        out.push_str(&format!(
+            "state:        {}\n",
+            display::state_line(snapshot)
+        ));
         if let Some(profile) = &snapshot.profile {
             out.push_str(&format!(
                 "profile:      {} ({})\n",
-                describe_scope(profile.scope),
-                if profile.networks.tor {
-                    "through Tor"
-                } else if profile.networks.i2p {
-                    "through I2P"
-                } else {
-                    "encrypted DNS only"
-                }
+                display::scope_line(profile.scope),
+                display::network_line(profile)
             ));
             if profile.allow_lan {
                 out.push_str("              including the local network\n");
@@ -304,7 +301,7 @@ OPTIONS:
         ));
         out.push_str(&format!(
             "verification: {}\n",
-            describe_verification(snapshot.health.verification)
+            display::verification_line(snapshot.health.verification)
         ));
 
         if !snapshot.reasons.is_empty() {
@@ -330,41 +327,6 @@ OPTIONS:
             snapshot.blocked_egress_attempts
         ));
         out
-    }
-
-    fn describe_state(snapshot: &Snapshot) -> String {
-        let scope = snapshot.profile.as_ref().map(|profile| profile.scope);
-        match snapshot.state {
-            ProtectionState::Off => "off — traffic is not protected".to_string(),
-            ProtectionState::Applying => "applying — a transition is in progress".to_string(),
-            ProtectionState::Protected => "protected — and verified".to_string(),
-            ProtectionState::Degraded => "protected, but unverified".to_string(),
-            ProtectionState::Blocked if scope == Some(Scope::App) => {
-                "blocked — no protected application can reach the network".to_string()
-            }
-            ProtectionState::Blocked => "blocked — no traffic can leave".to_string(),
-            ProtectionState::Portal => "captive portal — protection is relaxed".to_string(),
-        }
-    }
-
-    fn describe_scope(scope: Scope) -> String {
-        match scope {
-            Scope::Off => "off".to_string(),
-            Scope::Dns => "encrypted DNS".to_string(),
-            Scope::App => "chosen applications".to_string(),
-            Scope::User => "your processes".to_string(),
-            Scope::System => "the whole system".to_string(),
-        }
-    }
-
-    fn describe_verification(verification: ghostnector_spec::Verification) -> &'static str {
-        match verification {
-            ghostnector_spec::Verification::Unknown => "not checked yet",
-            ghostnector_spec::Verification::Fresh => "checked recently",
-            ghostnector_spec::Verification::Stale => "not checked recently",
-            ghostnector_spec::Verification::Unavailable => "nothing can verify it yet",
-            ghostnector_spec::Verification::Failed => "CHECKED AND FAILED",
-        }
     }
 
     // ------------------------------------------------------------------ transport
@@ -576,6 +538,7 @@ OPTIONS:
     #[cfg(test)]
     mod tests {
         use super::*;
+        use ghostnector_spec::ProtectionState;
 
         fn args(list: &[&str]) -> std::vec::IntoIter<String> {
             list.iter()

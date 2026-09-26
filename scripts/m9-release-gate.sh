@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# The M1–M9 release gate, runnable on any Linux host with the build and test dependencies.
+# The M1–M10 release gate, runnable on any Linux host with the build and test dependencies.
 #
 #   scripts/m9-release-gate.sh [log path]
 #
@@ -10,7 +10,8 @@
 # the public I2P network, and it is recorded as its own run.
 #
 # Requires: cargo (stable), nftables, iproute2, util-linux (setpriv), python3, curl, tcpdump,
-# conntrack (optional), and root (the suites create namespaces and apply policy).
+# conntrack (optional), libgtk-4-dev (for the GUI's GTK feature), and root (the suites create
+# namespaces and apply policy).
 
 set -u
 cd "$(dirname "$0")/.."
@@ -36,6 +37,13 @@ BIN="$(pwd)/target/debug"
     echo "=== build bins ==="
     cargo build --workspace --bins
     echo "build rc=$?"
+    echo "=== gui (gtk feature) ==="
+    cargo check -p ghostnector-gui --features gtk --all-targets
+    echo "gui-check rc=$?"
+    cargo clippy -p ghostnector-gui --features gtk --all-targets -- -D warnings
+    echo "gui-clippy rc=$?"
+    cargo build -p ghostnector-gui --features gtk
+    echo "gui-build rc=$?"
     # The privileged helpers verify that the tools they execute are root-owned and not writable by
     # anyone else. On a machine where the build ran as another user, the artifacts are handed to
     # root before any suite runs; this is an environment step, not a product change.

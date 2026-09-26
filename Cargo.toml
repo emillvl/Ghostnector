@@ -9,6 +9,7 @@ members = [
     "crates/ghostnector-cli",
     "crates/ghostnector-dns",
     "crates/ghostnector-bootguard",
+    "crates/ghostnector-gui",
 ]
 
 [workspace.package]

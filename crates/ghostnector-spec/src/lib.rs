@@ -19,6 +19,7 @@
 pub mod app;
 pub mod appd;
 pub mod backend;
+pub mod display;
 pub mod exemption;
 pub mod ipc;
 pub mod profile;
