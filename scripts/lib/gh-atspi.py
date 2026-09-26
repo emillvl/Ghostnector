@@ -81,13 +81,18 @@ def click(name, role=None):
                 node.queryAction().doAction(index)
                 print(f"clicked {name!r} ({node.getRoleName()}) via {label}")
                 return 0
+    # A non-label node with any action may still be the control (for example a switch that exposes
+    # a single unnamed action). A label's actions are clipboard operations, never a control, so it
+    # is never activated by the fallback.
     for node in candidates:
+        if node.getRoleName() == "label":
+            continue
         names = action_names(node)
         if names:
             node.queryAction().doAction(0)
             print(f"clicked {name!r} ({node.getRoleName()}) via action 0 ({names[0]})")
             return 0
-    print(f"no action on any node named {name!r} (roles: {[c.getRoleName() for c in candidates]})")
+    print(f"no action on any non-label node named {name!r}")
     return 1
 
 

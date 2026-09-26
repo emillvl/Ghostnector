@@ -52,19 +52,24 @@ wait_off()       { local i; for i in $(seq 1 "$1"); do off_now && return 0; slee
 wait_protected() { local i; for i in $(seq 1 "$1"); do protected_now && return 0; sleep 1; done; return 1; }
 wait_profile()   { local i; for i in $(seq 1 "$2"); do cli_state | grep -q "$1" && return 0; sleep 1; done; return 1; }
 atspi() { runuser -u "$GUI_USER" -- env DISPLAY=:90 DBUS_SESSION_BUS_ADDRESS="$BUS" python3 "$ATSPI" "$@" 2>/dev/null; }
-# GTK4 check buttons expose no AT-SPI action, so the reliable path is: AT-SPI finds the widget's
-# screen coordinates, xdotool clicks there. Buttons that do expose an action are clicked through
-# AT-SPI first (the fallback below).
+# Clicks: an AT-SPI action is used when the control exposes one (switches, buttons, menu items);
+# otherwise AT-SPI locates the widget and xdotool clicks its screen coordinates. Coordinate clicks
+# need the target window focused: xfwm4's click-to-focus would otherwise consume the first click.
 ui_click() {
     local name="$1" xy
+    if atspi click "$name" >/dev/null 2>&1; then
+        sleep 0.3
+        return 0
+    fi
     xy="$(atspi coords "$name")"
     if [ -n "$xy" ]; then
+        xdotool windowactivate --sync "$(xdotool getactivewindow 2>/dev/null)" 2>/dev/null || true
+        sleep 0.2
         xdotool mousemove --sync "${xy% *}" "${xy#* }" click 1
         sleep 0.4
         return 0
     fi
-    runuser -u "$GUI_USER" -- env DISPLAY=:90 DBUS_SESSION_BUS_ADDRESS="$BUS" \
-        python3 "$ATSPI" click "$name" 2>/dev/null
+    return 1
 }
 ui_labels() { atspi labels; }
 shot() { import -window root "$SHOTS/$1.png" 2>/dev/null; }
@@ -226,6 +231,7 @@ shot gui-01-off
 # ---------------------------------------------------------------- T2: refusals in plain words
 echo
 echo "-- T2: unsupported combinations are refused in plain words --"
+focus_gui
 ui_click I2P >/dev/null 2>&1 || bad "could not select I2P"
 sleep 0.5
 LABELS="$(ui_labels)"
@@ -255,10 +261,14 @@ else
 fi
 STATE="$(cli_state)"
 echo "$STATE" | head -10
-case "$(cli_line)" in
-*"and verified"*) ok "the state is protected — and verified" ;;
-*) inc "the state is protected but not verified: $(cli_line)" ;;
-esac
+if protected_now; then
+    case "$(cli_line)" in
+    *"and verified"*) ok "the state is protected — and verified" ;;
+    *) inc "the state is protected but not verified: $(cli_line)" ;;
+    esac
+else
+    bad "the state is not protected: $(cli_line)"
+fi
 DIAG="$(diag_copy)"
 echo "$DIAG" | grep -E "state:|profile:|policy applied:|verification:|services:" || true
 case "$DIAG" in
@@ -267,7 +277,7 @@ case "$DIAG" in
 esac
 BANNER="$(atspi banner)"
 case "$BANNER" in
-*"protected"*) ok "the banner shows protection: '$BANNER'" ;;
+protected*) ok "the banner shows protection: '$BANNER'" ;;
 *) bad "the banner does not show protection: '$BANNER'" ;;
 esac
 shot gui-03-protected
@@ -314,6 +324,7 @@ cat >/usr/local/bin/gh-qual-app <<'EOF'
 sleep 600
 EOF
 chmod 0755 /usr/local/bin/gh-qual-app
+focus_gui
 ui_click "Selected applications" >/dev/null 2>&1 || bad "could not select the APP scope"
 sleep 1
 ui_click Apply >/dev/null 2>&1 || key Return
