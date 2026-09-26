@@ -31,7 +31,6 @@ mod tests {
                 "CAP_NET_ADMIN CAP_SYS_ADMIN CAP_CHOWN",
             ),
             ("AmbientCapabilities", "CAP_NET_ADMIN"),
-            ("KeepCapabilities", "yes"),
             ("NoNewPrivileges", "yes"),
             ("RestrictAddressFamilies", "AF_UNIX AF_NETLINK"),
             ("RestrictNamespaces", "net mnt"),
@@ -45,6 +44,16 @@ mod tests {
                 Some(found) => problems.push(format!("{key} is '{found}', expected '{value}'")),
                 None => problems.push(format!("{key} is missing")),
             }
+        }
+        // systemd has no KeepCapabilities directive; naming one is a claim that is silently
+        // ignored, so the unit text must not carry it (D-36). The capability state is real because
+        // the helper runs as root with a bounded set, and it is measured on the installed machine.
+        if text
+            .lines()
+            .map(str::trim)
+            .any(|line| !line.starts_with('#') && line.contains("KeepCapabilities"))
+        {
+            problems.push("KeepCapabilities is not a systemd directive (D-36)".to_string());
         }
         if !text.contains("/usr/libexec/ghostnector-appd") {
             problems.push("the unit does not start the helper from /usr/libexec".to_string());
@@ -89,7 +98,6 @@ mod tests {
 [Service]
 ExecStart=/usr/libexec/ghostnector-appd
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_DAC_OVERRIDE
-KeepCapabilities=yes
 AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN
 NoNewPrivileges=yes
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
@@ -107,6 +115,18 @@ ReadWritePaths=/run/ghostnector /run/netns
         );
         assert!(
             problems.iter().any(|p| p.contains("CAP_DAC_OVERRIDE")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn the_checker_notices_a_directive_that_does_not_exist() {
+        let with_bogus = "[Service]\nKeepCapabilities=yes\n";
+        let problems = violations(with_bogus);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("not a systemd directive")),
             "{problems:?}"
         );
     }

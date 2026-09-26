@@ -1,6 +1,6 @@
 [Unit]
 Description=Ghostnector APP-scope namespace helper (dead-end namespaces)
-Documentation=man:ghostnector-appd(8)
+Documentation=file:/usr/share/doc/ghostnector/README.md file:/usr/share/doc/ghostnector/RECOVERY.md
 # The control plane starts before any transition needs this helper, and the boot guard must not wait
 # on it: APP namespaces are volatile by design and nothing at boot depends on them.
 DefaultDependencies=no
@@ -8,6 +8,13 @@ After=local-fs.target systemd-tmpfiles-setup.service ghostnector-netd.service
 Before=sysinit.target
 Conflicts=shutdown.target
 Before=shutdown.target
+# A start that can never succeed (for example a missing /run/netns, D-33) must not restart forever:
+# without an explicit bound the unit was observed restarting more than a thousand times in half an
+# hour. Ten attempts in a minute is generous for transient trouble and bounded for a permanent one;
+# after that the unit stays failed and is visible in `systemctl --failed`. These keys belong in
+# [Unit]; systemd ignores them in [Service] (which is where they were first put, D-33).
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
 Type=exec
@@ -28,10 +35,12 @@ ExecStart=/usr/libexec/ghostnector-appd \
 #   * handing the socket to the control plane's uid needs CAP_CHOWN (the mode is set before the
 #     chown, so CAP_FOWNER is not needed and the socket is never briefly peer-owned with a
 #     permissive mode).
-# KeepCapabilities keeps the set across exec. Only CAP_NET_ADMIN is ambient, so the tools this
-# helper runs (`ip`, `bridge`, `nft`) never inherit CAP_SYS_ADMIN or CAP_CHOWN.
+# The helper runs as root, so the bounding set above is also the permitted and effective set
+# (measured on the installed machine: cap_chown,cap_sys_admin,cap_net_admin+ep). Only
+# CAP_NET_ADMIN is ambient, so the tools this helper runs (`ip`, `bridge`, `nft`) never inherit
+# CAP_SYS_ADMIN or CAP_CHOWN. There is no `KeepCapabilities=` directive in systemd; an earlier
+# revision of this unit named one, and systemd ignored it (D-36).
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_CHOWN
-KeepCapabilities=yes
 AmbientCapabilities=CAP_NET_ADMIN
 NoNewPrivileges=yes
 
@@ -54,12 +63,6 @@ ReadWritePaths=/run/ghostnector /run/netns
 
 Restart=on-failure
 RestartSec=2
-# A start that can never succeed (for example a missing /run/netns, D-33) must not restart forever:
-# without an explicit bound the unit was observed restarting more than a thousand times in half an
-# hour. Ten attempts in a minute is generous for transient trouble and bounded for a permanent one;
-# after that the unit stays failed and is visible in `systemctl --failed`.
-StartLimitIntervalSec=60
-StartLimitBurst=10
 
 [Install]
 WantedBy=sysinit.target

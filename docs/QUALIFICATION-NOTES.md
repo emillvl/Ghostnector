@@ -14,6 +14,15 @@ environment artifacts apart from product findings.
   `libgtk-4-1`/`libgtk-4-dev 4.14`, `Xvfb`, `xfwm4`, `xdotool`, `wmctrl`.
 * **`/tmp` is a tmpfs.** Everything written there (qualification logs, staged scripts) is lost on
   reboot. Durable evidence goes under `/var/log/` or `/var/lib/`.
+* **A guest-initiated reboot can hang on this VM.** Twice a `systemctl reboot` (and once a
+  `reboot -f` from a rescue shell) left the VM `running` but never completing the transition:
+  VBoxService stopped, console blank, sshd gone, no CPU activity, and the state never came back.
+  `VBoxManage controlvm ghostnector-qual reset` boots it normally afterwards (the journal recovers
+  the filesystem). The qualification therefore treats "no SSH after a reboot" as reset-and-retry,
+  with a bounded wait, rather than assuming the product blocked the network.
+* **`systemd-analyze verify` is part of the installed qualification.** It found `KeepCapabilities=`
+  (a directive that does not exist) and `Documentation=` references to files the package never
+  installed (D-35/D-36); both were invisible in the source tree.
 
 ## Environment-only changes
 

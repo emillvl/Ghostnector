@@ -132,6 +132,19 @@ nft list table $TABLE >/dev/null 2>&1 &&
     bad "a policy table survived the baseline reset" ||
     ok "no policy table is applied at the baseline"
 
+# ---------------------------------------------------------------- the units as systemd reads them
+echo
+echo "-- systemd's own opinion of the packaged units (D-35/D-36) --"
+for unit in ghostnector-netd ghostnector-core ghostnector-appd ghostnector-bootguard \
+    ghostnector-tor ghostnector-i2pd; do
+    OUT="$(systemd-analyze verify "/usr/lib/systemd/system/$unit.service" 2>&1)"
+    if [ -z "$OUT" ]; then
+        ok "$unit verifies clean"
+    else
+        bad "$unit is not clean: $OUT"
+    fi
+done
+
 # ---------------------------------------------------------------- D-29: runtime directories
 echo
 echo "-- D-29: both daemons' sockets live where the units say --"

@@ -1,6 +1,6 @@
 [Unit]
 Description=Ghostnector control plane
-Documentation=man:ghostnector-core(8)
+Documentation=file:/usr/share/doc/ghostnector/README.md file:/usr/share/doc/ghostnector/RECOVERY.md
 After=ghostnector-netd.service
 Wants=ghostnector-netd.service
 # No ordering against the network: it works without one, and every check it makes is local.

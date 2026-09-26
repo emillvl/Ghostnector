@@ -85,15 +85,86 @@ mod tests {
 
     /// The namespace helper's start can fail for a permanent reason; it must not restart forever.
     /// Before this bound existed it was observed restarting more than a thousand times in half an
-    /// hour (D-33).
+    /// hour (D-33). The keys belong in `[Unit]`: systemd ignores them in `[Service]`, which is
+    /// where they were first written.
     #[test]
     fn a_unit_that_can_never_start_is_not_restarted_forever() {
         let text = packaging_file("systemd/ghostnector-appd.service");
         for key in ["StartLimitIntervalSec", "StartLimitBurst"] {
+            assert_eq!(
+                section_of(&text, key).as_deref(),
+                Some("[Unit]"),
+                "ghostnector-appd.service must bound its restarts with {key}= in [Unit] (D-33)"
+            );
+        }
+    }
+
+    /// The section a `key=value` line lives in, or None when the key is absent.
+    fn section_of(text: &str, key: &str) -> Option<String> {
+        let mut section = String::new();
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                section = trimmed.to_string();
+                continue;
+            }
+            if trimmed.starts_with(&format!("{key}=")) {
+                return Some(section);
+            }
+        }
+        None
+    }
+
+    /// `Documentation=` references must point at files the package actually installs. The units
+    /// named man pages that were never written and a recovery file that was never installed;
+    /// systemd-analyze verify reports both as broken references (D-35).
+    #[test]
+    fn every_documentation_reference_is_installed() {
+        let installer = packaging_file("install.sh");
+        let units = [
+            "ghostnector-netd.service",
+            "ghostnector-core.service",
+            "ghostnector-appd.service",
+            "ghostnector-bootguard.service",
+        ];
+        for unit in units {
+            let text = packaging_file(&format!("systemd/{unit}"));
+            for line in text.lines().map(str::trim) {
+                let Some(value) = line.strip_prefix("Documentation=") else {
+                    continue;
+                };
+                for reference in value.split_whitespace() {
+                    if let Some(path) = reference.strip_prefix("file:") {
+                        assert!(
+                            installer.contains(path),
+                            "{unit} documents {path}, which install.sh never installs (D-35)"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// systemd ignored `KeepCapabilities=` (there is no such directive) and the unit claimed a
+    /// mechanism that did not exist; the capability state is real because the helper runs as root
+    /// with a bounded set, and it is measured on the installed machine (D-36).
+    #[test]
+    fn the_units_do_not_claim_a_directive_systemd_does_not_have() {
+        for unit in [
+            "ghostnector-netd.service",
+            "ghostnector-core.service",
+            "ghostnector-appd.service",
+            "ghostnector-bootguard.service",
+            "ghostnector-tor.service",
+            "ghostnector-i2pd.service",
+        ] {
+            let text = packaging_file(&format!("systemd/{unit}"));
             assert!(
-                text.lines()
-                    .any(|line| line.trim().starts_with(&format!("{key}="))),
-                "ghostnector-appd.service must bound its restarts with {key}= (D-33)"
+                !text
+                    .lines()
+                    .map(str::trim)
+                    .any(|line| !line.starts_with('#') && line.contains("KeepCapabilities")),
+                "{unit} names KeepCapabilities, which systemd ignores (D-36)"
             );
         }
     }

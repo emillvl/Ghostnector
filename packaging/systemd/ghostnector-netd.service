@@ -1,6 +1,6 @@
 [Unit]
 Description=Ghostnector privileged helper (the only writer of the network policy)
-Documentation=man:ghostnector-netd(8)
+Documentation=file:/usr/share/doc/ghostnector/README.md file:/usr/share/doc/ghostnector/RECOVERY.md
 # Deliberately early: the boot guard runs before sysinit and needs this helper to exist by then.
 DefaultDependencies=no
 After=local-fs.target systemd-tmpfiles-setup.service

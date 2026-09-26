@@ -13,8 +13,8 @@
 //!
 //! Everything else — links, addresses, routes, bridge membership, per-namespace sysctls — needs only
 //! `CAP_NET_ADMIN`, which is also the only capability this helper's child tools inherit. The
-//! helper holds `CAP_SYS_ADMIN` itself (systemd's `KeepCapabilities`) but never passes it to a
-//! child, so a compromised `nft` or `ip` does not get it.
+//! helper holds `CAP_SYS_ADMIN` itself (it runs as root under a bounded capability set) but never
+//! passes it to a child, so a compromised `nft` or `ip` does not get it.
 
 use std::io::Write;
 use std::net::Ipv4Addr;

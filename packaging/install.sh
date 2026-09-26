@@ -56,6 +56,10 @@ install -m 0644 "$here/core.env.example" /etc/ghostnector/core.env.example
 install -D -m 0644 "$here/desktop/ghostnector.desktop" /usr/share/applications/ghostnector.desktop
 install -D -m 0644 "$here/icons/hicolor/scalable/apps/ghostnector.svg" \
     /usr/share/icons/hicolor/scalable/apps/ghostnector.svg
+# The units point at these files (`Documentation=file:...`); a reference to a file that is not
+# installed is a broken reference, and systemd-analyze verify reports it (D-35).
+install -D -m 0644 "$here/../README.md" /usr/share/doc/ghostnector/README.md
+install -D -m 0644 "$here/../docs/RECOVERY.md" /usr/share/doc/ghostnector/RECOVERY.md
 command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q -t /usr/share/icons/hicolor 2>/dev/null || true
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q 2>/dev/null || true
 

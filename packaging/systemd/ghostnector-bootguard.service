@@ -1,6 +1,6 @@
 [Unit]
 Description=Ghostnector boot guard (deny everything if protection was requested)
-Documentation=man:ghostnector-bootguard(8) file:/usr/share/doc/ghostnector/RECOVERY.md
+Documentation=file:/usr/share/doc/ghostnector/README.md file:/usr/share/doc/ghostnector/RECOVERY.md
 # Early, and before the network is configured: an application that starts sending during boot must
 # find the machine already denied.
 DefaultDependencies=no
