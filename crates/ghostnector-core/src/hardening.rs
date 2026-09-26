@@ -98,6 +98,118 @@ mod tests {
         }
     }
 
+    /// (path, mode, owner) for every directory a tmpfiles entry creates.
+    fn tmpfiles_entries() -> Vec<(String, String, String)> {
+        packaging_file("tmpfiles.d/ghostnector.conf")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let kind = fields.next()?;
+                if !kind.starts_with('d') && !kind.starts_with('v') && !kind.starts_with('q') {
+                    return None;
+                }
+                let path = fields.next()?.to_string();
+                let mode = fields.next().unwrap_or("0755").to_string();
+                let owner = fields.next().unwrap_or("root").to_string();
+                Some((path, mode, owner))
+            })
+            .collect()
+    }
+
+    /// A daemon that binds a unix socket must be able to create it: it runs without
+    /// `CAP_DAC_OVERRIDE` (or as an unprivileged account), so the socket's directory has to be
+    /// owned by that same account. D-29 (netd) and D-34 (the namespace helper) were both this
+    /// mistake on the installed layout; the source-tree suites missed them because they ran the
+    /// binaries directly, as root with every capability.
+    fn socket_placement_problems(
+        unit: &str,
+        text: &str,
+        entries: &[(String, String, String)],
+    ) -> Vec<String> {
+        let mut problems = Vec::new();
+        let user = line_value(text, "User").unwrap_or("root").to_string();
+        let tokens: Vec<&str> = text.split_whitespace().collect();
+        for (index, token) in tokens.iter().enumerate() {
+            if *token != "--socket" {
+                continue;
+            }
+            let Some(raw) = tokens.get(index + 1) else {
+                problems.push(format!("{unit}: --socket must be followed by a path"));
+                continue;
+            };
+            let path = raw.trim_end_matches('\\');
+            if !path.starts_with('/') {
+                problems.push(format!("{unit}: --socket {path} is not absolute"));
+                continue;
+            }
+            let parent = std::path::Path::new(path)
+                .parent()
+                .expect("a socket path has a parent")
+                .to_string_lossy()
+                .to_string();
+            let Some((_, mode, owner)) = entries
+                .iter()
+                .find(|(candidate, _, _)| *candidate == parent)
+            else {
+                problems.push(format!(
+                    "{unit}: --socket {path} lives in {parent}, which no tmpfiles entry creates"
+                ));
+                continue;
+            };
+            if owner != &user {
+                problems.push(format!(
+                    "{unit}: {parent} is owned by {owner}, but the daemon runs as {user} without \
+                     CAP_DAC_OVERRIDE and could not create its socket (D-29/D-34)"
+                ));
+            }
+            match u32::from_str_radix(mode, 8) {
+                Ok(bits) if bits & 0o022 == 0 => {}
+                Ok(_) => problems.push(format!(
+                    "{unit}: {parent} is group- or other-writable ({mode}); the client's trust \
+                     check must refuse such a socket directory"
+                )),
+                Err(_) => problems.push(format!("{unit}: tmpfiles mode '{mode}' is not octal")),
+            }
+        }
+        problems
+    }
+
+    #[test]
+    fn a_daemon_can_write_the_socket_it_binds() {
+        let entries = tmpfiles_entries();
+        let units = [
+            "ghostnector-netd.service",
+            "ghostnector-core.service",
+            "ghostnector-appd.service",
+        ];
+        for unit in units {
+            let text = packaging_file(&format!("systemd/{unit}"));
+            let problems = socket_placement_problems(unit, &text, &entries);
+            assert!(
+                problems.is_empty(),
+                "socket placement drifted: {problems:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_socket_placement_checker_notices_a_daemon_that_cannot_write_its_socket() {
+        let entries = tmpfiles_entries();
+        // No User= means root; the control plane's directory is owned by the control plane's
+        // account, so this root daemon could not create the socket (the D-34 shape).
+        let synthetic = "[Service]\nExecStart=/usr/libexec/x --socket /run/ghostnector/appd.sock\n";
+        let problems =
+            socket_placement_problems("ghostnector-synthetic.service", synthetic, &entries);
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("CAP_DAC_OVERRIDE")),
+            "{problems:?}"
+        );
+    }
+
     /// The polkit rule is the authorization for the control plane to start and stop the two router
     /// units. It is a privilege surface: it must stay bounded to that user, those units and those
     /// verbs, and this test fails if the text drifts.

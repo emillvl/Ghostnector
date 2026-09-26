@@ -102,4 +102,6 @@ result cuts, writing evidence to `/tmp`, and having no detached cleanup.
 * The install/rebuild procedure must `ghostnector disconnect` (or remove the intent) **before**
   restarting `ghostnector-core`, and must not depend on the SSH session it is about to cut.
 * `/run/netns` is created by `packaging/tmpfiles.d/ghostnector.conf`; without it the namespace
-  helper cannot start at all on a fresh boot (D-33).
+  helper cannot start at all on a fresh boot (D-33). The helper's socket lives in the root-owned
+  `/run/ghostnector/appd/`, because it runs as root without `CAP_DAC_OVERRIDE` and cannot write in
+  the control plane's directory (D-34).

@@ -24,7 +24,7 @@ mod inner {
     const DEFAULT_SOCKET: &str = "/run/ghostnector/core.sock";
     const DEFAULT_JOURNAL: &str = "/var/lib/ghostnector/intent.json";
     const DEFAULT_SYSTEMCTL: &str = "/usr/bin/systemctl";
-    const DEFAULT_APP_SOCKET: &str = "/run/ghostnector/appd.sock";
+    const DEFAULT_APP_SOCKET: &str = "/run/ghostnector/appd/appd.sock";
     const DEFAULT_TOR_UNIT: &str = "ghostnector-tor.service";
     const DEFAULT_TORRC: &str = "/run/ghostnector/torrc";
     const DEFAULT_TOR_DATA: &str = "/var/lib/tor";
@@ -106,7 +106,7 @@ OPTIONS:
     --resolvectl <PATH>     the tool used to configure systemd-resolved
                                                       [default: /usr/bin/resolvectl]
     --app-socket <PATH>     the namespace helper's socket
-                                            [default: /run/ghostnector/appd.sock]
+                                            [default: /run/ghostnector/appd/appd.sock]
     --app-core <ADDR>       the host-local APP core address [default: 10.200.0.1]
 
   Verification (a run that proves the policy is working, not just applied):

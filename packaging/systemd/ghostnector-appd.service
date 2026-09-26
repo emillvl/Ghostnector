@@ -12,7 +12,7 @@ Before=shutdown.target
 [Service]
 Type=exec
 ExecStart=/usr/libexec/ghostnector-appd \
-    --socket /run/ghostnector/appd.sock \
+    --socket /run/ghostnector/appd/appd.sock \
     --peer-user ghostnector \
     --state-dir /run/ghostnector/apps \
     --launcher /usr/libexec/ghostnector-appd-launch \

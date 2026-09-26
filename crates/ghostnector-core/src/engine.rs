@@ -49,7 +49,7 @@ pub const DEFAULT_JOURNAL: &str = "/var/lib/ghostnector/intent.json";
 pub const DEFAULT_RESOLVER_STATE: &str = "/var/lib/ghostnector/resolver.json";
 
 /// Where the namespace helper's socket lives.
-pub const DEFAULT_APP_SOCKET: &str = "/run/ghostnector/appd.sock";
+pub const DEFAULT_APP_SOCKET: &str = "/run/ghostnector/appd/appd.sock";
 
 /// What the engine needs to know about its environment.
 #[derive(Debug, Clone)]
