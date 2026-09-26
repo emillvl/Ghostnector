@@ -71,6 +71,35 @@ covers protection on/off, Tor or I2P, whole system or selected applications, per
 add/list/stop, a confirmed deny-everything action, and a secondary diagnostics view. Technical
 information (exemptions, health, verification age, versions) lives there, not in normal use.
 
+### Verification: what "protected and verified" needs
+
+Applying a policy yields `protected, but unverified`; `protected — and verified` is only claimed
+from evidence. The shipped unit has no check endpoints configured, so out of the box Ghostnector
+reports `protected, but unverified` and names the checks that did not run. To let it conclude,
+configure endpoints outside the local network in `/etc/ghostnector/core.env` (example shipped at
+`/etc/ghostnector/core.env.example`) and restart `ghostnector-core`:
+
+```
+GHOSTNECTOR_VERIFY=--udp-check 203.0.113.10:9999 --check-url http://203.0.113.10/ \
+    --canary canary.example@203.0.113.9 --canary-resolver 127.0.0.1:53
+```
+
+The UDP endpoint must answer a datagram if one reaches it; the HTTP endpoint must answer `200`
+with the address it sees in the body; the canary must resolve to the expected address through the
+chokepoint. All of them must be outside the local network, or `connect --lan` is refused with an
+explanation (the exception would make the check meaningless). The HTTP endpoint must be reachable
+**from a Tor exit** — a private or NAT-internal address is refused by Tor's own guard, which is a
+correct fail-closed response, not a product failure.
+
+Two operational notes that matter in real use:
+
+* Starting whole-system protection **cuts remote SSH sessions** as soon as it begins (the deny-first
+  baseline drops the server's replies, and transparent Tor carries outbound TCP only). Run the
+  command from the console, or drive it from a detached script that disconnects when it is done.
+* The install ships one bounded polkit rule: it lets the `ghostnector` service account start and
+  stop exactly `ghostnector-tor.service` and `ghostnector-i2pd.service` (start/stop only, nothing
+  else). Without it the unprivileged control plane could not manage its own routers.
+
 ## Build and test
 
 **Windows is for editing and static checks** — its Smart App Control policy blocks execution of

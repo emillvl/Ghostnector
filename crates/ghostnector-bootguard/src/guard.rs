@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use ghostnector_spec::backend::{Params, ProfileId, Verb};
 use ghostnector_spec::ipc::{HelperResponse, PROTOCOL_VERSION};
 
-const DEFAULT_NETD: &str = "/run/ghostnector/netd.sock";
+const DEFAULT_NETD: &str = "/run/ghostnector/netd/netd.sock";
 const DEFAULT_INTENT: &str = "/var/lib/ghostnector/intent.json";
 const DEFAULT_FALLBACK: &str = "/var/lib/ghostnector/fail-closed.nft";
 const DEFAULT_CMDLINE: &str = "/proc/cmdline";
@@ -62,7 +62,7 @@ USAGE:
 
 OPTIONS:
     --netd <PATH>        the privileged helper's socket
-                                              [default: /run/ghostnector/netd.sock]
+                                              [default: /run/ghostnector/netd/netd.sock]
     --intent <PATH>      the journal that records what the user asked for
                                           [default: /var/lib/ghostnector/intent.json]
     --fallback <PATH>    a copy of the fail-closed policy, for when the helper is

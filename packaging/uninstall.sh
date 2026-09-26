@@ -35,9 +35,10 @@ rm -f /usr/lib/systemd/system/ghostnector-core.service \
     /usr/lib/systemd/system/ghostnector-tor.service \
     /usr/lib/systemd/system/ghostnector-i2pd.service
 rm -f /usr/lib/sysusers.d/ghostnector.conf /usr/lib/tmpfiles.d/ghostnector.conf
+rm -f /usr/share/polkit-1/rules.d/50-ghostnector.rules
 rm -f /usr/share/applications/ghostnector.desktop
 rm -f /usr/share/icons/hicolor/scalable/apps/ghostnector.svg
-rm -rf /var/lib/ghostnector /run/ghostnector
+rm -rf /var/lib/ghostnector /run/ghostnector /etc/ghostnector
 
 systemctl daemon-reload
 systemctl reset-failed ghostnector-core.service ghostnector-netd.service ghostnector-appd.service \

@@ -1,0 +1,26 @@
+// Ghostnector: the unprivileged control plane may start and stop exactly the two service units it
+// manages — the Tor and I2P routers — and nothing else. This is the authorization half of the
+// design in docs/ARCHITECTURE-REVIEW.md ("Services are systemd units, started and stopped only by
+// the control plane"); without it a real install cannot bring Tor or I2P up.
+//
+// Bounds, all deliberate:
+//   * only the `ghostnector` service account;
+//   * only org.freedesktop.systemd1.manage-units;
+//   * only ghostnector-tor.service and ghostnector-i2pd.service;
+//   * only the start and stop verbs (core never restarts or reloads a unit).
+// Everything else falls through to the normal polkit decision.
+polkit.addRule(function (action, subject) {
+    if (action.id !== "org.freedesktop.systemd1.manage-units") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    if (subject.user !== "ghostnector") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    var unit = action.lookup("unit");
+    var verb = action.lookup("verb");
+    if ((unit === "ghostnector-tor.service" || unit === "ghostnector-i2pd.service") &&
+        (verb === "start" || verb === "stop")) {
+        return polkit.Result.YES;
+    }
+    return polkit.Result.NOT_HANDLED;
+});

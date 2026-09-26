@@ -316,7 +316,7 @@ impl HelperLink for MockHelper {
     fn invoke(&self, verb: Verb) -> Result<HelperResponse, HelperError> {
         if !self.reachable {
             return Err(HelperError::Connect {
-                path: "/run/ghostnector/netd.sock".into(),
+                path: "/run/ghostnector/netd/netd.sock".into(),
                 reason: "no such file or directory".to_string(),
             });
         }

@@ -20,7 +20,7 @@ mod inner {
         VerificationConfig, Verifier, VERSION,
     };
 
-    const DEFAULT_HELPER: &str = "/run/ghostnector/netd.sock";
+    const DEFAULT_HELPER: &str = "/run/ghostnector/netd/netd.sock";
     const DEFAULT_SOCKET: &str = "/run/ghostnector/core.sock";
     const DEFAULT_JOURNAL: &str = "/var/lib/ghostnector/intent.json";
     const DEFAULT_SYSTEMCTL: &str = "/usr/bin/systemctl";
@@ -28,7 +28,7 @@ mod inner {
     const DEFAULT_TOR_UNIT: &str = "ghostnector-tor.service";
     const DEFAULT_TORRC: &str = "/run/ghostnector/torrc";
     const DEFAULT_TOR_DATA: &str = "/var/lib/tor";
-    const DEFAULT_TOR_COOKIE: &str = "/run/ghostnector/tor-control.cookie";
+    const DEFAULT_TOR_COOKIE: &str = "/run/ghostnector-tor/control.cookie";
     const DEFAULT_TOR_CONTROL_PORT: u16 = 9051;
     const DEFAULT_TOR_DNS_PORT: u16 = 9053;
     const DEFAULT_TOR_BUDGET_SECONDS: u64 = 120;
@@ -56,7 +56,7 @@ OPTIONS:
     --socket <PATH>     unix socket for clients
                                           [default: /run/ghostnector/core.sock]
     --helper <PATH>     the privileged helper's socket
-                                              [default: /run/ghostnector/netd.sock]
+                                              [default: /run/ghostnector/netd/netd.sock]
     --journal <PATH>    where the user's intent is recorded
                                           [default: /var/lib/ghostnector/intent.json]
     --group <NAME>      group allowed to talk to this socket; without it, only
@@ -72,7 +72,7 @@ OPTIONS:
                                               [default: /run/ghostnector/torrc]
     --tor-data-dir <PATH>   Tor's data directory           [default: /var/lib/tor]
     --tor-cookie <PATH>     Tor's control cookie
-                                   [default: /run/ghostnector/tor-control.cookie]
+                                   [default: /run/ghostnector-tor/control.cookie]
     --tor-control-port <PORT>   Tor's control port           [default: 9051]
     --tor-dns-port <PORT>       Tor's DNS listener, which the DNS chokepoint
                                 forwards to                      [default: 9053]

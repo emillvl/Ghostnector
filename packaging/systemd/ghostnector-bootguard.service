@@ -13,7 +13,7 @@ Wants=network-pre.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/libexec/ghostnector-bootguard \
-    --netd /run/ghostnector/netd.sock \
+    --netd /run/ghostnector/netd/netd.sock \
     --intent /var/lib/ghostnector/intent.json \
     --fallback /var/lib/ghostnector/fail-closed.nft
 

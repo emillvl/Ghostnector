@@ -54,6 +54,12 @@ ReadWritePaths=/run/ghostnector /run/netns
 
 Restart=on-failure
 RestartSec=2
+# A start that can never succeed (for example a missing /run/netns, D-33) must not restart forever:
+# without an explicit bound the unit was observed restarting more than a thousand times in half an
+# hour. Ten attempts in a minute is generous for transient trouble and bounded for a permanent one;
+# after that the unit stays failed and is visible in `systemctl --failed`.
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Install]
 WantedBy=sysinit.target

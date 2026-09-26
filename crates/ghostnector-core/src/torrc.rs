@@ -51,7 +51,10 @@ impl Default for TorSettings {
             socks_port: 9050,
             control_port: 9051,
             data_directory: PathBuf::from("/var/lib/tor"),
-            cookie_path: PathBuf::from("/run/ghostnector/tor-control.cookie"),
+            // Tor writes this cookie itself, so it lives in a directory owned by Tor's service
+            // account with the control plane's group (setgid) so the unprivileged control plane
+            // can read it. The packaged tmpfiles entry creates it; see packaging/.
+            cookie_path: PathBuf::from("/run/ghostnector-tor/control.cookie"),
             sandbox: true,
             app_core: None,
         }
@@ -165,7 +168,7 @@ mod tests {
     fn settings() -> TorSettings {
         TorSettings {
             data_directory: PathBuf::from("/var/lib/tor"),
-            cookie_path: PathBuf::from("/run/ghostnector/tor-control.cookie"),
+            cookie_path: PathBuf::from("/run/ghostnector-tor/control.cookie"),
             ..TorSettings::default()
         }
     }

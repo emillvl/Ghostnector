@@ -11,7 +11,7 @@ Before=shutdown.target
 [Service]
 Type=exec
 ExecStart=/usr/libexec/ghostnector-netd \
-    --socket /run/ghostnector/netd.sock \
+    --socket /run/ghostnector/netd/netd.sock \
     --peer-user ghostnector \
     --nft /usr/sbin/nft \
     --conntrack /usr/sbin/conntrack \

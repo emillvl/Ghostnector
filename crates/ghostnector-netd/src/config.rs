@@ -410,7 +410,7 @@ mod tests {
     fn minimal_configuration_uses_documented_defaults() {
         let config = run(&[
             "--socket",
-            "/run/ghostnector/netd.sock",
+            "/run/ghostnector/netd/netd.sock",
             "--peer-uid",
             "1000",
         ]);
@@ -619,7 +619,7 @@ mod tests {
     fn the_summary_names_the_peer_and_the_ports() {
         let config = run(&[
             "--socket",
-            "/run/ghostnector/netd.sock",
+            "/run/ghostnector/netd/netd.sock",
             "--peer-uid",
             "1000",
         ]);

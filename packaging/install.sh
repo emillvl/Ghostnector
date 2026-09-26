@@ -48,6 +48,10 @@ install -D -m 0644 "$here/systemd/ghostnector-tor.service" /usr/lib/systemd/syst
 install -D -m 0644 "$here/systemd/ghostnector-i2pd.service" /usr/lib/systemd/system/ghostnector-i2pd.service
 install -D -m 0644 "$here/sysusers.d/ghostnector.conf" /usr/lib/sysusers.d/ghostnector.conf
 install -D -m 0644 "$here/tmpfiles.d/ghostnector.conf" /usr/lib/tmpfiles.d/ghostnector.conf
+install -D -m 0644 "$here/polkit-1/rules.d/50-ghostnector.rules" \
+    /usr/share/polkit-1/rules.d/50-ghostnector.rules
+install -d -m 0755 /etc/ghostnector
+install -m 0644 "$here/core.env.example" /etc/ghostnector/core.env.example
 
 install -D -m 0644 "$here/desktop/ghostnector.desktop" /usr/share/applications/ghostnector.desktop
 install -D -m 0644 "$here/icons/hicolor/scalable/apps/ghostnector.svg" \
@@ -67,3 +71,7 @@ echo "For the command line and the window, add yourself to the ghostnector group
 echo "    sudo usermod -aG ghostnector \$USER"
 echo
 echo "Start it now with:  sudo systemctl start ghostnector-core"
+echo
+echo "To let it claim 'protected and verified', configure check endpoints in /etc/ghostnector/core.env"
+echo "(see /etc/ghostnector/core.env.example) and restart ghostnector-core. Until then it reports"
+echo "'protected, but unverified' and says which checks are missing."

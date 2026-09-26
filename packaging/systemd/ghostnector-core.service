@@ -9,11 +9,16 @@ Wants=ghostnector-netd.service
 Type=exec
 User=ghostnector
 Group=ghostnector
+# Optional, administrator-owned verification configuration. Uncomment and edit the example at
+# /etc/ghostnector/core.env.example; `Protected` requires at least one passing check, and the
+# daemon honestly stays `degraded` when nothing is configured.
+EnvironmentFile=-/etc/ghostnector/core.env
 ExecStart=/usr/libexec/ghostnector-core \
     --group ghostnector \
     --dns-helper /usr/libexec/ghostnector-dns \
     --resolver-state /var/lib/ghostnector/resolver.json \
-    --journal /var/lib/ghostnector/intent.json
+    --journal /var/lib/ghostnector/intent.json \
+    $GHOSTNECTOR_VERIFY
 
 # Exactly one capability, and not for this process: the DNS relay it starts listens on port 53 so
 # that a plain resolv.conf can point at it. The control plane itself never binds a low port, and it
@@ -29,7 +34,9 @@ ProtectProc=invisible
 ProcSubset=pid
 # It writes the journal and the recorded resolver state, starts the relay, and manages Tor.
 StateDirectory=ghostnector
-ReadWritePaths=/run/ghostnector
+# /etc/resolv.conf is where a plain-file resolver is repointed; the dash tolerates a machine whose
+# resolver is managed by systemd-resolved instead (the daemon uses resolvectl there, no file write).
+ReadWritePaths=/run/ghostnector -/etc/resolv.conf
 RestrictNamespaces=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
