@@ -52,24 +52,51 @@ wait_off()       { local i; for i in $(seq 1 "$1"); do off_now && return 0; slee
 wait_protected() { local i; for i in $(seq 1 "$1"); do protected_now && return 0; sleep 1; done; return 1; }
 wait_profile()   { local i; for i in $(seq 1 "$2"); do cli_state | grep -q "$1" && return 0; sleep 1; done; return 1; }
 atspi() { runuser -u "$GUI_USER" -- env DISPLAY=:90 DBUS_SESSION_BUS_ADDRESS="$BUS" python3 "$ATSPI" "$@" 2>/dev/null; }
-# Clicks: an AT-SPI action is used when the control exposes one (switches, buttons, menu items);
-# otherwise AT-SPI locates the widget and xdotool clicks its screen coordinates. Coordinate clicks
-# need the target window focused: xfwm4's click-to-focus would otherwise consume the first click.
+# Clicks, in order of preference:
+#   1. an AT-SPI action (switches, buttons, menu items) — works without focus;
+#   2. keyboard: Tab until the named control has AT-SPI focus, then Space;
+#   3. fixed layout coordinates for this exact window (460x640 at 0,0), taken from a screenshot.
 ui_click() {
-    local name="$1" xy
+    local name="$1" i xy
     if atspi click "$name" >/dev/null 2>&1; then
         sleep 0.3
         return 0
     fi
-    xy="$(atspi coords "$name")"
+    xdotool windowactivate --sync "$(xdotool search --name '^Ghostnector$' | head -1)" 2>/dev/null || true
+    sleep 0.2
+    for i in $(seq 1 40); do
+        if atspi focused "$name" >/dev/null 2>&1; then
+            xdotool key --clearmodifiers space
+            sleep 0.4
+            return 0
+        fi
+        xdotool key --clearmodifiers Tab
+        sleep 0.12
+    done
+    xy="$(fixed_coords "$name")"
     if [ -n "$xy" ]; then
-        xdotool windowactivate --sync "$(xdotool getactivewindow 2>/dev/null)" 2>/dev/null || true
-        sleep 0.2
         xdotool mousemove --sync "${xy% *}" "${xy#* }" click 1
         sleep 0.4
         return 0
     fi
     return 1
+}
+
+# The layout of the shipped window at its default size, read from a screenshot of this build.
+fixed_coords() {
+    case "$1" in
+    "Protection") echo "413 161" ;;
+    "Tor") echo "34 240" ;;
+    "I2P") echo "93 240" ;;
+    "Whole system") echo "33 306" ;;
+    "Selected applications") echo "170 306" ;;
+    "Allow access to the local network") echo "428 339" ;;
+    "Diagnostics") echo "266 27" ;;
+    "More actions") echo "192 27" ;;
+    "Add application…"|"Add application") echo "364 390" ;;
+    "Stop") echo "430 483" ;;
+    *) echo "" ;;
+    esac
 }
 ui_labels() { atspi labels; }
 shot() { import -window root "$SHOTS/$1.png" 2>/dev/null; }
