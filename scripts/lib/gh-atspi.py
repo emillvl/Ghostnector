@@ -122,12 +122,18 @@ def checked(name):
 
 
 def coords(name):
-    """Print the centre of the first named node that has real screen extents."""
+    """Print the centre of the first named node that has real screen extents.
+
+    Non-label nodes come first: clicking a switch's text label does nothing, while clicking the
+    switch itself (or a check button's indicator) toggles it.
+    """
     candidates = find_all(name)
     if not candidates:
         print(f"not found: {name!r}")
         return 1
-    for node in candidates:
+    ordered = [node for node in candidates if node.getRoleName() != "label"]
+    ordered += [node for node in candidates if node.getRoleName() == "label"]
+    for node in ordered:
         try:
             extents = node.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
             if extents.width > 0 and extents.height > 0:
