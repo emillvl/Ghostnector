@@ -68,6 +68,9 @@ command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q
 systemd-sysusers
 systemd-tmpfiles --create
 systemctl daemon-reload
+# polkitd reloads rules when the directory changes, but asynchronously; nudge it so a check that
+# follows the install immediately cannot race the reload (SIGHUP reloads configuration and rules).
+systemctl kill -s HUP polkit.service >/dev/null 2>&1 || true
 systemctl enable ghostnector-netd.service ghostnector-appd.service ghostnector-bootguard.service \
     ghostnector-core.service >/dev/null
 
