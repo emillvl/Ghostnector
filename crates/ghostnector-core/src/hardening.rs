@@ -145,6 +145,24 @@ mod tests {
         }
     }
 
+    /// The control plane names the default-route interface for systemd-resolved by reading
+    /// `/proc/net/route`. `ProcSubset=pid` hides `/proc/net`, and with it the resolver was silently
+    /// never repointed on an installed, resolved machine (D-37). `ProtectProc=invisible` stays: it
+    /// hides other processes' details, which is the protection that matters, and `/proc/net` is
+    /// world-readable anyway.
+    #[test]
+    fn the_core_unit_does_not_hide_proc_net() {
+        let text = packaging_file("systemd/ghostnector-core.service");
+        assert!(
+            !text
+                .lines()
+                .map(str::trim)
+                .any(|line| line.starts_with("ProcSubset=")),
+            "ghostnector-core.service must not set ProcSubset: it hides /proc/net, and the resolver \
+             is then never repointed (D-37)"
+        );
+    }
+
     /// systemd ignored `KeepCapabilities=` (there is no such directive) and the unit claimed a
     /// mechanism that did not exist; the capability state is real because the helper runs as root
     /// with a bounded set, and it is measured on the installed machine (D-36).

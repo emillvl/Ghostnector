@@ -31,7 +31,10 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 ProtectProc=invisible
-ProcSubset=pid
+# No ProcSubset=pid here. The control plane names the default-route interface for systemd-resolved
+# by reading /proc/net/route; ProcSubset=pid hides /proc/net, so on a resolved machine the resolver
+# was silently never repointed (D-37). ProtectProc=invisible is the protection that matters — other
+# processes' details stay hidden — and /proc/net is world-readable anyway.
 # It writes the journal and the recorded resolver state, starts the relay, and manages Tor.
 StateDirectory=ghostnector
 # /etc/resolv.conf is where a plain-file resolver is repointed; the dash tolerates a machine whose

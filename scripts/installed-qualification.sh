@@ -250,7 +250,7 @@ nft list table $TABLE 2>&1 | head -25
 echo
 echo "-- D-31: Tor's control cookie where the control plane reads it --"
 ls -la /run/ghostnector-tor/ 2>&1
-if [ -S "/run/ghostnector-tor/control.cookie" ]; then
+if [ -f "/run/ghostnector-tor/control.cookie" ]; then
     COOKIE_OWNER="$(stat -c '%U:%G %a' /run/ghostnector-tor/control.cookie)"
     case "$COOKIE_OWNER" in
     debian-tor:ghostnector*) ok "the cookie is debian-tor-owned and group-readable ($COOKIE_OWNER)" ;;
@@ -258,6 +258,13 @@ if [ -S "/run/ghostnector-tor/control.cookie" ]; then
     esac
 else
     bad "Tor did not write a control cookie"
+fi
+echo
+echo "-- D-37: the resolver can be repointed (needs /proc/net/route) --"
+if status_text | grep -q "proc/net/route"; then
+    bad "the control plane could not read /proc/net/route, so the resolver was not repointed"
+else
+    ok "the resolver note is absent; repointing worked or the layout needs no change"
 fi
 echo
 echo "-- managed Tor --"
