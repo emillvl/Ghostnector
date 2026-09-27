@@ -1,4 +1,4 @@
-﻿# Qualification environment notes
+# Qualification environment notes
 
 These are environment facts and workarounds for the native Ubuntu 24.04 VirtualBox VM used to
 qualify Ghostnector. They are **not product behavior**: nothing here changes what Ghostnector
@@ -35,8 +35,8 @@ environment artifacts apart from product findings.
   `mount -o remount,rw /`, `nft destroy table inet ghostnector`, `rm -f
   /var/lib/ghostnector/intent.json`, `reboot -f`. On a headless VM the keystrokes were injected with
   `VBoxManage controlvm ... keyboardputscancode` (or `keyboardputstring`); on a machine with a
-  console, type them. The console is also reachable while the policy is applied â€” the policy blocks
-  packets, not the local login â€” so the preferred recovery is to log in on tty1 and run
+  console, type them. The console is also reachable while the policy is applied — the policy blocks
+  packets, not the local login — so the preferred recovery is to log in on tty1 and run
   `ghostnector disconnect`, and only reboot when that is impossible.
 * **Host-side verification endpoints.** VirtualBox NAT exposes the host's loopback at `10.0.2.2`.
   A UDP echo on 18081 and an HTTP server on 18082 were run on the host. The **HTTP check that goes
@@ -68,27 +68,27 @@ environment artifacts apart from product findings.
   `disconnect` (or remove the intent) *before* restarting the control plane, and must never rely on
   the SSH session that its own test can sever.
 
-## The second lockout (2026-09-26, 17:54â€“18:31 UTC) â€” reconstructed evidence
+## The second lockout (2026-09-26, 17:54–18:31 UTC) — reconstructed evidence
 
 The chat that drove this campaign died (a request-size limit), not the VM; the VM was alive and, in
 the end, sitting in a documented `init=/bin/bash` rescue shell. The reconstructed chain:
 
 1. The installed machine still had **D-29**: `/run/ghostnector` was not writable by the
    `ghostnector` account or not creatable by netd, and `ghostnector-netd` was dead
-   (`cannot use socket '/run/ghostnector/netd.sock': Permission denied`, restart counter 51â†’52,
+   (`cannot use socket '/run/ghostnector/netd.sock': Permission denied`, restart counter 51→52,
    then start-limited).
 2. A detached qualification at 17:54:15Z wrote `/etc/ghostnector/core.env` and ran
    `ghostnector connect`. The connect failed at once against the dead helper:
    `the helper's socket '/run/ghostnector/netd.sock' cannot be trusted: No such file or directory
    (os error 2) (BackendFailure)`. The engine reported
-   `blocked â€” no traffic can leave`, `policy: not applied`, with the honest reason "connecting
+   `blocked — no traffic can leave`, `policy: not applied`, with the honest reason "connecting
    failed and the policy could not be withdrawn, so the machine is treated as denied", and recorded
    `intent.json` as `{"protected": true, "profile": "fail_closed", "generation": 2}`.
    **No policy was applied**, so SSH still worked at this point.
 3. A background resync-and-reinstall job (started 17:58:29Z) rebuilt and reinstalled the tree with
    the D-29/D-30/D-31 fixes, then restarted `ghostnector-core` at 18:00:35Z. `reconcile()` read the
    persisted Blocked intent, found nothing applied, applied the fail-closed baseline and reported
-   `state: Blocked, applied: true` â€” correctly. From that second, every SSH reply was dropped; the
+   `state: Blocked, applied: true` — correctly. From that second, every SSH reply was dropped; the
    background job's log stopped at the `install.sh` output and the SSH client waited forever.
 4. The operator then reset the VM and used the GRUB rescue path. The intent journal was still on
    disk and was preserved before clearing (`/root/lockout2/var-lib-ghostnector/intent.json`); the
@@ -119,7 +119,7 @@ result cuts, writing evidence to `/tmp`, and having no detached cleanup.
   authorized to repoint the resolver (D-38); the machine carries two bounded polkit rules for
   exactly those two jobs.
 
-## Installed-stack qualification record (2026-09-26, after D-29â€“D-38)
+## Installed-stack qualification record (2026-09-26, after D-29–D-38)
 
 Run as a transient unit (`systemd-run --unit=ghostnector-qual --property=RuntimeMaxSec=1500`),
 real Tor 0.4.9.11 from the packaged `ghostnector-tor.service`, public HTTP check
@@ -134,7 +134,7 @@ machine:
   `restart` and an ordinary-user attempt (D-30);
 * managed Tor bootstraps to 100% and the control cookie is `debian-tor:ghostnector 0640` (D-31);
 * the namespace helper and `/run/netns` work on a fresh boot (D-33/D-34);
-* connect reaches `protected â€” and verified` through real Tor, with UDP denied, the protected path
+* connect reaches `protected — and verified` through real Tor, with UDP denied, the protected path
   answering with an address that is not this machine, and the effective policy compared;
 * systemd-resolved is repointed at the chokepoint (`resolvectl` shows `127.0.0.1`) and the
   `/proc/net/route` note is gone (D-37/D-38);
@@ -149,16 +149,16 @@ restored it without any manual step.
 The GUI qualification's I2P selection exposed that installed I2P mode was dead, and fixing it took
 three defects in sequence (each only visible after the previous one was fixed):
 
-1. **D-40** â€” the packaged `ghostnector-i2pd.service` could not start: i2pd stats `$HOME/.i2pd`
+1. **D-40** — the packaged `ghostnector-i2pd.service` could not start: i2pd stats `$HOME/.i2pd`
    before reading its configuration, the package user's home `/home/i2pd` does not exist, and
    `ProtectHome=yes` turns that into `EACCES`; the unit also omitted the package's certificate
    directory. Fixed with `Environment=HOME=/var/lib/ghostnector-i2pd` and
    `--certsdir=/usr/share/i2pd/certificates`.
-2. **D-41** â€” the router starts under the fail-closed baseline, which (correctly) exempts only
+2. **D-41** — the router starts under the fail-closed baseline, which (correctly) exempts only
    Tor's uid, so the I2P profile (itself a deny-everything-except-the-router policy) is now applied
    *before* the router starts. The baseline never carries the I2P uid; PC-22's mutually-exclusive
    exemption model is unchanged.
-3. **D-42** â€” the router's name resolution ran as `systemd-resolve` through resolved's stub, an
+3. **D-42** — the router's name resolution ran as `systemd-resolve` through resolved's stub, an
    identity I2P mode denies, so reseed failed with `Host not found` even under the router's own
    policy. The engine now discovers the machine's upstream nameservers and writes
    `/run/ghostnector/i2pd-resolv.conf` and a minimal `i2pd-nsswitch.conf`; the unit bind-mounts them,
@@ -187,8 +187,8 @@ product's.
 
 **D-45** was found immediately after D-44: the namespace existed and the group was listed, but the
 invoking user could not reach its own session socket because `/run/ghostnector/apps` was
-`0700 root:root`. It is now `0710 root:ghostnector` â€” traversable by the accounts that may control
-Ghostnector, not listable â€” while the socket itself stays `0600` owned by that user.
+`0700 root:root`. It is now `0710 root:ghostnector` — traversable by the accounts that may control
+Ghostnector, not listable — while the socket itself stays `0600` owned by that user.
 
 **D-46, D-47** completed the chain. D-46 added `CAP_SETUID`/`CAP_SETGID` to appd's bounding set so
 the launcher could drop identity at all; D-47 found that this was still not enough: an exec'd child
@@ -197,34 +197,34 @@ launcher still had no `CAP_SETUID` and every launch died with `cannot set uid 10
 unit's ambient set now carries everything a child needs
 (`CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SETUID CAP_SETGID`); the launcher still clears every granting set
 before it execs the user's shell (measured: `CapPrm=CapEff=CapAmb=0`), and the same fix restores
-`ip netns add`'s `CAP_SYS_ADMIN` in a child â€” it had only worked because `/run/netns` was made
+`ip netns add`'s `CAP_SYS_ADMIN` in a child — it had only worked because `/run/netns` was made
 shared by hand during the D-44 investigation. The hardening test now names the ambient set and
 refuses `CAP_CHOWN` ambient.
 
 **D-49** was the last link: with the launcher working, the group was still torn down within three
 seconds and no application could use the network. The helper's unit restricted address families to
-`AF_UNIX AF_NETLINK`, and systemd applies that to the whole unit tree â€” the verification probe and
+`AF_UNIX AF_NETLINK`, and systemd applies that to the whole unit tree — the verification probe and
 the user's application are children of the helper, so their `AF_INET` sockets failed with
 `EAFNOSUPPORT`, the verification failed (correctly) and the engine removed every namespace. The unit
 now allows `AF_INET`/`AF_INET6`; the helper's own code still opens only unix and netlink sockets.
 
 ## Performance qualification (installed, 2026-09-27)
 
-Method: the same machine, the same network, measured twice â€” through the product's transparent Tor
+Method: the same machine, the same network, measured twice — through the product's transparent Tor
 path and through a standalone Tor instance started on the same VM for the baseline. Medians over
 repeated samples; every sample is in `perf-20260927T082830Z.log`.
 
 | Measurement | Product | Baseline Tor | Notes |
 |---|---|---|---|
-| Direct DNS (open) | 2.61 ms | â€” | the VM's own resolver |
+| Direct DNS (open) | 2.61 ms | — | the VM's own resolver |
 | DNS through the chokepoint | 158.3 ms | 287.5 ms (Tor `DNSPort`) | the chokepoint adds Tor's DNS path in both cases |
 | HTTP latency (checkip) | 1.469 s | 0.543 s | five samples each; the product path includes the transparent redirect |
 | Throughput (1 MB) | 390.8 kB/s | 436.1 kB/s | two samples each; ~10% below baseline on this VM |
-| Connect to return | 27.5â€“44.3 s | â€” | cold Tor bootstrap each run |
-| Return to `protected` after connect | 2.6â€“13.6 s | â€” | first verification through Tor |
-| Disconnect | 0.527 s normally; two of three run samples hit 90.5 s | â€” | the 90 s samples are D-51; bounded to 20 s from here |
+| Connect to return | 27.5–44.3 s | — | cold Tor bootstrap each run |
+| Return to `protected` after connect | 2.6–13.6 s | — | first verification through Tor |
+| Disconnect | 0.527 s normally; two of three run samples hit 90.5 s | — | the 90 s samples are D-51; bounded to 20 s from here |
 | APP-scope launch | 0.72 s / 0.94 s / 0.95 s (focused rerun) | direct launch 0.33 s | the run's own APP numbers were polluted by leftover processes and are superseded by the focused rerun |
-| Product idle cost while protected | netd 3.68 MB / 0.5%, core 3.19 MB / 0.5%, appd 2.68 MB / 0.2%, DNS relay 2.02 MB / 0.0% | â€” | 10 samples, 1 s apart, excluding Tor itself |
+| Product idle cost while protected | netd 3.68 MB / 0.5%, core 3.19 MB / 0.5%, appd 2.68 MB / 0.2%, DNS relay 2.02 MB / 0.0% | — | 10 samples, 1 s apart, excluding Tor itself |
 
 The performance script's resource summary and APP-launch sampling were corrected after this run
 (the `ps` field/comm mismatch printed zero means, and a leftover application could satisfy the
@@ -237,28 +237,28 @@ launch check); the table above uses the focused re-measurement.
 * uninstall: every packaged file gone, no process, no policy table, the resolver restored, ordinary
   HTTP and DNS working;
 * reinstall: all three units active on the first attempt (after D-52);
-* ordinary use: connect â†’ protected â†’ disconnect â†’ off;
+* ordinary use: connect → protected → disconnect → off;
 * deliberate lockout (deterministic): protected, the router is stopped, the next verification
   fails, the fail-closed baseline is applied (the SSH session driving the runs is cut by design),
   and the documented local `disconnect` recovers to off with no table and no protected intent;
 * first boot after the reinstall (hard reset): all four units active, `/run/netns` present, state
   off;
-* adversarial reboot with protection on: the intent was `protected â€” and verified`; after the hard
-  reset the boot guard applied the fail-closed baseline before the network â€” `blocked â€” no traffic
-  can leave`, the policy table asserted present (`table inet ghostnector`), SSH cut â€” and guest
+* adversarial reboot with protection on: the intent was `protected — and verified`; after the hard
+  reset the boot guard applied the fail-closed baseline before the network — `blocked — no traffic
+  can leave`, the policy table asserted present (`table inet ghostnector`), SSH cut — and guest
   control (the VMMDev channel) recovered it to off. The same sequence was repeated manually with
   the same result.
 
-## Full M1â€“M10 gate (installed VM, 2026-09-27)
+## Full M1–M10 gate (installed VM, 2026-09-27)
 
 `release-gate.log` (run 2): every step returned 0, **455 unit tests passed, 0 failed**.
 
 * static: `fmt`, `check`, `clippy`, `test`, `build bins`, and the GUI `check`/`clippy`/`build` with
-  the GTK feature â€” all rc 0;
+  the GTK feature — all rc 0;
 * suites: app-topology, app-policy, appd-socket, core-app, app-adversarial (**13 held / 0
   contradicted / 0 inconclusive**), policy-netns (i2p golden), i2p-adversarial (**26/0/0**),
   policy-netns (tor golden), netd-socket, core-cli, bootguard, watch-oracle, and adversarial
-  (**27/0/1**) â€” all rc 0. The single inconclusive is the documented IPv6-environment case (AS-4:
+  (**27/0/1**) — all rc 0. The single inconclusive is the documented IPv6-environment case (AS-4:
   this VM has no global IPv6, so a failure there proves nothing).
 
 Environment notes, recorded because the first attempt was not evidence: the gate needs `cargo` on
@@ -286,7 +286,7 @@ self-probes; **zero arrivals in any protected, tamper, router-death, panic, I2P 
 protected path reported `185.181.61.203` against a host public address of `94.20.98.15`; the
 observer's heartbeats span the whole run window. The two VM-side inconclusive items are the APP
 exit-address observations: the applications launch, are confined and are listed, but their
-transparent TCP cannot work with real Tor (D-50) â€” the addresses are therefore absent, and this is a
+transparent TCP cannot work with real Tor (D-50) — the addresses are therefore absent, and this is a
 functional defect rather than a leak. Earlier, the run-3 evidence (30 phases, the same three
 expected arrivals and two self-probes, zero violations) was salvaged by re-correlating the intact
 logs after the controller's collection defect (D-48); the analyzer now refuses a verdict with no
@@ -298,9 +298,9 @@ failed with real Tor. A listener on the core address accepted an app's DNAT'ed c
 receiving host namespace had no entry to answer from, so real Tor could not learn the destination
 (the installed probe read `the answer could not be read`; the app's `curl` got `Connection reset by
 peer`). DNS worked because the chokepoint needs no original destination. The M8 evidence used a
-stand-in Tor that never asked for the destination, so this went unnoticed (GA-6). The fix â€” a
+stand-in Tor that never asked for the destination, so this went unnoticed (GA-6). The fix — a
 per-namespace relay that reads the namespace's own `SO_ORIGINAL_DST` and speaks to the core's Tor as
-the app's address â€” is implemented and requalified; see "D-50 fix" below and
+the app's address — is implemented and requalified; see "D-50 fix" below and
 `docs/RELEASE-CANDIDATE-REPORT.md`.
 
 The run's own controller failed to collect the log (D-48: a PowerShell `$args` collision made the
@@ -416,14 +416,14 @@ phase order that exposed the defect.
 **D-54 (found in the close-out verification; fixed and requalified).** The final lifecycle run's
 reboot-with-intent boot did not actually have the boot guard deny, and the investigation found three
 layers: netd (root, but with only `CAP_NET_ADMIN CAP_CHOWN`) could not create the copy in the
-control plane's ghostnector-owned `/var/lib/ghostnector` at all â€” the apply note said `a copy of the
-fail-closed policy could not be kept: Permission denied (os error 13)` â€” and the copy was produced
+control plane's ghostnector-owned `/var/lib/ghostnector` at all — the apply note said `a copy of the
+fail-closed policy could not be kept: Permission denied (os error 13)` — and the copy was produced
 only on a fail-closed apply; a copy that existed was `0600` owned by `ghostnector`, which the root
 guard (`NET_ADMIN` only) could not read; and the guard could not connect to netd's `0600` socket
 either. The fix, least privilege: netd keeps the copy in its own root-owned state directory
 (`StateDirectory=ghostnector-netd`) on **every** apply, hands the finished file to the control
 plane's user with the `CAP_CHOWN` it already carries for the socket, and replaces it atomically
-(root-owned temporary, `chown`, `rename` â€” `rename` needs only directory write, which netd owns);
+(root-owned temporary, `chown`, `rename` — `rename` needs only directory write, which netd owns);
 netd no longer touches `/var/lib/ghostnector`, which also ends the latent ownership fight with the
 core. The guard runs as that same control-plane user (`User=ghostnector`) with exactly
 `CAP_NET_ADMIN` ambient and `NoNewPrivileges`, owns the socket and the copy, and writes nothing (no
@@ -439,7 +439,7 @@ resets; durable log `boot-guard-qualification.log`):
   for protection.
 * **verify-protected 7/0/0**: the boot guard exits 0, its own journal says the helper denied
   everything, it finishes **at or before the network-pre barrier** (e.g. 23019768us vs 23034512us),
-  the fail-closed table is present, and the machine reports `blocked â€” no traffic can leave`; the
+  the fail-closed table is present, and the machine reports `blocked — no traffic can leave`; the
   documented disconnect recovers to off with no table.
 * **verify-off 4/0/0**: with no persisted intent the guard exits 0, does nothing, no table exists and
   the machine is off.
@@ -449,5 +449,3 @@ refused, missing and corrupt copies failing safely), and the hardening tests pin
 identity, capability set and read-only posture plus the helper's own state directory. The full gate
 at `f82adf9` is 21/21 rc 0 with 461 unit tests passing and the boot-guard suite PASS. The ordering
 claim itself (no packet leaves before the deny) remains G6; the mechanism gap G14 is closed.
-
-
