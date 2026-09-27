@@ -5,7 +5,9 @@ a native VM): GUI → leakage/privacy/network identity → performance → adver
 clean install/uninstall/reboot → the complete M1–M10 gate.
 
 **Tested commit:** `8029bda` (the gate and all installed runs used a VM tree reset to this commit;
-the commits after it are the qualification record itself). No release tag was created or moved.
+the commits after it are the qualification record itself, plus one documentation-only correction:
+the handoff working aid was accidentally tracked earlier and has been untracked, leaving the product
+code unchanged). No release tag was created or moved.
 
 **Recommendation: do not freeze `v1.0.0` until D-50 is decided.** The confinement, privacy,
 packaging, lifecycle and gate evidence is strong and reproducible, but the APP-scope claim that a
