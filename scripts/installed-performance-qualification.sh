@@ -61,6 +61,18 @@ trap cleanup EXIT
 
 median() { sort -n | awk '{a[NR]=$1} END {if (NR==0) {print "none"; exit} if (NR%2) print a[(NR+1)/2]; else printf "%.3f", (a[NR/2]+a[NR/2+1])/2}'; }
 now() { date +%s.%N; }
+# The verifier takes a SocketAddr, so the check endpoint is pinned to a resolved address; pick one
+# that answers the probe's bare-IP GET with 200 (the edges rotate and some do not serve every
+# request). A failed check would block the machine and the measurements would measure the wrong
+# path.
+check_endpoint() {
+    local candidate code
+    for candidate in $(getent ahostsv4 checkip.amazonaws.com | awk '{print $1}'); do
+        code="$(timeout 15 curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://$candidate/" || true)"
+        [ "$code" = "200" ] && { echo "$candidate"; return 0; }
+    done
+    getent ahostsv4 checkip.amazonaws.com | awk 'NR==1{print $1}'
+}
 
 echo "== installed performance qualification at $(date -u) =="
 echo "log: $LOG"
@@ -76,12 +88,13 @@ echo "-- baseline: open, off --"
 timeout 60 "${CLI[@]}" disconnect >/dev/null 2>&1 || true
 nft destroy table inet ghostnector 2>/dev/null || true
 rm -f /var/lib/ghostnector/intent.json
-HTTP_IP="$(getent ahostsv4 checkip.amazonaws.com | awk 'NR==1{print $1}')"
+HTTP_IP="$(check_endpoint)"
 cat >/etc/ghostnector/core.env <<EOF
 GHOSTNECTOR_VERIFY=--udp-check $HOST:18081 --check-url http://$HTTP_IP/ --verify-timeout 10 --verify-interval 5 --verify-stale-after 30
 EOF
 systemctl restart ghostnector-netd.service ghostnector-core.service ghostnector-appd.service
 sleep 2
+echo "verification endpoint: http://$HTTP_IP/"
 "${CLI[@]}" status | head -1
 
 # Direct DNS baseline (the DHCP resolver, unprotected).
