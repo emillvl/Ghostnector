@@ -29,6 +29,10 @@ ProtectHome=yes
 PrivateTmp=yes
 ProtectProc=invisible
 ProcSubset=pid
+# The journal and the fallback policy live here; systemd creates the directory as part of this
+# unit's setup, so the boot guard cannot fail with 226/NAMESPACE when the directory is missing on a
+# fresh install (the same class as D-52).
+StateDirectory=ghostnector
 ReadWritePaths=/run/ghostnector /var/lib/ghostnector
 
 [Install]
