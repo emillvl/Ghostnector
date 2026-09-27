@@ -384,11 +384,13 @@ ip link show "$BRIDGE" >/dev/null 2>&1 && fail "revert left the bridge behind"
 ok "every namespace, link and the bridge are gone"
 
 echo "[8] the packaged capability set is sufficient, and CAP_SYS_ADMIN is necessary"
-# Exactly the packaged state: bounding {net_admin, sys_admin, chown}, ambient net_admin only.
-# (A root process's permitted set after exec is its bounding set, which is what setpriv emulates.)
+# Exactly the packaged state: bounding {net_admin, sys_admin, chown, setuid, setgid}, ambient
+# {net_admin, sys_admin, setuid, setgid}. The ambient set is what survives execve, so everything a
+# child of the helper needs (the launcher's identity drop and the probe) must be in it (D-46/D-47);
+# this test must mirror the unit, and the hardening test pins the unit.
 setpriv --reuid=0 --regid=0 --clear-groups \
-    --bounding-set=-all,+net_admin,+sys_admin,+chown \
-    --inh-caps +net_admin --ambient-caps +net_admin \
+    --bounding-set=-all,+net_admin,+sys_admin,+chown,+setuid,+setgid \
+    --inh-caps +net_admin --ambient-caps +net_admin,+sys_admin,+setuid,+setgid \
     "$APPD" --socket "$SOCK3" --peer-uid "$CORE_UID" --state-dir "$STATE3" \
     --launcher "$LAUNCHER" --probe "$PROBE" \
     --bridge "$BRIDGE3" --core "$CORE" --prefix "$PREFIX" --dead-device "$DEAD" \
@@ -427,10 +429,11 @@ APPD3_PID=""
 
 # The same state minus CAP_SYS_ADMIN. The bridge still works (CAP_NET_ADMIN), the socket is still
 # prepared (CAP_CHOWN), and creating a namespace fails with EPERM: this is the empirical
-# justification for CAP_SYS_ADMIN in the unit.
+# justification for CAP_SYS_ADMIN in the unit. The other packaged capabilities stay ambient so the
+# only difference is the one under test.
 setpriv --reuid=0 --regid=0 --clear-groups \
-    --bounding-set=-all,+net_admin,+chown \
-    --inh-caps +net_admin --ambient-caps +net_admin \
+    --bounding-set=-all,+net_admin,+chown,+setuid,+setgid \
+    --inh-caps +net_admin --ambient-caps +net_admin,+setuid,+setgid \
     "$APPD" --socket "$SOCK2" --peer-uid "$CORE_UID" --state-dir "$STATE2" \
     --launcher "$LAUNCHER" --probe "$PROBE" \
     --bridge "$BRIDGE2" --core "$CORE" --prefix "$PREFIX" --dead-device "$DEAD" \
