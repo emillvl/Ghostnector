@@ -379,3 +379,35 @@ machine-wide Tor session, so the focused regression covers the transition; the f
 **17 held / 0 contradicted / 0 inconclusive** (`app-real-tor-20260927T134858Z.log`), with the two
 groups' fetches returning `94.230.208.147` and `192.42.116.51`. The post-fix leakage run uses the
 phase order that exposed the defect.
+
+## Post-fix qualification records (2026-09-27, after D-50 and D-53)
+
+* **Focused APP against real Tor** (`app-real-tor-test.sh`, `app-real-tor-20260927T134858Z.log`):
+  **17 held / 0 contradicted / 0 inconclusive**. A machine-wide Tor session first (the D-53
+  transition), then two groups fetched real exit addresses (`94.230.208.147`, `192.42.116.51`), the
+  intended destination answered 200, DNS resolved through the chokepoint, a direct connection
+  produced no data, a direct relay connection was refused, the stopped group's relay was gone while
+  the other group's stayed, and with Tor stopped the state stopped claiming verification while no
+  application produced an address.
+* **Leakage** (`leak-20260927T135503Z.log`): VM-side **30/0/0** (run exit 0); analyzer exit 0 with
+  30 phase records, 3 expected open-validation arrivals, 2 observer self-probes, **0 violations, 0
+  ambiguous**, heartbeats spanning the run; the protected path reported `185.220.101.20` against
+  the host's public `94.20.98.15`; nothing reached the far side in any protected window; the APP
+  window's two groups left through different observed addresses.
+* **Performance** (`perf-20260927T144529Z.log`): direct DNS 1.91 ms; chokepoint DNS 162.6 ms
+  (baseline Tor 276.3 ms); HTTP 0.896 s (baseline 0.803 s); machine-wide throughput 180.3 kB/s
+  (baseline 476.5 kB/s; this quantity varies widely between runs); APP launch 0.79/0.90/0.96 s
+  against a direct launch of 0.32/0.33/0.34 s; APP throughput through the relay 712.8 kB/s (median
+  of 3); the relay's cost during a download 2.52 MB RSS / 0.47% CPU (40 samples); idle helpers
+  netd 3.80 MB / core 3.17 MB / appd 2.70 MB / DNS 2.22 MB.
+* **Lifecycle** (`lifecycle-20260927T145851Z.log`): **32/0/0** (run exit 0), including the relay
+  residue check after the uninstall, the reinstall's first boot, and the reboot-with-intent
+  recovery to `off` via guest control.
+* **Full M1-M10 gate** (`release-gate.log`, commit `e788aab`): 21 steps all rc 0; 460 unit tests
+  passed, 0 failed; app-adversarial 13/0/0, i2p-adversarial 26/0/0, adversarial 27/0/1 (the
+  documented no-IPv6 case), watch-oracle 10/0; the product was restored (three units active, state
+  off, no table).
+* **AA-13 correction.** The relay is the helper's child and exits when the helper dies (its stdin
+  pipe closes), so the case now asserts what it claims - the namespace still exists and carries
+  nothing, with the connection refused at the dead local relay - instead of the pre-relay liveness
+  expectation that the protected path keeps working. WSL rerun 13/0/0; final gate 13/0/0.
