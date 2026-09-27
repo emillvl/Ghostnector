@@ -219,18 +219,36 @@ it really contains its phases, then correlates arrivals against phases with the 
 is refused (exit 3) when there are no phases, no open-validation arrival (the channel would be
 unproven), or the observer's last heartbeat predates the end of the run.
 
-Result of the conclusive run (`leak-20260927T060301Z.log`, VM-side **26 held / 0 contradicted /
-3 inconclusive**): 30 phase records; the only far-side arrivals were the three open-validation
-probes (HTTP, UDP, DNS) and the two observer self-probes; **zero arrivals in any protected, tamper,
-router-death, panic, I2P or APP window**; the protected path reported `109.70.100.13` against a host
-public address of `94.20.98.15`. The three VM-side inconclusive items were the APP section, which
-could not observe its applications for an unrelated reason (the launcher's D-47 failure); the
-section now captures the application's output through the session, because appd's `PrivateTmp`
-hides `/tmp` and `/var/tmp` from the namespace.
+Result of the conclusive run (`leak-20260927T073453Z.log`, VM-side **27 held / 0 contradicted / 2
+inconclusive**; analyzer exit 0 after the heartbeat check was corrected): 30 phase records; the only
+far-side arrivals were the three open-validation probes (HTTP, UDP, DNS) and the two observer
+self-probes; **zero arrivals in any protected, tamper, router-death, panic, I2P or APP window**; the
+protected path reported `185.181.61.203` against a host public address of `94.20.98.15`; the
+observer's heartbeats span the whole run window. The two VM-side inconclusive items are the APP
+exit-address observations: the applications launch, are confined and are listed, but their
+transparent TCP cannot work with real Tor (D-50) — the addresses are therefore absent, and this is a
+functional defect rather than a leak. Earlier, the run-3 evidence (30 phases, the same three
+expected arrivals and two self-probes, zero violations) was salvaged by re-correlating the intact
+logs after the controller's collection defect (D-48); the analyzer now refuses a verdict with no
+phases, no open-validation arrivals, or heartbeats that do not span the run.
+
+**D-50 (recorded, decision for the maintainer).** The leakage run's APP section showed why the
+transparent path fails with real Tor. A listener on the core address accepts an app's DNAT'ed
+connection, but `SO_ORIGINAL_DST` returns `ENOENT`: the NAT happened in the app namespace's
+conntrack, and the receiving host namespace has no entry to answer from, so real Tor cannot learn
+the destination (the installed probe reads `the answer could not be read`; the app's `curl` gets
+`Connection reset by peer`). DNS works because the chokepoint needs no original destination. The M8
+evidence used a stand-in Tor that never asks for the destination, so this went unnoticed (GA-6).
+A correct fix changes the M8 data-path mechanism — a per-namespace relay that reads the namespace's
+own `SO_ORIGINAL_DST` and speaks to the core's Tor as the app's address, or host-side interception
+(which would falsify PC-18) — so it is recorded rather than taken in this campaign.
 
 The run's own controller failed to collect the log (D-48: a PowerShell `$args` collision made the
 collection run `sudo` with no arguments), which produced a `phases: 0` analysis. The raw evidence
 was intact on both sides and was re-correlated directly with the measured offset; the analyzer now
 refuses a `phases: 0` verdict. Every external operation in the controllers is bounded
 (`Start-Process` + `WaitForExit`, SSH commands quoted as one argument), and the poll loop reads a
-single-word unit state and keeps polling on anything unexpected.
+single-word unit state and keeps polling on anything unexpected. The analyzer's heartbeat check was
+corrected too: it had required a heartbeat after the run's last phase, which fails whenever the
+analyzer runs inside the 15-second beat window (it did, on run 4); it now checks that the beats span
+the run window with bounded gaps.
