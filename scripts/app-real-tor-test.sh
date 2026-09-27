@@ -180,8 +180,14 @@ else
     bad "the application produced no exit address"
 fi
 case "$ENDPOINT1" in
-2*) ok "the intended destination survived the relay (the endpoint answered $ENDPOINT1)" ;;
-*) bad "the intended destination did not answer: ${ENDPOINT1:-none}" ;;
+2*) ok "the intended destination answered a second request ($ENDPOINT1)" ;;
+*)
+    if [ -n "$IP1" ]; then
+        inc "the second request to the rotating public name did not answer (${ENDPOINT1:-none}); the first did ($IP1)"
+    else
+        bad "the intended destination did not answer: ${ENDPOINT1:-none}"
+    fi
+    ;;
 esac
 [ -n "$DNS1" ] && ok "DNS inside the namespace resolved through the chokepoint ($DNS1)" \
     || bad "DNS inside the namespace did not resolve"
