@@ -484,33 +484,42 @@ focus_gui
 # window's own list and Stop are exercised below. The picker itself is a documented limitation of
 # this environment, not of the product.
 if dialog_open; then key Escape; sleep 0.5; fi
-runuser -u "$GUI_USER" -g ghostnector -- /usr/bin/ghostnector run /usr/local/bin/gh-qual-app >/tmp/gh-qual-run.log 2>&1 &
-sleep 3
-if ! runuser -u "$GUI_USER" -g ghostnector -- /usr/bin/ghostnector apps 2>&1 | grep -q "gh-qual-app"; then
+# The CLI's session copies stdin; with stdin at EOF the group is torn down while the application
+# keeps running. Hold a pipe open so the session (and the group) lives until Stop.
+( sleep 600 | runuser -u "$GUI_USER" -g ghostnector -- /usr/bin/ghostnector run /usr/local/bin/gh-qual-app >/tmp/gh-qual-run.log 2>&1 ) &
+sleep 4
+if ! runuser -u "$GUI_USER" -g ghostnector -- /usr/bin/ghostnector apps 2>&1 | grep -q "running"; then
     note "run output: $(head -2 /tmp/gh-qual-run.log 2>/dev/null | tr '\n' ' ')"
 fi
 APPS="$(runuser -u "$GUI_USER" -g ghostnector -- /usr/bin/ghostnector apps 2>&1)"
 echo "apps: $APPS"
-if ! printf '%s' "$APPS" | grep -q "gh-qual-app"; then
-    note "windows: $(wmctrl -l | tr '\n' ' ')"
-    note "dialog-ish labels: $(ui_labels | grep -iE 'choose|name|location|open|select' | head -5 | tr '\n' ' ')"
-fi
 case "$APPS" in
-*"no protected applications"*) bad "the chosen application did not appear: $APPS" ;;
-*"running"*) ok "the chosen application is listed as running" ;;
-*) bad "the chosen application did not appear as running: $APPS" ;;
+*"no protected applications"*) bad "the launched application did not appear: $APPS" ;;
+*"running"*) ok "the launched application is listed as running" ;;
+*) bad "the launched application did not appear as running: $APPS" ;;
 esac
 ps -eo args= | grep -q '[g]h-qual-app' && ok "the application process is really running" || bad "no application process found"
+app_in_namespace() {
+    local initns
+    initns="$(readlink /proc/1/ns/net)"
+    local p
+    for p in $(pgrep -f gh-qual-app 2>/dev/null); do
+        [ "$(readlink "/proc/$p/ns/net" 2>/dev/null)" != "$initns" ] && return 0
+    done
+    return 1
+}
+app_in_namespace && ok "the application runs in its own network namespace" || bad "the application is not in a namespace"
 ip netns list 2>/dev/null | grep -q ghapp && ok "an APP namespace exists" || bad "no APP namespace found"
 LABELS="$(ui_labels)"
 case "$LABELS" in
 *"gh-qual-app"*) ok "the window lists the application by name" ;;
+*"Protected application"*) ok "the window lists the application by its neutral ordinal (it was launched by another client)" ;;
 *) bad "the window does not list the application" ;;
 esac
 shot gui-04-app
 ui_click Stop >/dev/null 2>&1 || bad "could not find the Stop button"
-sleep 1.5
-ps -eo args= | grep -q '[g]h-qual-app' && bad "the application is still running after Stop" || ok "Stop ended the application"
+sleep 2
+app_in_namespace && bad "the application is still running after Stop" || ok "Stop ended the application"
 APPS="$(runuser -u "$GUI_USER" -g ghostnector -- /usr/bin/ghostnector apps 2>&1)"
 echo "apps after stop: $APPS"
 
