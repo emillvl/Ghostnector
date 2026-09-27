@@ -406,22 +406,46 @@ phase order that exposed the defect.
 * **Full M1-M10 gate** (`release-gate.log`, commit `e788aab`): 21 steps all rc 0; 460 unit tests
   passed, 0 failed; app-adversarial 13/0/0, i2p-adversarial 26/0/0, adversarial 27/0/1 (the
   documented no-IPv6 case), watch-oracle 10/0; the product was restored (three units active, state
-  off, no table).
+  off, no table). (The final gate after the D-54 fix is in the D-54 paragraph below: `63bee78`,
+  21/21 rc 0, 461 unit tests.)
 * **AA-13 correction.** The relay is the helper's child and exits when the helper dies (its stdin
   pipe closes), so the case now asserts what it claims - the namespace still exists and carries
   nothing, with the connection refused at the dead local relay - instead of the pre-relay liveness
   expectation that the protected path keeps working. WSL rerun 13/0/0; final gate 13/0/0.
 
-**D-54 (found in the close-out verification; requires action before a tag).** The final lifecycle
-run's reboot-with-intent boot did not actually have the boot guard deny. The guard's journal shows
-`the helper could not deny everything: Permission denied (os error 13)` and `there is no copy of the
-fail-closed policy at '/var/lib/ghostnector/fail-closed.nft'`, and the control plane's reconcile
-applied the baseline once it started (the machine ended `blocked - no traffic can leave`). Under the
-unit's own capability set (root, only `CAP_NET_ADMIN`, `NoNewPrivileges`) both routes are blocked:
-netd's socket and the fallback copy are `0600` owned by `ghostnector`, so the connect and the
-`nft -f` on the copy fail with `EACCES` (reproduced in `d54-bootguard-closeout.log`); the copy is
-also written only when the fail-closed profile is applied, so a fresh install's first protected
-reboot has none. The hermetic `bootguard-test.sh` runs the guard as plain root, which is why it
-passed. The ordering claim was already open (G6); this is the mechanism gap G14. Fix D-54 (make the
-copy readable to the guard, write it on every apply, and assert the guard's own success in the
-lifecycle's reboot case) or narrow PC-10 before tagging.
+**D-54 (found in the close-out verification; fixed and requalified).** The final lifecycle run's
+reboot-with-intent boot did not actually have the boot guard deny, and the investigation found three
+layers: netd (root, but with only `CAP_NET_ADMIN CAP_CHOWN`) could not create the copy in the
+control plane's ghostnector-owned `/var/lib/ghostnector` at all — the apply note said `a copy of the
+fail-closed policy could not be kept: Permission denied (os error 13)` — and the copy was produced
+only on a fail-closed apply; a copy that existed was `0600` owned by `ghostnector`, which the root
+guard (`NET_ADMIN` only) could not read; and the guard could not connect to netd's `0600` socket
+either. The fix, least privilege: netd keeps the copy in its own root-owned state directory
+(`StateDirectory=ghostnector-netd`) on **every** apply, hands the finished file to the control
+plane's user with the `CAP_CHOWN` it already carries for the socket, and replaces it atomically
+(root-owned temporary, `chown`, `rename` — `rename` needs only directory write, which netd owns);
+netd no longer touches `/var/lib/ghostnector`, which also ends the latent ownership fight with the
+core. The guard runs as that same control-plane user (`User=ghostnector`) with exactly
+`CAP_NET_ADMIN` ambient and `NoNewPrivileges`, owns the socket and the copy, and writes nothing (no
+state directory, no writable path). No capability that bypasses file permissions and no widened file
+or socket mode.
+
+Focused installed qualification (`installed-boot-guard-qualification.sh`, driven across real hard
+resets; durable log `boot-guard-qualification.log`):
+
+* **prepare 8/0/0**: with the copy removed (a fresh install has none), a protected session leaves a
+  fresh copy owned by the control plane's user, mode 0600, containing the fail-closed ruleset; an
+  unprivileged user can neither read it nor connect to the helper's socket; the persisted intent asks
+  for protection.
+* **verify-protected 7/0/0**: the boot guard exits 0, its own journal says the helper denied
+  everything, it finishes **at or before the network-pre barrier** (e.g. 23019768us vs 23034512us),
+  the fail-closed table is present, and the machine reports `blocked — no traffic can leave`; the
+  documented disconnect recovers to off with no table.
+* **verify-off 4/0/0**: with no persisted intent the guard exits 0, does nothing, no table exists and
+  the machine is off.
+
+The hermetic suite now runs the guard under that exact identity (both routes, an unrelated user
+refused, missing and corrupt copies failing safely), and the hardening tests pin the guard's
+identity, capability set and read-only posture plus the helper's own state directory. The full gate
+at `63bee78` is 21/21 rc 0 with 461 unit tests passing and the boot-guard suite PASS. The ordering
+claim itself (no packet leaves before the deny) remains G6; the mechanism gap G14 is closed.

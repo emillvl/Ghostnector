@@ -329,3 +329,11 @@ defect ledger (`docs/ADVERSARIAL-TEST-PLAN.md`, D-40…D-46).
    mode no longer renders a TransPort, and the rejected alternatives were host-side interception (it
    would put application frames on the host link, falsifying PC-18) and narrowing the v1 APP claim to
    "no transparent egress" (it would drop a capability the M8 design promised).
+6. **The boot guard runs as the control plane's user, and the helper keeps the fallback copy for it
+   (D-54).** The guard must apply the fail-closed policy before the network with nothing but
+   `CAP_NET_ADMIN`, so it runs as the user that owns both the helper's socket and the fallback copy:
+   netd hands both over (the socket as before, the copy with the `CAP_CHOWN` it already carries) and
+   keeps the copy current on every apply in its own root-owned state directory. No capability that
+   bypasses file permissions and no widened file or socket mode was added; the alternatives (running
+   the guard as root and granting `CAP_DAC_OVERRIDE`/`CAP_DAC_READ_SEARCH`, or a world-readable copy)
+   were rejected as broader than the problem.
