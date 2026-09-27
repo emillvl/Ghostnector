@@ -292,16 +292,16 @@ expected arrivals and two self-probes, zero violations) was salvaged by re-corre
 logs after the controller's collection defect (D-48); the analyzer now refuses a verdict with no
 phases, no open-validation arrivals, or heartbeats that do not span the run.
 
-**D-50 (recorded, decision for the maintainer).** The leakage run's APP section showed why the
-transparent path fails with real Tor. A listener on the core address accepts an app's DNAT'ed
-connection, but `SO_ORIGINAL_DST` returns `ENOENT`: the NAT happened in the app namespace's
-conntrack, and the receiving host namespace has no entry to answer from, so real Tor cannot learn
-the destination (the installed probe reads `the answer could not be read`; the app's `curl` gets
-`Connection reset by peer`). DNS works because the chokepoint needs no original destination. The M8
-evidence used a stand-in Tor that never asks for the destination, so this went unnoticed (GA-6).
-A correct fix changes the M8 data-path mechanism — a per-namespace relay that reads the namespace's
-own `SO_ORIGINAL_DST` and speaks to the core's Tor as the app's address, or host-side interception
-(which would falsify PC-18) — so it is recorded rather than taken in this campaign.
+**D-50 (fixed after this run).** The leakage run's APP section showed why the transparent path
+failed with real Tor. A listener on the core address accepted an app's DNAT'ed connection, but
+`SO_ORIGINAL_DST` returned `ENOENT`: the NAT happened in the app namespace's conntrack, and the
+receiving host namespace had no entry to answer from, so real Tor could not learn the destination
+(the installed probe read `the answer could not be read`; the app's `curl` got `Connection reset by
+peer`). DNS worked because the chokepoint needs no original destination. The M8 evidence used a
+stand-in Tor that never asked for the destination, so this went unnoticed (GA-6). The fix — a
+per-namespace relay that reads the namespace's own `SO_ORIGINAL_DST` and speaks to the core's Tor as
+the app's address — is implemented and requalified; see "D-50 fix" below and
+`docs/RELEASE-CANDIDATE-REPORT.md`.
 
 The run's own controller failed to collect the log (D-48: a PowerShell `$args` collision made the
 collection run `sudo` with no arguments), which produced a `phases: 0` analysis. The raw evidence
@@ -312,3 +312,46 @@ single-word unit state and keeps polling on anything unexpected. The analyzer's 
 corrected too: it had required a heartbeat after the run's last phase, which fails whenever the
 analyzer runs inside the 15-second beat window (it did, on run 4); it now checks that the beats span
 the run window with bounded gaps.
+
+## D-50 fix: the per-namespace relay (implemented and requalified)
+
+Mechanism. The namespace's catch-all TCP DNAT now targets `127.0.0.1:9041`, where
+`ghostnector-appd-relay` runs inside the same namespace. appd starts it (via `ip netns exec`) when a
+group is created, as the application's own uid, and the relay drops every capability set before it
+listens. Because the DNAT happened in the namespace's own conntrack, `SO_ORIGINAL_DST` answers there
+(proved in `d50-origdst-caps.log`: a uid-1000 listener in the namespace that created the NAT reads
+the original destination; no privilege is required). The relay refuses any connection with no
+original destination, speaks SOCKS5 to the core's SocksPort with the per-group credential
+`app<id>`/`ghostnector`, and splices bytes; it never parses payloads. Tor therefore sees the
+application's own address and keys `IsolateSOCKSAuth` isolation per group. The namespace's egress
+allows only the chokepoint (DNS) and the SocksPort; the host table admits the app link to the same
+two ports; APP mode no longer renders a `TransPort`. A refused client is drained first, so a dead
+router produces an empty answer (a failed check) rather than a read error (an inconclusive one), and
+the state reports fail-closed. The relay's shutdown channel is its standard input: appd holds the
+write end of the pipe and closes it to stop the relay (the packaged capability set has no
+`CAP_KILL`), then reaps it with a bounded wait.
+
+Evidence regenerated after the fix:
+
+* `app-real-tor-test.sh`, installed product, real Tor (`app-real-tor-20260927T121825Z.log`): **16
+  held / 0 contradicted / 0 inconclusive**. Two groups fetched real exit addresses
+  (`141.98.11.62`, `185.100.87.174`) that differ from the host's public address; the intended
+  destination answered 200 twice; DNS resolved through the chokepoint; a direct connection to a
+  private host produced no data; a direct connection to the relay was refused; stopping one group
+  removed its relay while the other group's stayed; with Tor stopped an application connection
+  produced no address and the state stopped claiming verification (`protected, but unverified`;
+  earlier runs with a path check configured reported `blocked - no traffic can leave`, the
+  fail-closed baseline); disconnect left no relay, namespace or table.
+* Kernel suites (source tree): `app-policy-test.sh` PASS (destination survives, source preserved,
+  direct relay connection refused, core TransPort closed to the app link), `app-topology-test.sh`
+  PASS, `appd-socket-test.sh` PASS (31 checks; no relay survives destroy/revert, including under the
+  packaged capability set), `core-app-test.sh` PASS (the stand-in now speaks SOCKS and records the
+  surviving destination, the source address and the per-group credential), `app-adversarial.sh`
+  12 held / 0 contradicted / 1 inconclusive in WSL (the inconclusive is the WSL-specific namespace
+  observation after the helper dies; the VM run is in the final gate).
+* The post-fix leakage run and the full M1-M10 gate are recorded below.
+
+Method notes: the verification probe's UDP check passes when UDP cannot leave, which is APP scope's
+design, so the focused APP run verifies deterministically without depending on a public endpoint's
+availability through a particular Tor exit. The path-check phase deliberately re-pins an HTTP check
+while Tor is down to show the state stops claiming verification.

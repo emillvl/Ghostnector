@@ -2,9 +2,9 @@
 
 Status: **implemented** (M10.1, commit `b92e994`). The native VM real-display qualification and the
 clean-install/lifecycle tests were completed in the M10 qualification campaign; the record is in
-`docs/QUALIFICATION-NOTES.md` and the consolidated result — including one open product decision
-(D-50, APP-scope transparent egress with real Tor) — is in `docs/RELEASE-CANDIDATE-REPORT.md`. No
-M1–M9 backend boundary was widened.
+`docs/QUALIFICATION-NOTES.md` and the consolidated result — including the D-50 APP-scope transparent
+egress fix, which is now implemented and requalified against real Tor — is in
+`docs/RELEASE-CANDIDATE-REPORT.md`. No M1–M9 backend boundary was widened.
 
 ---
 
@@ -317,3 +317,15 @@ defect ledger (`docs/ADVERSARIAL-TEST-PLAN.md`, D-40…D-46).
    `0710 root:ghostnector` (traversable by the accounts that may control Ghostnector, not listable);
    each socket stays `0600` owned by the invoking user and the launcher's peer check still decides
    who may use it.
+5. **The APP TCP path is a per-namespace relay, not a DNAT to the core's TransPort (D-50).** Real
+   Tor's transparent contract needs `SO_ORIGINAL_DST`, which only the namespace that created the NAT
+   can answer, so the DNAT now targets a relay inside the application's own namespace. The relay
+   runs as the application's uid with every capability set empty (proved by `d50-origdst-caps.log`),
+   refuses any connection with no original destination (it can never be an open proxy), speaks SOCKS
+   to the core's SocksPort as the application's address with a per-group credential (so Tor's
+   `IsolateSOCKSAuth` keys each group separately), drains a refused client so a dead router reads as
+   a failed check rather than an inconclusive one, and is stopped through a stdin pipe because the
+   packaged set has no `CAP_KILL`. The namespace may reach only the chokepoint and SocksPort, APP
+   mode no longer renders a TransPort, and the rejected alternatives were host-side interception (it
+   would put application frames on the host link, falsifying PC-18) and narrowing the v1 APP claim to
+   "no transparent egress" (it would drop a capability the M8 design promised).

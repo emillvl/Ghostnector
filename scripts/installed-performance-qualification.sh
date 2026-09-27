@@ -275,13 +275,13 @@ for _ in 1 2 3; do
 done
 "${CLI[@]}" disconnect >/dev/null 2>&1 || true
 sleep 1
-# The APP profile needs a fresh verification endpoint; retry with a newly resolved address if the
-# connect lands Blocked on a stale one.
+# The APP profile is verified deterministically by the UDP check (the namespace denies UDP; the
+# probe treats that as the pass), so the launch measurement does not depend on a public endpoint's
+# availability through a particular Tor exit.
 APP_READY=0
 for attempt in 1 2 3; do
-    HTTP_IP="$(getent ahostsv4 checkip.amazonaws.com | awk 'NR==1{print $1}')"
     cat >/etc/ghostnector/core.env <<EOF
-GHOSTNECTOR_VERIFY=--udp-check $HOST:18081 --check-url http://$HTTP_IP/ --verify-timeout 10 --verify-interval 5 --verify-stale-after 30
+GHOSTNECTOR_VERIFY=--udp-check $HOST:18081 --verify-timeout 10 --verify-interval 5 --verify-stale-after 30
 EOF
     systemctl restart ghostnector-core.service
     sleep 2
@@ -333,6 +333,19 @@ PY
     for _ in $(seq 1 50); do app_in_namespace || break; sleep 0.2; done
     sleep 1
 done
+# The relay is one process per group, running as the application's uid; its cost belongs with the
+# APP figures (it is part of the launch and of the idle footprint while a group exists).
+echo "APP-scope relay resources:"
+: >/tmp/gh-perf-res-relay.txt
+for _ in $(seq 1 6); do
+    ps -eo rss=,pcpu=,args= 2>/dev/null | grep 'ghostnector-appd-relay --id' | grep -v grep |
+        awk '{print $1, $2}' >>/tmp/gh-perf-res-relay.txt
+    sleep 1
+done
+awk '{rss+=$1; cpu+=$2; n++} END {
+    if (n > 0) printf "relay mean_rss_kb=%.0f mean_cpu_pct=%.2f samples=%d\n", rss/n, cpu/n, n;
+    else print "relay: no relay process observed"
+}' /tmp/gh-perf-res-relay.txt
 "${CLI[@]}" disconnect >/dev/null 2>&1 || true
 
 echo
