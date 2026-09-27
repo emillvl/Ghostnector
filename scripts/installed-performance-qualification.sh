@@ -334,10 +334,23 @@ PY
     sleep 1
 done
 # The relay is one process per group, running as the application's uid; its cost belongs with the
-# APP figures (it is part of the launch and of the idle footprint while a group exists).
-echo "APP-scope relay resources:"
+# APP figures. Measure a real download through it (the same 1 MB URL as the machine-wide path) and
+# sample the relay's memory and CPU while that download is in flight.
+cat >/usr/local/bin/gh-perf-download <<'EOF'
+#!/bin/sh
+for _ in 1 2 3; do
+    timeout 120 curl -s -o /dev/null -w '%{speed_download}\n' --max-time 110 \
+        http://ipv4.download.thinkbroadband.com/1MB.zip 2>/dev/null || echo 0
+done
+EOF
+chmod 0755 /usr/local/bin/gh-perf-download
+: >/tmp/gh-perf-app-throughput.txt
+( sleep 300 | "${CLI[@]}" run /usr/local/bin/gh-perf-download >/tmp/gh-perf-app-throughput.txt 2>&1 ) &
+DOWNLOAD_PID=$!
+sleep 6
+echo "APP-scope relay resources (during a download):"
 : >/tmp/gh-perf-res-relay.txt
-for _ in $(seq 1 6); do
+for _ in $(seq 1 10); do
     ps -eo rss=,pcpu=,args= 2>/dev/null | grep 'ghostnector-appd-relay --id' | grep -v grep |
         awk '{print $1, $2}' >>/tmp/gh-perf-res-relay.txt
     sleep 1
@@ -346,6 +359,9 @@ awk '{rss+=$1; cpu+=$2; n++} END {
     if (n > 0) printf "relay mean_rss_kb=%.0f mean_cpu_pct=%.2f samples=%d\n", rss/n, cpu/n, n;
     else print "relay: no relay process observed"
 }' /tmp/gh-perf-res-relay.txt
+wait "$DOWNLOAD_PID" 2>/dev/null || true
+APP_THROUGHPUT="$(grep -v '^0$' /tmp/gh-perf-app-throughput.txt | median)"
+note "APP-scope throughput median: ${APP_THROUGHPUT} bytes/s"
 "${CLI[@]}" disconnect >/dev/null 2>&1 || true
 
 echo

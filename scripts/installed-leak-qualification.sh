@@ -84,6 +84,30 @@ EOF
     done
     return 1
 }
+# APP scope is verified deterministically by the UDP check: the namespace denies UDP, and the probe
+# treats "UDP could not leave" as the pass. An HTTP check must not be configured for the APP window:
+# a public endpoint that answers the host can still fail through a particular Tor exit, and the
+# product's documented response to a failed APP check is to remove the groups - the applications
+# would then die mid-window and their fetches would produce nothing (the first post-fix leak run hit
+# exactly that). The application's own fetch is the TCP evidence.
+ensure_connect_app() { # [connect arguments...]
+    local attempt
+    for attempt in 1 2 3; do
+        cat >/etc/ghostnector/core.env <<EOF
+GHOSTNECTOR_VERIFY=--udp-check $HOST:18081 --verify-timeout 10 --verify-interval 5 --verify-stale-after 30
+EOF
+        systemctl restart ghostnector-core.service
+        sleep 2
+        "${CLI[@]}" connect "$@" >/dev/null 2>&1 || true
+        if wait_status "protected" 120 && ! cli_line | grep -q "no traffic can leave"; then
+            return 0
+        fi
+        echo "    APP connect attempt $attempt did not apply; retrying"
+        "${CLI[@]}" disconnect >/dev/null 2>&1 || true
+        sleep 2
+    done
+    return 1
+}
 phase() { echo "PHASE $1 $(date +%s.%N)"; }
 
 as_probe() { setpriv --reuid="$PROBE_UID" --regid="$PROBE_GID" --clear-groups "$@"; }
@@ -406,7 +430,7 @@ EOF
 chmod 0755 /usr/local/bin/gh-leak-1 /usr/local/bin/gh-leak-2
 rm -f /tmp/gh-leak-1.out /tmp/gh-leak-2.out
 phase CONNECT_APP_START
-ensure_connect --scope app
+ensure_connect_app --scope app
 phase CONNECT_APP_END
 if wait_status "chosen applications" 240; then
     ok "the APP scope applied: $(cli_state | head -1)"
