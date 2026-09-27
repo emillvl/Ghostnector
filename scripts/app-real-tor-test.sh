@@ -155,11 +155,9 @@ if wait_status "chosen applications" 240; then
 else
     bad "the APP scope did not apply: $(cli_state | head -3)"
 fi
-if wait_status "protected — and verified" 120; then
-    ok "the namespace verification passed (the relay carried the probe's check)"
-else
-    inc "the state did not reach verified: $(cli_state | head -1)"
-fi
+# The core verifies the groups that exist; before any application runs there is nothing to verify,
+# and the honest state is "protected, but unverified". The verification is asserted after the first
+# application has created its group (below).
 
 FIRST="$(run_app first)"
 note "first application: $(printf '%s' "$FIRST" | tr '\n' ' ')"
@@ -168,6 +166,12 @@ ENDPOINT1="$(printf '%s\n' "$FIRST" | sed -n 's/^endpoint=//p' | head -1)"
 DNS1="$(printf '%s\n' "$FIRST" | sed -n 's/^dns=//p' | head -1)"
 DIRECT1="$(printf '%s\n' "$FIRST" | sed -n 's/^direct=//p' | head -1)"
 RELAY1="$(printf '%s\n' "$FIRST" | sed -n 's/^relay=//p' | head -1)"
+
+if wait_status "protected — and verified" 120; then
+    ok "the namespace verification passed with the group running (the relay carried the UDP check)"
+else
+    inc "the state did not reach verified after the first application: $(cli_state | head -1)"
+fi
 
 if [ -n "$IP1" ]; then
     ok "the application reached the network through Tor (exit $IP1)"
