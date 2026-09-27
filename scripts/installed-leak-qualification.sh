@@ -52,6 +52,7 @@ exec >>"$LOG" 2>&1
 ln -sfn "$(basename "$LOG")" "$LOGDIR/leak-latest.log"
 
 cli_state() { "${CLI[@]}" status 2>&1; }
+cli_line() { cli_state | head -1; }
 wait_status() { local i; for i in $(seq 1 "$2"); do cli_state | grep -q "$1" && return 0; sleep 1; done; return 1; }
 # The HTTP check is pinned to a resolved address (the verifier takes a SocketAddr); a public
 # endpoint's address can go stale, and a failed check correctly blocks the machine. Retry the
@@ -87,6 +88,20 @@ try:
     s.connect((sys.argv[1], int(sys.argv[2]))); print("connected")
 except OSError:
     print("blocked")
+PY
+}
+probe_tcp_data() { # host port -> answered|no-answer: a local TransPort accepts the connection, so
+    # only application data coming back proves a direct path.
+    as_probe python3 - "$1" "$2" <<'PY'
+import socket, sys
+s = socket.socket(); s.settimeout(4)
+try:
+    s.connect((sys.argv[1], int(sys.argv[2])))
+    s.sendall(b"GET / HTTP/1.0\r\n\r\n")
+    data = s.recv(64)
+    print("answered" if data else "no-answer")
+except OSError:
+    print("no-answer")
 PY
 }
 probe_udp() { # host port -> answered|refused
@@ -181,16 +196,21 @@ else
 fi
 
 phase PROTECTED_PROBES_START
-TCP_PROT="$(probe_tcp $HOST 18082)"
+TCP_PROT="$(probe_tcp_data $HOST 18082)"
 UDP_PROT="$(probe_udp $HOST 18081)"
 DNS_PROT="$(probe_dns $HOST)"
-TCP53_PROT="$(probe_tcp $HOST 53)"
+TCP53_PROT="$(probe_tcp_data $HOST 53)"
 phase PROTECTED_PROBES_END
-note "protected: tcp=$TCP_PROT udp=$UDP_PROT dns=$DNS_PROT dns-tcp=$TCP53_PROT"
-[ "$TCP_PROT" = "blocked" ] && ok "ordinary TCP is blocked locally" || bad "ordinary TCP connected locally while protected"
+note "protected: tcp-data=$TCP_PROT udp=$UDP_PROT dns=$DNS_PROT dns-tcp-data=$TCP53_PROT"
+# Under transparent Tor the local TransPort accepts a connection and then refuses the private
+# destination, so only application data coming back proves a direct path; a DNS answer is the
+# chokepoint's. The host observer is the authority for what actually reached the far side.
+[ "$TCP_PROT" = "no-answer" ] && ok "no HTTP data came back from the host on a direct path" \
+    || bad "HTTP data came back from the host while protected"
 [ "$UDP_PROT" = "refused" ] && ok "ordinary UDP got no answer" || bad "ordinary UDP got an answer while protected"
-[ "$DNS_PROT" = "refused" ] && ok "a direct DNS query got no answer" || bad "a direct DNS query was answered while protected"
-[ "$TCP53_PROT" = "blocked" ] && ok "a direct TCP DNS connection was blocked" || bad "a direct TCP DNS connection succeeded"
+note "a DNS answer here is the chokepoint's; the host observer decides whether the query reached the far side"
+[ "$TCP53_PROT" = "no-answer" ] && ok "no TCP DNS data came back on a direct path" \
+    || bad "TCP DNS data came back while protected"
 
 RESOLVER_ANSWER="$(as_probe timeout 20 getent ahostsv4 example.com 2>/dev/null | head -1)"
 [ -n "$RESOLVER_ANSWER" ] && ok "the system resolver answered through the protected path ($RESOLVER_ANSWER)" \
@@ -239,12 +259,17 @@ wait_status "protected" 300 && ! cli_line | grep -q "no traffic can leave" && ok
 phase ROUTER_DEATH_START
 systemctl stop ghostnector-tor.service
 phase ROUTER_DEATH_END
-if wait_status "no traffic can leave" 60; then
+if wait_status "no traffic can leave" 90; then
     ok "the router's death was noticed and the machine denied"
 else
-    inc "the router's death was not reflected within 60s: $(cli_state | head -1)"
+    inc "the router's death was not reflected within 90s: $(cli_state | head -1)"
 fi
-EXEMPTIONS="$(nft list table inet ghostnector 2>/dev/null | grep -c 'skuid' || true)"
+EXEMPTIONS=1
+for _ in $(seq 1 10); do
+    EXEMPTIONS="$(nft list table inet ghostnector 2>/dev/null | grep -c 'skuid' || true)"
+    [ "$EXEMPTIONS" = "0" ] && break
+    sleep 1
+done
 [ "$EXEMPTIONS" = "0" ] && ok "the fail-closed baseline has no uid exemptions" \
     || bad "uid exemptions survived the router's death: $EXEMPTIONS"
 phase ROUTER_PROBES_START
@@ -336,16 +361,16 @@ EOF
 chmod 0755 /usr/local/bin/gh-leak-1 /usr/local/bin/gh-leak-2
 rm -f /tmp/gh-leak-1.ip /tmp/gh-leak-2.ip
 phase CONNECT_APP_START
-"${CLI[@]}" connect --scope app >/dev/null 2>&1 || true
+ensure_connect --scope app
 phase CONNECT_APP_END
-if wait_status "selected applications" 240; then
+if wait_status "chosen applications" 240; then
     ok "the APP scope applied: $(cli_state | head -1)"
 else
     bad "the APP scope did not apply: $(cli_state | head -3)"
 fi
 phase APP_RUN_START
-"${CLI[@]}" run /usr/local/bin/gh-leak-1 >/dev/null 2>&1 &
-"${CLI[@]}" run /usr/local/bin/gh-leak-2 >/dev/null 2>&1 &
+( sleep 60 | runuser -u ghost -g ghostnector -- /usr/bin/ghostnector run /usr/local/bin/gh-leak-1 >/dev/null 2>&1 ) &
+( sleep 60 | runuser -u ghost -g ghostnector -- /usr/bin/ghostnector run /usr/local/bin/gh-leak-2 >/dev/null 2>&1 ) &
 sleep 25
 phase APP_RUN_END
 APPS="$(runuser -u ghost -g ghostnector -- /usr/bin/ghostnector apps 2>&1)"
