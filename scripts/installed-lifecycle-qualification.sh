@@ -92,6 +92,13 @@ if ps -eo comm= | grep -qE '^ghostnector-(core|netd|appd|bootguard|dns|appd-laun
 else
     ok "no ghostnector process after the uninstall"
 fi
+# The relay's comm is truncated to the same 15 characters as the helper's, so it is matched by its
+# own command line: no group relay may outlive the uninstall.
+if pgrep -f "ghostnector-appd-relay --id" >/dev/null 2>&1; then
+    bad "a namespace relay survived the uninstall: $(pgrep -af 'ghostnector-appd-relay --id' | tr '\n' ' ')"
+else
+    ok "no namespace relay after the uninstall"
+fi
 if command -v resolvectl >/dev/null 2>&1 && systemctl is-active --quiet systemd-resolved; then
     LINK="$(ip route show default | awk '{print $5; exit}')"
     if resolvectl dns "$LINK" 2>/dev/null | grep -q "127.0.0.1"; then
