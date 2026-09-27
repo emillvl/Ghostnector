@@ -53,6 +53,28 @@ ln -sfn "$(basename "$LOG")" "$LOGDIR/leak-latest.log"
 
 cli_state() { "${CLI[@]}" status 2>&1; }
 wait_status() { local i; for i in $(seq 1 "$2"); do cli_state | grep -q "$1" && return 0; sleep 1; done; return 1; }
+# The HTTP check is pinned to a resolved address (the verifier takes a SocketAddr); a public
+# endpoint's address can go stale, and a failed check correctly blocks the machine. Retry the
+# connect with a freshly resolved endpoint so the qualification is not defeated by that.
+ensure_connect() { # [connect arguments...]
+    local attempt ip
+    for attempt in 1 2 3; do
+        ip="$(getent ahostsv4 checkip.amazonaws.com | awk 'NR==1{print $1}')"
+        cat >/etc/ghostnector/core.env <<EOF
+GHOSTNECTOR_VERIFY=--udp-check $HOST:18081 --check-url http://$ip/ --verify-timeout 10 --verify-interval 5 --verify-stale-after 30
+EOF
+        systemctl restart ghostnector-core.service
+        sleep 2
+        "${CLI[@]}" connect "$@" >/dev/null 2>&1 || true
+        if wait_status "protected" 120 && ! cli_line | grep -q "no traffic can leave"; then
+            return 0
+        fi
+        echo "    connect attempt $attempt did not verify (endpoint $ip); retrying"
+        "${CLI[@]}" disconnect >/dev/null 2>&1 || true
+        sleep 2
+    done
+    return 1
+}
 phase() { echo "PHASE $1 $(date +%s.%N)"; }
 
 as_probe() { setpriv --reuid="$PROBE_UID" --regid="$PROBE_GID" --clear-groups "$@"; }
@@ -150,9 +172,9 @@ note "open: tcp=$TCP_OPEN udp=$UDP_OPEN dns=$DNS_OPEN"
 echo
 echo "-- Tor SYSTEM: the protected path carries, direct paths do not --"
 phase CONNECT_TOR_START
-"${CLI[@]}" connect >/dev/null 2>&1 || true
+ensure_connect
 phase CONNECT_TOR_END
-if wait_status "protected" 300; then
+if wait_status "protected" 300 && ! cli_line | grep -q "no traffic can leave"; then
     ok "Tor SYSTEM protection is up: $(cli_state | head -1)"
 else
     bad "Tor SYSTEM did not come up: $(cli_state | head -1)"
@@ -212,8 +234,8 @@ note "after tamper: tcp=$TCP_TAMPER udp=$UDP_TAMPER"
 # ---------------------------------------------------------------- router death
 echo
 echo "-- the router's death fails closed --"
-"${CLI[@]}" connect >/dev/null 2>&1 || true
-wait_status "protected" 300 && ok "Tor is up again" || inc "Tor did not come up again"
+ensure_connect
+wait_status "protected" 300 && ! cli_line | grep -q "no traffic can leave" && ok "Tor is up again" || inc "Tor did not come up again"
 phase ROUTER_DEATH_START
 systemctl stop ghostnector-tor.service
 phase ROUTER_DEATH_END
@@ -238,8 +260,8 @@ systemctl start ghostnector-tor.service 2>/dev/null || true
 # ---------------------------------------------------------------- panic
 echo
 echo "-- panic fails closed --"
-"${CLI[@]}" connect >/dev/null 2>&1 || true
-wait_status "protected" 300 && ok "Tor is up before the panic" || inc "Tor did not come up before the panic"
+ensure_connect
+wait_status "protected" 300 && ! cli_line | grep -q "no traffic can leave" && ok "Tor is up before the panic" || inc "Tor did not come up before the panic"
 phase PANIC_START
 "${CLI[@]}" panic >/dev/null 2>&1 || true
 phase PANIC_END
