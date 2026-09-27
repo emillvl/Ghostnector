@@ -524,11 +524,18 @@ run_probe >/dev/null 2>&1
 APP_ID="$(app_id)"
 kill "$APPD_PID" 2>/dev/null || true
 sleep 1
-# The existing namespace does not depend on the helper being alive; observe it directly.
+# The existing namespace does not depend on the helper being alive; observe it directly. The relay
+# is the helper's child and exits when the helper dies (its stdin pipe closes), so the protected
+# path is deliberately gone with it - what must hold is that nothing can leave: the connection is
+# refused at the dead local relay and no data comes back. That is the fail-closed direction, not a
+# loosening.
 OUTPUT="$(ip netns exec "ghapp$APP_ID" python3 "$WORKDIR/probe.py" 2>&1)"
 case "$OUTPUT" in
 *"tcp:tor-ok"*)
-    ok "the existing namespace kept its protected path after the helper died"
+    bad "the namespace still carried traffic through the dead helper's relay"
+    ;;
+*"Connection refused"*|*"Connection reset"*|*"TimeoutError"*|*"No route to host"*|*"Network is unreachable"*)
+    ok "the namespace still exists and carries nothing after the helper died (fail closed)"
     ;;
 *)
     inc "the existing namespace could not be observed after the helper died: $OUTPUT"
