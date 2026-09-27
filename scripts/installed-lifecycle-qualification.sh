@@ -147,19 +147,21 @@ wait_status "off" 60 && ok "ordinary use returns to off" || bad "ordinary use di
 # ---------------------------------------------------------------- deliberate lockout and recovery
 echo
 echo "-- a deliberate fail-closed lockout, then the documented recovery --"
-# The HTTP endpoint is private, so Tor refuses it and verification fails: the machine must deny
-# and the SSH session driving this must be cut. Recovery is the documented local disconnect.
-cat >/etc/ghostnector/core.env <<EOF
-GHOSTNECTOR_VERIFY=--udp-check $HOST:18081 --check-url http://$HOST:18082/ --verify-timeout 5 --verify-interval 5 --verify-stale-after 30
-EOF
-systemctl restart ghostnector-core.service
-sleep 2
+# Deterministic form: let Tor boot and verify normally, then kill the router under the claim. The
+# next verification cannot reach the protected path, the engine applies the fail-closed baseline,
+# and the SSH session driving this is cut by design. Recovery is the documented local disconnect.
 echo "PHASE LOCKOUT_START $(date +%s.%N)"
 "${CLI[@]}" connect >/dev/null 2>&1 || true
-if wait_status "no traffic can leave" 120; then
-    ok "the bad endpoint failed verification and the machine denied (fail-closed)"
+if wait_status "protected" 300; then
+    ok "the machine reached protection before the lockout"
 else
-    inc "the machine did not block within 120s: $(cli_state | head -1)"
+    inc "the machine did not reach protection before the lockout: $(cli_state | head -1)"
+fi
+systemctl stop ghostnector-tor.service
+if wait_status "no traffic can leave" 150; then
+    ok "the router's death failed verification and the machine denied (fail-closed)"
+else
+    inc "the machine did not block within 150s: $(cli_state | head -1)"
 fi
 echo "PHASE LOCKOUT_END $(date +%s.%N)"
 # The recovery is the documented first way out, executed locally on the machine (the SSH session
