@@ -99,14 +99,15 @@ if command -v resolvectl >/dev/null 2>&1 && systemctl is-active --quiet systemd-
         ok "the resolver is back to its own configuration ($(resolvectl dns "$LINK" 2>/dev/null | tr -d '\n'))"
     fi
 fi
-# Ordinary networking must still work after the uninstall.
-TCP_AFTER="$(runuser -u ghost -- python3 -c 'import socket
-s=socket.socket();s.settimeout(4)
-try:
- s.connect(("'"$HOST"'",18082));print("connected")
-except OSError:
- print("blocked")' 2>/dev/null)"
-[ "$TCP_AFTER" = "connected" ] && ok "ordinary networking works after the uninstall" || bad "networking is broken after the uninstall"
+# Ordinary networking must still work after the uninstall. Probe a real public endpoint (the same
+# kind the product's verification uses), not the qualification's host observer, which is not
+# expected to be running.
+AFTER_IP="$(getent ahostsv4 checkip.amazonaws.com | awk 'NR==1{print $1}')"
+TCP_AFTER="$(runuser -u ghost -- timeout 10 curl -s -o /dev/null -w '%{http_code}' "http://$AFTER_IP/" 2>/dev/null)"
+case "$TCP_AFTER" in
+2*|3*) ok "ordinary networking works after the uninstall (HTTP $TCP_AFTER)" ;;
+*) bad "networking is broken after the uninstall (HTTP ${TCP_AFTER:-none})" ;;
+esac
 DNS_AFTER="$(runuser -u ghost -- timeout 10 getent ahostsv4 example.com 2>/dev/null | head -1)"
 [ -n "$DNS_AFTER" ] && ok "DNS works after the uninstall ($DNS_AFTER)" || inc "DNS did not answer after the uninstall"
 
