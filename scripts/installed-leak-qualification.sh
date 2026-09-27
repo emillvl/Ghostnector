@@ -414,11 +414,13 @@ else
     bad "the APP scope did not apply: $(cli_state | head -3)"
 fi
 phase APP_RUN_START
-( sleep 60 | runuser -u ghost -g ghostnector -- /usr/bin/ghostnector run /usr/local/bin/gh-leak-1 >/tmp/gh-leak-1.out 2>&1 ) &
-( sleep 60 | runuser -u ghost -g ghostnector -- /usr/bin/ghostnector run /usr/local/bin/gh-leak-2 >/tmp/gh-leak-2.out 2>&1 ) &
-# Wait for both applications to report (the curl budget is 35 s) or give up at 45 s.
-for _ in $(seq 1 45); do
-    grep -q "^ip=" /tmp/gh-leak-1.out 2>/dev/null && grep -q "^ip=" /tmp/gh-leak-2.out 2>/dev/null && break
+( sleep 300 | runuser -u ghost -g ghostnector -- /usr/bin/ghostnector run /usr/local/bin/gh-leak-1 >/tmp/gh-leak-1.out 2>&1 ) &
+( sleep 300 | runuser -u ghost -g ghostnector -- /usr/bin/ghostnector run /usr/local/bin/gh-leak-2 >/tmp/gh-leak-2.out 2>&1 ) &
+# Wait for both applications to finish their probes: the public name's address rotates among edges,
+# and each application retries its fetch a few times, so the last line (the relay refusal) is the
+# honest completion marker. The session keeps the file open until the application exits.
+for _ in $(seq 1 240); do
+    grep -q "^relay-direct=" /tmp/gh-leak-1.out 2>/dev/null && grep -q "^ip=" /tmp/gh-leak-2.out 2>/dev/null && break
     sleep 1
 done
 phase APP_RUN_END
