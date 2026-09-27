@@ -264,14 +264,14 @@ if wait_status "no traffic can leave" 90; then
 else
     inc "the router's death was not reflected within 90s: $(cli_state | head -1)"
 fi
-EXEMPTIONS=1
-for _ in $(seq 1 10); do
-    EXEMPTIONS="$(nft list table inet ghostnector 2>/dev/null | grep -c 'skuid' || true)"
-    [ "$EXEMPTIONS" = "0" ] && break
-    sleep 1
-done
-[ "$EXEMPTIONS" = "0" ] && ok "the fail-closed baseline has no uid exemptions" \
-    || bad "uid exemptions survived the router's death: $EXEMPTIONS"
+# The fail-closed baseline legitimately exempts the Tor uid (so Tor can bootstrap) and DHCP; what
+# must not survive is any other identity (I2P, an application, the LAN).
+TOR_UID="$(id -u debian-tor 2>/dev/null || echo none)"
+UIDS_AFTER="$(nft list table inet ghostnector 2>/dev/null | grep -oE 'skuid [0-9]+' | awk '{print $2}' | sort -u | tr '\n' ' ')"
+case "$UIDS_AFTER" in
+"$TOR_UID ") ok "the fail-closed baseline exempts only the Tor uid (and DHCP)" ;;
+*) bad "unexpected exemptions after the alarm: $UIDS_AFTER" ;;
+esac
 phase ROUTER_PROBES_START
 TCP_RD="$(probe_tcp $HOST 18082)"
 UDP_RD="$(probe_udp $HOST 18081)"
@@ -345,21 +345,21 @@ echo
 echo "-- Tor APP: two groups stay on the protected path and cannot egress directly --"
 cat >/usr/local/bin/gh-leak-1 <<'EOF'
 #!/bin/sh
-{ timeout 40 curl -s --max-time 35 http://checkip.amazonaws.com || true; } >/tmp/gh-leak-1.ip 2>/dev/null
+{ timeout 40 curl -s --max-time 35 http://checkip.amazonaws.com || true; } >/var/tmp/gh-leak-1.ip 2>/dev/null
 printf 'tcp-direct=%s\n' "$(timeout 6 python3 -c 'import socket;s=socket.socket();s.settimeout(4)
 try:
  s.connect(("10.0.2.2",18082));print("connected")
 except OSError:
- print("blocked")')" >>/tmp/gh-leak-1.ip
+ print("blocked")')" >>/var/tmp/gh-leak-1.ip
 sleep 30
 EOF
 cat >/usr/local/bin/gh-leak-2 <<'EOF'
 #!/bin/sh
-{ timeout 40 curl -s --max-time 35 http://checkip.amazonaws.com || true; } >/tmp/gh-leak-2.ip 2>/dev/null
+{ timeout 40 curl -s --max-time 35 http://checkip.amazonaws.com || true; } >/var/tmp/gh-leak-2.ip 2>/dev/null
 sleep 30
 EOF
 chmod 0755 /usr/local/bin/gh-leak-1 /usr/local/bin/gh-leak-2
-rm -f /tmp/gh-leak-1.ip /tmp/gh-leak-2.ip
+rm -f /var/tmp/gh-leak-1.ip /var/tmp/gh-leak-2.ip
 phase CONNECT_APP_START
 ensure_connect --scope app
 phase CONNECT_APP_END
@@ -375,9 +375,9 @@ sleep 25
 phase APP_RUN_END
 APPS="$(runuser -u ghost -g ghostnector -- /usr/bin/ghostnector apps 2>&1)"
 echo "$APPS"
-IP1="$(head -1 /tmp/gh-leak-1.ip 2>/dev/null | tr -d '\r\n')"
-IP2="$(head -1 /tmp/gh-leak-2.ip 2>/dev/null | tr -d '\r\n')"
-DIRECT1="$(grep tcp-direct /tmp/gh-leak-1.ip 2>/dev/null | cut -d= -f2)"
+IP1="$(head -1 /var/tmp/gh-leak-1.ip 2>/dev/null | tr -d '\r\n')"
+IP2="$(head -1 /var/tmp/gh-leak-2.ip 2>/dev/null | tr -d '\r\n')"
+DIRECT1="$(grep tcp-direct /var/tmp/gh-leak-1.ip 2>/dev/null | cut -d= -f2)"
 note "app exit addresses: 1=${IP1:-none} 2=${IP2:-none}; direct from namespace: ${DIRECT1:-none}"
 [ -n "$IP1" ] && ok "the first application reached the network through the protected path" \
     || inc "the first application produced no address"
