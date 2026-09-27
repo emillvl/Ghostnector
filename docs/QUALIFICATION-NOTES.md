@@ -355,3 +355,27 @@ Method notes: the verification probe's UDP check passes when UDP cannot leave, w
 design, so the focused APP run verifies deterministically without depending on a public endpoint's
 availability through a particular Tor exit. The path-check phase deliberately re-pins an HTTP check
 while Tor is down to show the state stops claiming verification.
+
+## D-53 fix: a profile change reloads Tor (found while requalifying D-50)
+
+The leakage qualification's phase order (machine-wide Tor ? router-death ? panic ? I2P ? APP) left a
+Tor instance running with the machine-wide torrc. The APP apply wrote the APP torrc but only
+*started* the unit, a no-op for an active unit, so Tor kept its SocksPort on `127.0.0.1:9050`; the
+namespace relay dialled the core address, was refused, drained and closed, and every application
+fetch returned an empty reply within seconds - while the relay itself was healthy (a direct
+connection to the relay was refused and the UDP verification passed, because UDP is denied either
+way). The focused real-Tor run began from a clean state, which is why it had not caught this.
+
+Fix: the supervisor gains `restart`, composed of the two verbs the polkit rule deliberately grants
+(`stop` then `start`; systemd's own `restart` verb is refused without interactive authentication and
+would need a wider rule for the same two actions), and the Tor bring-up compares the rendered torrc
+with the file: a changed file means restart, a first apply or an unchanged file means start. The
+i2pd path has the same shape but its listeners do not move between profiles; it is recorded as a
+low-risk analogue, not changed here.
+
+Evidence: `services::tests::app_scope_restarts_tor_when_the_listeners_move` (machine-wide then APP
+must restart; the same profile again must not); `app-real-tor-test.sh` now begins with a
+machine-wide Tor session, so the focused regression covers the transition; the focused rerun is
+**17 held / 0 contradicted / 0 inconclusive** (`app-real-tor-20260927T134858Z.log`), with the two
+groups' fetches returning `94.230.208.147` and `192.42.116.51`. The post-fix leakage run uses the
+phase order that exposed the defect.
