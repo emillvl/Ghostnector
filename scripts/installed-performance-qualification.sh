@@ -273,15 +273,41 @@ for _ in 1 2 3; do
     kill "$APP_PID" 2>/dev/null || true
     wait "$APP_PID" 2>/dev/null || true
 done
-"${CLI[@]}" connect --scope app >/dev/null 2>&1 || true
-for _ in $(seq 1 240); do "${CLI[@]}" status 2>/dev/null | grep -q "selected applications" && break; sleep 1; done
+"${CLI[@]}" disconnect >/dev/null 2>&1 || true
+sleep 1
+# The APP profile needs a fresh verification endpoint; retry with a newly resolved address if the
+# connect lands Blocked on a stale one.
+APP_READY=0
+for attempt in 1 2 3; do
+    HTTP_IP="$(getent ahostsv4 checkip.amazonaws.com | awk 'NR==1{print $1}')"
+    cat >/etc/ghostnector/core.env <<EOF
+GHOSTNECTOR_VERIFY=--udp-check $HOST:18081 --check-url http://$HTTP_IP/ --verify-timeout 10 --verify-interval 5 --verify-stale-after 30
+EOF
+    systemctl restart ghostnector-core.service
+    sleep 2
+    "${CLI[@]}" connect --scope app >/dev/null 2>&1 || true
+    for _ in $(seq 1 120); do "${CLI[@]}" status 2>/dev/null | grep -q "chosen applications" && { APP_READY=1; break; } sleep 1; done
+    [ "$APP_READY" = "1" ] && ! "${CLI[@]}" status 2>/dev/null | head -1 | grep -q "no traffic can leave" && break
+    APP_READY=0
+    "${CLI[@]}" disconnect >/dev/null 2>&1 || true
+    sleep 2
+done
+[ "$APP_READY" = "1" ] && note "APP scope is up" || note "APP scope did not come up; the launch measurements will be inconclusive"
 echo "APP-scope launch:"
+app_in_namespace() {
+    local initns p
+    initns="$(readlink /proc/1/ns/net)"
+    for p in $(pgrep -f gh-perf-app 2>/dev/null); do
+        [ "$(readlink "/proc/$p/ns/net" 2>/dev/null)" != "$initns" ] && return 0
+    done
+    return 1
+}
 for _ in 1 2 3; do
     START="$(now)"
-    "${CLI[@]}" run /usr/local/bin/gh-perf-app >/dev/null 2>&1 &
+    ( sleep 30 | "${CLI[@]}" run /usr/local/bin/gh-perf-app >/dev/null 2>&1 ) &
     RUN_PID=$!
     for _ in $(seq 1 100); do
-        pgrep -f gh-perf-app >/dev/null 2>&1 && break
+        app_in_namespace && break
         sleep 0.1
     done
     END="$(now)"

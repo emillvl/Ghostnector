@@ -349,11 +349,17 @@ echo "-- Tor APP: two groups stay on the protected path and cannot egress direct
 cat >/usr/local/bin/gh-leak-1 <<'EOF'
 #!/bin/sh
 echo "ip=$(timeout 40 curl -s --max-time 35 http://checkip.amazonaws.com || true)"
-echo "tcp-direct=$(timeout 6 python3 -c 'import socket;s=socket.socket();s.settimeout(4)
+# Under APP scope the namespace's DNAT sends this to the core's transparent proxy, which accepts
+# the TCP connection locally and then refuses the private destination; only data coming back proves
+# a direct path. The far-side observer is the authority either way.
+echo "tcp-direct=$(timeout 8 python3 -c 'import socket
+s=socket.socket();s.settimeout(5)
 try:
- s.connect(("10.0.2.2",18082));print("connected")
+ s.connect(("10.0.2.2",18082))
+ s.sendall(b"GET / HTTP/1.0\r\n\r\n")
+ print("answered" if s.recv(64) else "no-answer")
 except OSError:
- print("blocked")' 2>/dev/null)"
+ print("no-answer")' 2>/dev/null)"
 sleep 30
 EOF
 cat >/usr/local/bin/gh-leak-2 <<'EOF'
@@ -390,7 +396,7 @@ note "app exit addresses: 1=${IP1:-none} 2=${IP2:-none}; direct from namespace: 
     || inc "the first application produced no address: $(head -2 /tmp/gh-leak-1.out 2>/dev/null | tr '\n' ' ')"
 [ -n "$IP2" ] && ok "the second application reached the network through the protected path" \
     || inc "the second application produced no address: $(head -2 /tmp/gh-leak-2.out 2>/dev/null | tr '\n' ' ')"
-[ "$DIRECT1" = "blocked" ] && ok "a direct connection from inside the namespace was blocked" \
+[ "$DIRECT1" = "no-answer" ] && ok "a direct connection from inside the namespace produced no application data" \
     || inc "the in-namespace direct probe said: ${DIRECT1:-nothing}"
 if [ -n "$IP1" ] && [ -n "$IP2" ] && [ "$IP1" != "$IP2" ]; then
     note "the two groups left through different observed addresses (circuits differ in effect)"
