@@ -65,6 +65,17 @@ trap cleanup EXIT
 
 cli_state() { "${CLI[@]}" status 2>&1; }
 wait_status() { local i; for i in $(seq 1 "$2"); do cli_state | grep -q "$1" && return 0; sleep 1; done; return 1; }
+# The verifier takes a SocketAddr, so the check endpoint is pinned to a resolved address; pick one
+# that answers the probe's bare-IP GET with 200 before pinning it (the edges rotate, and some do
+# not serve every request).
+check_endpoint() {
+    local candidate code
+    for candidate in $(getent ahostsv4 checkip.amazonaws.com | awk '{print $1}'); do
+        code="$(timeout 15 curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://$candidate/" || true)"
+        [ "$code" = "200" ] && { echo "$candidate"; return 0; }
+    done
+    getent ahostsv4 checkip.amazonaws.com | awk 'NR==1{print $1}'
+}
 
 echo "== installed APP path against real Tor at $(date -u) =="
 echo "log: $LOG"
@@ -234,14 +245,24 @@ else
 fi
 
 echo
-echo "-- Tor dies: no direct fallback, and the machine fails closed --"
+echo "-- Tor dies: no direct fallback, and the state detects it --"
 systemctl stop ghostnector-tor.service
 FALLBACK="$(run_app after-tor-death)"
 AFTER_IP="$(printf '%s\n' "$FALLBACK" | sed -n 's/^ip=//p' | head -1)"
 [ -z "$AFTER_IP" ] && ok "an application connection produced no address with Tor down" \
     || bad "an application connection still produced an address with Tor down: $AFTER_IP"
+# The UDP check cannot see a dead router (UDP is denied either way), so the state can only detect
+# it through a path check. Re-pin the core with a validated endpoint while Tor is down: the first
+# verification must fail and the scope must report fail-closed, not stay "verified".
+HTTP_IP="$(check_endpoint)"
+echo "path check endpoint: http://$HTTP_IP/"
+cat >/etc/ghostnector/core.env <<EOF
+GHOSTNECTOR_VERIFY=--udp-check $HOST:18081 --check-url http://$HTTP_IP/ --verify-timeout 10 --verify-interval 5 --verify-stale-after 30
+EOF
+systemctl restart ghostnector-core.service
+sleep 3
 if wait_status "no protected application can reach the network" 150; then
-    ok "the APP scope failed closed after Tor stopped"
+    ok "the APP scope failed closed once its path check could run against a dead router"
 else
     inc "the APP scope did not report fail-closed within 150s: $(cli_state | head -1)"
 fi
