@@ -153,18 +153,11 @@ impl Supervisor for SystemdUnits {
     }
 
     fn restart(&self, unit: &str) -> Result<(), SupervisorError> {
-        validate_unit(unit)?;
-        let (ok, output) = self.run(&["restart", unit])?;
-        if ok {
-            Ok(())
-        } else {
-            eprintln!("ghostnector-core: systemctl restart {unit} failed: {output}");
-            Err(SupervisorError::Refused {
-                action: "restarted",
-                unit: unit.to_string(),
-                reason: output,
-            })
-        }
+        // Composed from the two verbs the polkit rule grants this control plane (D-30): a single
+        // `restart` verb would need a wider rule for exactly the same stop-then-start, and the
+        // service manager refuses it without interactive authentication.
+        self.stop(unit)?;
+        self.start(unit)
     }
 
     fn state(&self, unit: &str) -> Result<ServiceState, SupervisorError> {
