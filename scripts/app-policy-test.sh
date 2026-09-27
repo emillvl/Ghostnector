@@ -47,6 +47,7 @@ PIDS=()
 
 cleanup() {
     for pid in "${PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done
+    exec 9>&- 2>/dev/null || true
     ip netns del "$HOST_NS" 2>/dev/null || true
     ip netns del "$LINK_NS" 2>/dev/null || true
     ip netns del "gh-app-ns" 2>/dev/null || true
@@ -67,6 +68,12 @@ command -v nft >/dev/null || fail "nftables is required"
 command -v tcpdump >/dev/null || fail "tcpdump is required"
 [ -d "$GOLDEN" ] || fail "run this from the repository root"
 [ -x "$RELAY" ] || fail "the namespace relay is not built at $RELAY (cargo build --workspace --bins)"
+
+# The relay exits when its standard input closes: that is the helper's shutdown channel (the helper
+# keeps the write end of a pipe). Start it the same way, with a pipe this shell holds open.
+RELAY_STDIN="$WORK/relay.stdin"
+mkfifo "$RELAY_STDIN"
+exec 9<>"$RELAY_STDIN"
 
 # ---------------------------------------------------------------- helpers
 
@@ -186,7 +193,7 @@ start_relay() { # namespace source-address
     local ns="$1" source="$2"
     ip netns exec "$ns" "$RELAY" --id 1 --uid "$RELAY_UID" --listen-port "$RELAY_PORT" \
         --core "$CORE" --socks-port "$SOCKS_PORT" --source "$source" \
-        >"$WORK/relay.log" 2>&1 &
+        <"$RELAY_STDIN" >"$WORK/relay.log" 2>&1 &
     PIDS+=("$!")
     for _ in $(seq 1 60); do
         if ip netns exec "$ns" python3 - "$RELAY_PORT" <<'PY'

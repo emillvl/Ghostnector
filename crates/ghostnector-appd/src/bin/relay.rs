@@ -347,13 +347,37 @@ fn splice(client: TcpStream, upstream: TcpStream) {
     let _ = forward.join();
 }
 
-fn handle(options: &Options, client: TcpStream) -> Result<(), String> {
+fn handle(options: &Options, mut client: TcpStream) -> Result<(), String> {
     let Some(destination) = original_destination(&client) else {
+        // Refuse, but consume whatever the caller already sent first: the close is then a FIN, and
+        // a caller sees an empty answer rather than a reset. This is also what makes the dead-router
+        // state honest: the verification probe classifies an empty answer as a failure, while a read
+        // error is only inconclusive.
+        drain(&mut client);
         return Err("refused a connection with no original destination".to_string());
     };
-    let upstream = connect_socks(options, destination)?;
+    let upstream = match connect_socks(options, destination) {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            drain(&mut client);
+            return Err(error);
+        }
+    };
     splice(client, upstream);
     Ok(())
+}
+
+/// Read and discard what the peer has already sent, bounded, so closing is a FIN rather than a RST.
+fn drain(stream: &mut TcpStream) {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+    let mut buffer = [0u8; 4096];
+    for _ in 0..64 {
+        match stream.read(&mut buffer) {
+            Ok(0) => return,
+            Ok(_) => continue,
+            Err(_) => return,
+        }
+    }
 }
 
 fn serve(options: &Options) -> Result<(), String> {
