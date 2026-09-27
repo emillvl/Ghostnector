@@ -286,8 +286,17 @@ EOF
     systemctl restart ghostnector-core.service
     sleep 2
     "${CLI[@]}" connect --scope app >/dev/null 2>&1 || true
-    for _ in $(seq 1 120); do "${CLI[@]}" status 2>/dev/null | grep -q "chosen applications" && { APP_READY=1; break; } sleep 1; done
-    [ "$APP_READY" = "1" ] && ! "${CLI[@]}" status 2>/dev/null | head -1 | grep -q "no traffic can leave" && break
+    APP_READY=0
+    for _ in $(seq 1 120); do
+        if "${CLI[@]}" status 2>/dev/null | grep -q "chosen applications"; then
+            APP_READY=1
+            break
+        fi
+        sleep 1
+    done
+    if [ "$APP_READY" = "1" ] && ! "${CLI[@]}" status 2>/dev/null | head -1 | grep -q "no traffic can leave"; then
+        break
+    fi
     APP_READY=0
     "${CLI[@]}" disconnect >/dev/null 2>&1 || true
     sleep 2
