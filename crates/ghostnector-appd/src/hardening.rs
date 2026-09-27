@@ -139,9 +139,11 @@ ReadWritePaths=/run/ghostnector /run/netns
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../packaging/tmpfiles.d/ghostnector.conf");
         let text = std::fs::read_to_string(&path).expect("tmpfiles entry");
+        // The group may traverse `apps` (each group's session socket lives inside it and the
+        // invoking user must reach it, D-45) but may not list or write it.
         assert!(
             text.lines()
-                .any(|line| line.starts_with("d /run/ghostnector/apps 0700 root root")),
+                .any(|line| line.starts_with("d /run/ghostnector/apps 0710 root ghostnector")),
             "{text}"
         );
     }

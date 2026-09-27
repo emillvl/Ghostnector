@@ -184,3 +184,8 @@ The GTK file picker remains a harness limitation: under Xvfb the chooser opens a
 visible, but its location entry did not accept a typed path from the automation, so the launch is
 performed through the same core API the picker calls. The picker's own widgets are GTK's, not the
 product's.
+
+**D-45** was found immediately after D-44: the namespace existed and the group was listed, but the
+invoking user could not reach its own session socket because `/run/ghostnector/apps` was
+`0700 root:root`. It is now `0710 root:ghostnector` — traversable by the accounts that may control
+Ghostnector, not listable — while the socket itself stays `0600` owned by that user.
