@@ -178,6 +178,28 @@ def focus_report():
     return 0
 
 
+def tree():
+    """Print every node as role: name, depth-indented."""
+    root = app()
+    if root is None:
+        print("(no application)")
+        return 1
+
+    def walk_depth(node, depth):
+        try:
+            print("  " * depth + f"{node.getRoleName()}: {(node.name or '').strip()!r}")
+        except Exception:
+            return
+        try:
+            for child in node:
+                walk_depth(child, depth + 1)
+        except Exception:
+            return
+
+    walk_depth(root, 0)
+    return 0
+
+
 def enabled(name):
     """Print enabled/disabled for the first node named NAME."""
     for node in find_all(name):
@@ -228,6 +250,8 @@ def main():
         return focused(sys.argv[2])
     if command == "focus-report":
         return focus_report()
+    if command == "tree":
+        return tree()
     if command == "enabled":
         return enabled(sys.argv[2])
     if command == "has":
