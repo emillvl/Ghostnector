@@ -73,31 +73,19 @@ runuser -u ghost -g ghostnector -- /usr/bin/ghostnector --version 2>/dev/null ||
 
 # ---------------------------------------------------------------- baseline
 echo
-echo "-- baseline: open, off, fresh verification endpoint --"
+echo "-- baseline: open, off, APP-scope verification is the UDP check --"
 timeout 60 "${CLI[@]}" disconnect >/dev/null 2>&1 || true
 nft destroy table inet ghostnector 2>/dev/null || true
 rm -f /var/lib/ghostnector/intent.json
 systemctl restart ghostnector-netd.service ghostnector-core.service ghostnector-appd.service
 sleep 2
-# The verification endpoint must answer a bare-IP GET with 200. AWS's edges rotate, and not every
-# resolved address serves the request, so pick the first one that does *before* protection is on
-# (the same request the probe will make; the endpoint does not care about the source).
-HTTP_IP=""
-for candidate in $(getent ahostsv4 checkip.amazonaws.com | awk '{print $1}'); do
-    code="$(timeout 15 curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://$candidate/" || true)"
-    echo "check endpoint candidate $candidate -> $code"
-    if [ "$code" = "200" ]; then
-        HTTP_IP="$candidate"
-        break
-    fi
-done
-if [ -z "$HTTP_IP" ]; then
-    HTTP_IP="$(getent ahostsv4 checkip.amazonaws.com | awk 'NR==1{print $1}')"
-    echo "no candidate answered 200; using $HTTP_IP anyway (the verification may be inconclusive)"
-fi
-[ -n "$HTTP_IP" ] || { echo "no check endpoint address could be resolved"; exit 2; }
+# APP scope is verified deterministically by the UDP check: the namespace denies UDP, and the probe
+# treats "UDP could not leave" as the pass condition. The HTTP check is deliberately not configured
+# here: a public endpoint's availability through a particular Tor exit is not part of the product,
+# and the application's own fetch below is the TCP evidence. (The machine-wide leakage run keeps the
+# HTTP check, where it is the point.)
 cat >/etc/ghostnector/core.env <<EOF
-GHOSTNECTOR_VERIFY=--udp-check $HOST:18081 --check-url http://$HTTP_IP/ --verify-timeout 10 --verify-interval 5 --verify-stale-after 30
+GHOSTNECTOR_VERIFY=--udp-check $HOST:18081 --verify-timeout 10 --verify-interval 5 --verify-stale-after 30
 EOF
 systemctl restart ghostnector-core.service
 sleep 2
@@ -106,9 +94,29 @@ cli_state | head -1
 # ---------------------------------------------------------------- the application probe
 cat >/usr/local/bin/gh-app-real <<'EOF'
 #!/bin/sh
-# 1. The intended destination, through the relay and Tor.
-echo "ip=$(timeout 40 curl -s --max-time 35 http://checkip.amazonaws.com || true)"
-echo "endpoint=$(timeout 40 curl -s -o /dev/null -w '%{http_code}' --max-time 35 "http://$GH_APP_ENDPOINT/" || true)"
+# 1. The intended destination, through the relay and Tor. The public name's address rotates among
+#    edges, and not every edge serves every exit, so a few attempts are made before calling it a
+#    failure; a non-empty answer is the destination's own proof.
+fetch() {
+    local i value
+    for i in 1 2 3 4; do
+        value="$(timeout 40 curl -s --max-time 35 "$1" 2>/dev/null || true)"
+        [ -n "$value" ] && { echo "$value"; return 0; }
+        sleep 2
+    done
+    echo ""
+}
+code() {
+    local i value
+    for i in 1 2 3 4; do
+        value="$(timeout 40 curl -s -o /dev/null -w '%{http_code}' --max-time 35 "$1" 2>/dev/null || true)"
+        case "$value" in 2*) echo "$value"; return 0 ;; esac
+        sleep 2
+    done
+    echo "${value:-000}"
+}
+echo "ip=$(fetch http://checkip.amazonaws.com)"
+echo "endpoint=$(code http://checkip.amazonaws.com/)"
 # 2. DNS through the chokepoint.
 echo "dns=$(timeout 15 getent hosts checkip.amazonaws.com | head -1 | awk '{print $1}')"
 # 3. A direct connection to a private host must produce no application data (the relay is the only
@@ -134,7 +142,7 @@ chmod 0755 /usr/local/bin/gh-app-real
 
 run_app() { # label
     local label="$1" output
-    output="$( ( sleep 60 | runuser -u ghost -g ghostnector -- env GH_APP_ENDPOINT="$HTTP_IP" \
+    output="$( ( sleep 60 | runuser -u ghost -g ghostnector -- \
         /usr/bin/ghostnector run /usr/local/bin/gh-app-real ) 2>&1 )"
     echo "$output"
 }

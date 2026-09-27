@@ -134,7 +134,13 @@ except OSError:
 PY
 }
 exit_ip() { # url -> address or "(no answer)"
-    as_probe timeout 30 curl -s --max-time 25 "$1" 2>/dev/null | tr -d '\r\n' || true
+    local i value
+    for i in 1 2 3 4; do
+        value="$(as_probe timeout 30 curl -s --max-time 25 "$1" 2>/dev/null | tr -d '\r\n' || true)"
+        [ -n "$value" ] && { echo "$value"; return 0; }
+        sleep 2
+    done
+    echo ""
 }
 
 cleanup() {
@@ -357,7 +363,13 @@ echo "-- Tor APP: two groups stay on the protected path and cannot egress direct
 # /var/tmp inside the application are appd's private directories, invisible from here.
 cat >/usr/local/bin/gh-leak-1 <<'EOF'
 #!/bin/sh
-echo "ip=$(timeout 40 curl -s --max-time 35 http://checkip.amazonaws.com || true)"
+ip=""
+for i in 1 2 3 4; do
+    ip="$(timeout 40 curl -s --max-time 35 http://checkip.amazonaws.com || true)"
+    [ -n "$ip" ] && break
+    sleep 2
+done
+echo "ip=$ip"
 # A direct connection to a private host is carried by the relay to Tor, which refuses private
 # destinations; only data coming back would prove a direct path. The far-side observer is the
 # authority either way.
@@ -382,7 +394,13 @@ sleep 30
 EOF
 cat >/usr/local/bin/gh-leak-2 <<'EOF'
 #!/bin/sh
-echo "ip=$(timeout 40 curl -s --max-time 35 http://checkip.amazonaws.com || true)"
+ip=""
+for i in 1 2 3 4; do
+    ip="$(timeout 40 curl -s --max-time 35 http://checkip.amazonaws.com || true)"
+    [ -n "$ip" ] && break
+    sleep 2
+done
+echo "ip=$ip"
 sleep 30
 EOF
 chmod 0755 /usr/local/bin/gh-leak-1 /usr/local/bin/gh-leak-2
