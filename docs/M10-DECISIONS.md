@@ -1,8 +1,10 @@
 # M10 decisions — the GTK4 interface
 
-Status: **implemented** (M10.1, commit `b92e994`), pending the native VM real-display qualification
-and the clean-install test in Phase 3. The architecture below was reviewed before implementation;
-"as built" notes are at the end. No M1–M9 backend boundary was widened.
+Status: **implemented** (M10.1, commit `b92e994`). The native VM real-display qualification and the
+clean-install/lifecycle tests were completed in the M10 qualification campaign; the record is in
+`docs/QUALIFICATION-NOTES.md` and the consolidated result — including one open product decision
+(D-50, APP-scope transparent egress with real Tor) — is in `docs/RELEASE-CANDIDATE-REPORT.md`. No
+M1–M9 backend boundary was widened.
 
 ---
 

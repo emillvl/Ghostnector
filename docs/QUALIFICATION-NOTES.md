@@ -230,6 +230,44 @@ The performance script's resource summary and APP-launch sampling were corrected
 (the `ps` field/comm mismatch printed zero means, and a leftover application could satisfy the
 launch check); the table above uses the focused re-measurement.
 
+## Lifecycle and adversarial qualification (installed, 2026-09-27)
+
+`lifecycle-20260927T091710Z.log`: **31 held / 0 contradicted / 0 inconclusive** on the final run.
+
+* uninstall: every packaged file gone, no process, no policy table, the resolver restored, ordinary
+  HTTP and DNS working;
+* reinstall: all three units active on the first attempt (after D-52);
+* ordinary use: connect → protected → disconnect → off;
+* deliberate lockout (deterministic): protected, the router is stopped, the next verification
+  fails, the fail-closed baseline is applied (the SSH session driving the runs is cut by design),
+  and the documented local `disconnect` recovers to off with no table and no protected intent;
+* first boot after the reinstall (hard reset): all four units active, `/run/netns` present, state
+  off;
+* adversarial reboot with protection on: the intent was `protected — and verified`; after the hard
+  reset the boot guard applied the fail-closed baseline before the network — `blocked — no traffic
+  can leave`, the policy table asserted present (`table inet ghostnector`), SSH cut — and guest
+  control (the VMMDev channel) recovered it to off. The same sequence was repeated manually with
+  the same result.
+
+## Full M1–M10 gate (installed VM, 2026-09-27)
+
+`release-gate.log` (run 2): every step returned 0, **455 unit tests passed, 0 failed**.
+
+* static: `fmt`, `check`, `clippy`, `test`, `build bins`, and the GUI `check`/`clippy`/`build` with
+  the GTK feature — all rc 0;
+* suites: app-topology, app-policy, appd-socket, core-app, app-adversarial (**13 held / 0
+  contradicted / 0 inconclusive**), policy-netns (i2p golden), i2p-adversarial (**26/0/0**),
+  policy-netns (tor golden), netd-socket, core-cli, bootguard, watch-oracle, and adversarial
+  (**27/0/1**) — all rc 0. The single inconclusive is the documented IPv6-environment case (AS-4:
+  this VM has no global IPv6, so a failure there proves nothing).
+
+Environment notes, recorded because the first attempt was not evidence: the gate needs `cargo` on
+the detached unit's PATH (the first run had rc=127 for every Rust step and the suites then used a
+stale debug build), and it must run with the installed product stopped, because the suites create
+their own cores and helpers on `/run/ghostnector`. The appd-socket test's simulated "packaged
+capability set" had gone stale after D-46/D-47 and now mirrors the unit; the hardening test still
+pins the unit itself.
+
 ## Leakage qualification (installed, far-side observation)
 
 Method: a host-side observer (outside the VM, reached through the NAT as `10.0.2.2`) listens on UDP
