@@ -189,3 +189,41 @@ product's.
 invoking user could not reach its own session socket because `/run/ghostnector/apps` was
 `0700 root:root`. It is now `0710 root:ghostnector` — traversable by the accounts that may control
 Ghostnector, not listable — while the socket itself stays `0600` owned by that user.
+
+**D-46, D-47** completed the chain. D-46 added `CAP_SETUID`/`CAP_SETGID` to appd's bounding set so
+the launcher could drop identity at all; D-47 found that this was still not enough: an exec'd child
+does not inherit the permitted or effective sets, only the ambient set survives `execve`, so the
+launcher still had no `CAP_SETUID` and every launch died with `cannot set uid 1000: EPERM`. The
+unit's ambient set now carries everything a child needs
+(`CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SETUID CAP_SETGID`); the launcher still clears every granting set
+before it execs the user's shell (measured: `CapPrm=CapEff=CapAmb=0`), and the same fix restores
+`ip netns add`'s `CAP_SYS_ADMIN` in a child — it had only worked because `/run/netns` was made
+shared by hand during the D-44 investigation. The hardening test now names the ambient set and
+refuses `CAP_CHOWN` ambient.
+
+## Leakage qualification (installed, far-side observation)
+
+Method: a host-side observer (outside the VM, reached through the NAT as `10.0.2.2`) listens on UDP
+18081, TCP 18082, UDP 53 and TCP 53 and timestamps every arrival; it emits a heartbeat every 15 s.
+The VM-side script records `PHASE <name> <vm-epoch>` markers around each window and probes the far
+side in the open window (expected arrivals) and in every protected window (must be silent). The
+controller measures the VM/host clock offset before the run, collects the durable log and verifies
+it really contains its phases, then correlates arrivals against phases with the offset. A verdict
+is refused (exit 3) when there are no phases, no open-validation arrival (the channel would be
+unproven), or the observer's last heartbeat predates the end of the run.
+
+Result of the conclusive run (`leak-20260927T060301Z.log`, VM-side **26 held / 0 contradicted /
+3 inconclusive**): 30 phase records; the only far-side arrivals were the three open-validation
+probes (HTTP, UDP, DNS) and the two observer self-probes; **zero arrivals in any protected, tamper,
+router-death, panic, I2P or APP window**; the protected path reported `109.70.100.13` against a host
+public address of `94.20.98.15`. The three VM-side inconclusive items were the APP section, which
+could not observe its applications for an unrelated reason (the launcher's D-47 failure); the
+section now captures the application's output through the session, because appd's `PrivateTmp`
+hides `/tmp` and `/var/tmp` from the namespace.
+
+The run's own controller failed to collect the log (D-48: a PowerShell `$args` collision made the
+collection run `sudo` with no arguments), which produced a `phases: 0` analysis. The raw evidence
+was intact on both sides and was re-correlated directly with the measured offset; the analyzer now
+refuses a `phases: 0` verdict. Every external operation in the controllers is bounded
+(`Start-Process` + `WaitForExit`, SSH commands quoted as one argument), and the poll loop reads a
+single-word unit state and keeps polling on anything unexpected.

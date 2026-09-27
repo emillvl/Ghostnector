@@ -343,23 +343,26 @@ note "i2p protected: tcp=$TCP_I udp=$UDP_I dns=$DNS_I"
 # ---------------------------------------------------------------- APP scope
 echo
 echo "-- Tor APP: two groups stay on the protected path and cannot egress directly --"
+# The application's output comes back through the session (the CLI relays it to its stdout). It
+# cannot be written to a file: the namespace is created inside appd's PrivateTmp, so /tmp and
+# /var/tmp inside the application are appd's private directories, invisible from here.
 cat >/usr/local/bin/gh-leak-1 <<'EOF'
 #!/bin/sh
-{ timeout 40 curl -s --max-time 35 http://checkip.amazonaws.com || true; } >/var/tmp/gh-leak-1.ip 2>/dev/null
-printf 'tcp-direct=%s\n' "$(timeout 6 python3 -c 'import socket;s=socket.socket();s.settimeout(4)
+echo "ip=$(timeout 40 curl -s --max-time 35 http://checkip.amazonaws.com || true)"
+echo "tcp-direct=$(timeout 6 python3 -c 'import socket;s=socket.socket();s.settimeout(4)
 try:
  s.connect(("10.0.2.2",18082));print("connected")
 except OSError:
- print("blocked")')" >>/var/tmp/gh-leak-1.ip
+ print("blocked")' 2>/dev/null)"
 sleep 30
 EOF
 cat >/usr/local/bin/gh-leak-2 <<'EOF'
 #!/bin/sh
-{ timeout 40 curl -s --max-time 35 http://checkip.amazonaws.com || true; } >/var/tmp/gh-leak-2.ip 2>/dev/null
+echo "ip=$(timeout 40 curl -s --max-time 35 http://checkip.amazonaws.com || true)"
 sleep 30
 EOF
 chmod 0755 /usr/local/bin/gh-leak-1 /usr/local/bin/gh-leak-2
-rm -f /var/tmp/gh-leak-1.ip /var/tmp/gh-leak-2.ip
+rm -f /tmp/gh-leak-1.out /tmp/gh-leak-2.out
 phase CONNECT_APP_START
 ensure_connect --scope app
 phase CONNECT_APP_END
@@ -369,20 +372,24 @@ else
     bad "the APP scope did not apply: $(cli_state | head -3)"
 fi
 phase APP_RUN_START
-( sleep 60 | runuser -u ghost -g ghostnector -- /usr/bin/ghostnector run /usr/local/bin/gh-leak-1 >/dev/null 2>&1 ) &
-( sleep 60 | runuser -u ghost -g ghostnector -- /usr/bin/ghostnector run /usr/local/bin/gh-leak-2 >/dev/null 2>&1 ) &
-sleep 25
+( sleep 60 | runuser -u ghost -g ghostnector -- /usr/bin/ghostnector run /usr/local/bin/gh-leak-1 >/tmp/gh-leak-1.out 2>&1 ) &
+( sleep 60 | runuser -u ghost -g ghostnector -- /usr/bin/ghostnector run /usr/local/bin/gh-leak-2 >/tmp/gh-leak-2.out 2>&1 ) &
+# Wait for both applications to report (the curl budget is 35 s) or give up at 45 s.
+for _ in $(seq 1 45); do
+    grep -q "^ip=" /tmp/gh-leak-1.out 2>/dev/null && grep -q "^ip=" /tmp/gh-leak-2.out 2>/dev/null && break
+    sleep 1
+done
 phase APP_RUN_END
 APPS="$(runuser -u ghost -g ghostnector -- /usr/bin/ghostnector apps 2>&1)"
 echo "$APPS"
-IP1="$(head -1 /var/tmp/gh-leak-1.ip 2>/dev/null | tr -d '\r\n')"
-IP2="$(head -1 /var/tmp/gh-leak-2.ip 2>/dev/null | tr -d '\r\n')"
-DIRECT1="$(grep tcp-direct /var/tmp/gh-leak-1.ip 2>/dev/null | cut -d= -f2)"
+IP1="$(sed -n 's/^ip=//p' /tmp/gh-leak-1.out 2>/dev/null | head -1 | tr -d '\r\n')"
+IP2="$(sed -n 's/^ip=//p' /tmp/gh-leak-2.out 2>/dev/null | head -1 | tr -d '\r\n')"
+DIRECT1="$(sed -n 's/^tcp-direct=//p' /tmp/gh-leak-1.out 2>/dev/null | head -1 | tr -d '\r\n')"
 note "app exit addresses: 1=${IP1:-none} 2=${IP2:-none}; direct from namespace: ${DIRECT1:-none}"
 [ -n "$IP1" ] && ok "the first application reached the network through the protected path" \
-    || inc "the first application produced no address"
+    || inc "the first application produced no address: $(head -2 /tmp/gh-leak-1.out 2>/dev/null | tr '\n' ' ')"
 [ -n "$IP2" ] && ok "the second application reached the network through the protected path" \
-    || inc "the second application produced no address"
+    || inc "the second application produced no address: $(head -2 /tmp/gh-leak-2.out 2>/dev/null | tr '\n' ' ')"
 [ "$DIRECT1" = "blocked" ] && ok "a direct connection from inside the namespace was blocked" \
     || inc "the in-namespace direct probe said: ${DIRECT1:-nothing}"
 if [ -n "$IP1" ] && [ -n "$IP2" ] && [ "$IP1" != "$IP2" ]; then

@@ -36,14 +36,19 @@ ExecStart=/usr/libexec/ghostnector-appd \
 #     chown, so CAP_FOWNER is not needed and the socket is never briefly peer-owned with a
 #     permissive mode);
 #   * the launcher drops to the invoking user with setgroups/setgid/setuid, which need CAP_SETGID
-#     and CAP_SETUID (D-46); those are used for that one transition and nothing else.
-# The helper runs as root, so the bounding set above is also the permitted and effective set
-# (measured on the installed machine: cap_chown,cap_sys_admin,cap_net_admin+ep). Only
-# CAP_NET_ADMIN is ambient, so the tools this helper runs (`ip`, `bridge`, `nft`) never inherit
-# CAP_SYS_ADMIN or CAP_CHOWN. There is no `KeepCapabilities=` directive in systemd; an earlier
+#     and CAP_SETUID (D-46).
+# An exec'd child does not inherit the permitted or effective sets: only the ambient set survives
+# `execve`. Measured on the installed machine, a child of this unit had
+# cap_chown,cap_sys_admin,cap_net_admin,cap_setgid but *not* cap_setuid, so `setuid` failed with
+# EPERM and every APP launch died at the identity drop (D-47). Everything a child needs must
+# therefore be ambient: NET_ADMIN and SYS_ADMIN for `ip`/`bridge`/`nft` (including `ip netns add`,
+# which makes /run/netns shared), SYS_ADMIN and SETUID/SETGID for the launcher. CAP_CHOWN is used
+# by this process itself and is deliberately not ambient. The launcher clears every capability set
+# before it execs the user's shell, so none of this reaches the application (measured: the shell
+# has CapPrm=CapEff=CapAmb=0). There is no `KeepCapabilities=` directive in systemd; an earlier
 # revision of this unit named one, and systemd ignored it (D-36).
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_CHOWN CAP_SETUID CAP_SETGID
-AmbientCapabilities=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SETUID CAP_SETGID
 NoNewPrivileges=yes
 
 # It speaks netlink and unix sockets. It never opens an internet socket itself.

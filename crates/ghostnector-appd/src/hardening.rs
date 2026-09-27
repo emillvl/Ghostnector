@@ -31,7 +31,10 @@ mod tests {
                 // Dropping to the invoking user needs CAP_SETUID/CAP_SETGID (D-46).
                 "CAP_NET_ADMIN CAP_SYS_ADMIN CAP_CHOWN CAP_SETUID CAP_SETGID",
             ),
-            ("AmbientCapabilities", "CAP_NET_ADMIN"),
+            (
+                "AmbientCapabilities",
+                "CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SETUID CAP_SETGID",
+            ),
             ("NoNewPrivileges", "yes"),
             ("RestrictAddressFamilies", "AF_UNIX AF_NETLINK"),
             ("RestrictNamespaces", "net mnt"),
@@ -82,12 +85,17 @@ mod tests {
                 }
             }
         }
-        // Only CAP_NET_ADMIN may be ambient: ambient capabilities are inherited by the tools the
-        // helper runs, and those tools must never hold CAP_SYS_ADMIN or CAP_CHOWN.
+        // The ambient set is what survives `execve`, so it must carry everything a child of this
+        // unit needs (the launcher's SYS_ADMIN/SETUID/SETGID and the tools' NET_ADMIN/SYS_ADMIN).
+        // It must stay a subset of the bounding set, and CAP_CHOWN — which this process uses for
+        // the session socket — must not be ambient: no child needs it (D-47).
         if let Some(line) = line_value(text, "AmbientCapabilities") {
             for capability in line.split_whitespace() {
-                if capability != "CAP_NET_ADMIN" {
-                    problems.push(format!("'{capability}' must not be ambient"));
+                if !allowed.contains(&capability) {
+                    problems.push(format!("ambient '{capability}' is not in the bounding set"));
+                }
+                if capability == "CAP_CHOWN" {
+                    problems.push("'CAP_CHOWN' must not be ambient (D-47)".to_string());
                 }
             }
         }
@@ -102,13 +110,13 @@ mod tests {
 
     #[test]
     fn the_checker_notices_a_widened_unit() {
-        // The oracle is tested too: a unit with ambient CAP_SYS_ADMIN and an extra capability must
-        // be rejected by the same code that accepts the real one.
+        // The oracle is tested too: a unit with an extra capability and with CAP_CHOWN ambient
+        // (which no child needs) must be rejected by the same code that accepts the real one.
         let widened = "\
 [Service]
 ExecStart=/usr/libexec/ghostnector-appd
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_DAC_OVERRIDE
-AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN CAP_CHOWN
 NoNewPrivileges=yes
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
 RestrictNamespaces=net
@@ -120,7 +128,7 @@ ReadWritePaths=/run/ghostnector /run/netns
         assert!(
             problems
                 .iter()
-                .any(|p| p.contains("'CAP_SYS_ADMIN' must not be ambient")),
+                .any(|p| p.contains("'CAP_CHOWN' must not be ambient")),
             "{problems:?}"
         );
         assert!(
