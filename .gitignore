@@ -16,3 +16,8 @@ Thumbs.db
 
 # Local test fixtures that may contain captured environment data
 /testdata/local/
+
+# Working aids that stay untracked (never part of the product).
+/docs/HANDOFF-RC2.md
+/m9-qual.bundle
+/Ghostnector Engineering Handoff*
