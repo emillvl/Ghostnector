@@ -11,11 +11,12 @@ areas.
 tree reset to this commit; the commits after it are this report and its records). The D-50/D-53
 product work spans `043b3e3` → `e788aab`. No release tag was created or moved.
 
-**Recommendation: the evidence supports freezing `v1.0.0`.** Every M1–M10 suite is clean, the
-leakage analyzer returns 0 violations / 0 ambiguous with nothing reaching the far side in any
-protected window, and APP scope now carries real TCP through real Tor with the intended
-destination and the application's identity preserved — including across a profile change. The
-remaining items are documented limitations, not open product decisions.
+**Recommendation: the evidence supports `v1.0.0` for every phase except the boot guard's early-deny
+claim, where the close-out verification found **D-54**: the installed guard cannot apply the
+fail-closed policy before the network (its sandbox cannot reach the helper's socket or read the
+fallback copy), and the control plane's reconcile applies the baseline only once it starts. Fix
+D-54, or narrow PC-10 explicitly, before tagging. Everything else — including APP scope with real
+Tor — is clean and reproducible.
 
 ---
 
@@ -93,6 +94,14 @@ The earlier conclusive run (`leak-20260927T073453Z.log`, 27/0/2) remains valid f
 data path and its far-side result was identical; the APP exit-address items it recorded as
 inconclusive were the D-50 defect, now fixed and requalified here.
 
+Focused APP regression (`app-real-tor-test.sh`, `app-real-tor-20260927T134858Z.log`): **17 held /
+0 contradicted / 0 inconclusive**. The run begins with a machine-wide Tor session (the D-53
+transition, so the APP apply must reload Tor), then two groups fetched real exit addresses
+(`94.230.208.147`, `192.42.116.51`); the intended destination answered 200, DNS resolved through the
+chokepoint, a direct connection produced no application data, a direct connection to the relay was
+refused, the stopped group's relay was gone while the other group's stayed, and with Tor stopped the
+state stopped claiming verification while no application produced an address.
+
 ### 2.3 Performance (installed; medians, same machine and network for product and baseline)
 
 | Measurement | Product | Baseline Tor |
@@ -130,9 +139,12 @@ extra case over the earlier 31 is the uninstall residue check for group relays).
   baseline is applied, the SSH session is cut by design, and the documented local `disconnect`
   recovers with no table and no protected intent;
 * first boot after the reinstall: all four units active, `/run/netns` present, state off;
-* **reboot with protection on**: after the hard reset the boot guard applied the fail-closed
-  baseline before the network (`blocked — no traffic can leave`, `table inet ghostnector` present,
-  SSH cut), and guest control recovered it to off.
+* **reboot with protection on**: after the hard reset the machine ended `blocked — no traffic can
+  leave` with the table present and SSH cut, and guest control recovered it to off. The close-out
+  verification showed **who** applied that baseline: the boot guard itself failed on that boot (D-54
+  — its unit cannot reach the helper's socket or read the fallback copy, so both routes are
+  `EACCES`), and the control plane's reconcile applied the baseline once it started. The machine was
+  denied, but not before the network; see the limitation and G14.
 
 The APP adversarial suite (`app-adversarial.sh`) is **13 held / 0 contradicted / 0 inconclusive** in
 the final gate. Its AA-13 case was corrected during this requalification: the relay is the helper's
@@ -157,7 +169,8 @@ tests passed / 0 failed**.
   the GTK feature;
 * suites: app-topology **PASS**, app-policy **PASS**, appd-socket **PASS**, core-app **PASS**,
   app-adversarial **13/0/0**, policy-netns (i2p golden) **PASS**, i2p-adversarial **26/0/0**,
-  policy-netns (tor golden) **PASS**, netd-socket **PASS**, core-cli **PASS**, bootguard **PASS**,
+  policy-netns (tor golden) **PASS**, netd-socket **PASS**, core-cli **PASS**, bootguard **PASS**
+  (hermetic, where the guard runs as plain root; the installed unit's sandbox gap is D-54),
   watch-oracle **10 held / 0 contradicted**, adversarial (M1–M7) **27/0/1** — the single
   inconclusive is the documented no-global-IPv6 case (AS-4);
 * the product was restored after the gate: netd, core and appd active, state `off`, no table.
@@ -185,6 +198,7 @@ Product defects (each with the regression that now guards it):
 | D-51 | Disconnect could freeze the interface for 90 s (router ignores SIGTERM) | `TimeoutStopSec=20` on both routers | `501f54d` |
 | D-52 | The first `netd` start after a fresh install failed (`226/NAMESPACE`); the boot guard too | `StateDirectory=ghostnector` on netd and bootguard; a test now covers `/var/lib` paths | `55da224`, `e35cb75` |
 | D-53 | **Applying APP scope over a Tor instance left running from another profile kept its listeners on loopback** (found while requalifying D-50; pre-existing, previously masked). The APP apply wrote the APP torrc but only *started* the unit, a no-op for an active unit, so the relay's dial to the core address was refused and every application fetch returned an empty reply within seconds while the relay itself was healthy. | the supervisor gains `restart`, composed of the two verbs the polkit rule grants (`stop` then `start`; systemd's own `restart` verb is refused without interactive authentication and would need a wider rule for the same two actions); the Tor bring-up restarts when the rendered torrc differs from the file, and starts on a first apply or an unchanged file. | `af89bc9`, `167ee85` |
+| D-54 | **The installed boot guard cannot deny by either route, so the fail-closed policy is not in place before the network on a protected reboot** (found in the close-out verification; requires action before a tag). Its unit runs root with only `CAP_NET_ADMIN`, while netd's socket and the fallback copy are `0600` owned by `ghostnector`: the connect and the `nft -f` on the copy fail with `EACCES` (`the helper could not deny everything: Permission denied`; `there is no copy ... so nothing could be denied`). The copy is also written only on a fail-closed apply, so a fresh install's first protected reboot has none. The control plane's reconcile applied the baseline once it started, so the machine ended blocked — after the network. | **Recorded, not fixed** (the campaign was closed as instructed). Proposed: keep the copy readable without `CAP_DAC_OVERRIDE` (e.g. `0644`), write it on every apply, and assert the guard's own success in the lifecycle's reboot case. | — (see `d54-bootguard-closeout.log` and G14) |
 
 Earlier in the same campaign (D-29–D-38) the installed stack was made to work at all: shared
 runtime directory ownership (D-29), a bounded polkit rule (D-30), the Tor control cookie (D-31), the
@@ -197,6 +211,13 @@ environmental flake in an old suite.
 
 * **GUI automation limits:** the header popover and the GTK file picker cannot be driven under
   Xvfb; their product-side paths rest on the model tests, the D-Bus action probe and the core API.
+* **D-54 (requires action before a `v1.0.0` tag).** The installed boot guard cannot apply the
+  fail-closed policy before the network: its capability set cannot reach netd's socket or read the
+  fallback copy (`0600`, owned by `ghostnector`), and the copy is written only on a fail-closed
+  apply. On a protected reboot the guard exits failed and the control plane's reconcile applies the
+  baseline once it starts, leaving a window from network-up to that reconcile. Fix D-54 (make the
+  copy readable to the guard, write it on every apply, and assert the guard's success) or narrow
+  PC-10 explicitly; the ordering claim was already open (G6) and is now recorded as G14.
 * **The harness pins a public HTTP check address per run.** A stale address makes the product fail
   closed (correct) and the harness validates a candidate before pinning it. For APP scope the
   installed runs use the UDP check, which is deterministic; an operator who configures an HTTP
@@ -227,8 +248,10 @@ environmental flake in an old suite.
 
 * **Confinement and privacy:** supported. On the installed product, while protection is reported,
   nothing reaches the far side; the resolver and DNS paths are confined; the fail-closed baseline
-  lands on contradiction; the boot guard denies before the network; disconnect/panic leave no
-  policy.
+  lands on contradiction; disconnect/panic leave no policy. **Except** the boot guard's early deny:
+  on a protected reboot the installed guard cannot act (D-54), and the baseline lands when the
+  control plane reconciles — so "denied from network-up" is not claimed until D-54 is fixed or
+  PC-10 is narrowed.
 * **APP scope with real Tor:** supported. The namespace relay carries real TCP through real Tor with
   the intended destination and the application's own source address, per-group SOCKS isolation
   credentials, no direct egress, a relay that refuses connections with no original destination, a

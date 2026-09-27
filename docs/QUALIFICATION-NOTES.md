@@ -411,3 +411,17 @@ phase order that exposed the defect.
   pipe closes), so the case now asserts what it claims - the namespace still exists and carries
   nothing, with the connection refused at the dead local relay - instead of the pre-relay liveness
   expectation that the protected path keeps working. WSL rerun 13/0/0; final gate 13/0/0.
+
+**D-54 (found in the close-out verification; requires action before a tag).** The final lifecycle
+run's reboot-with-intent boot did not actually have the boot guard deny. The guard's journal shows
+`the helper could not deny everything: Permission denied (os error 13)` and `there is no copy of the
+fail-closed policy at '/var/lib/ghostnector/fail-closed.nft'`, and the control plane's reconcile
+applied the baseline once it started (the machine ended `blocked - no traffic can leave`). Under the
+unit's own capability set (root, only `CAP_NET_ADMIN`, `NoNewPrivileges`) both routes are blocked:
+netd's socket and the fallback copy are `0600` owned by `ghostnector`, so the connect and the
+`nft -f` on the copy fail with `EACCES` (reproduced in `d54-bootguard-closeout.log`); the copy is
+also written only when the fail-closed profile is applied, so a fresh install's first protected
+reboot has none. The hermetic `bootguard-test.sh` runs the guard as plain root, which is why it
+passed. The ordering claim was already open (G6); this is the mechanism gap G14. Fix D-54 (make the
+copy readable to the guard, write it on every apply, and assert the guard's own success in the
+lifecycle's reboot case) or narrow PC-10 before tagging.

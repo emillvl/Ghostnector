@@ -214,7 +214,7 @@ reason reported is different, and it must read differently to a person.
 | Confirms | The policy exists before the network is up, and an independent boundary observes no packet from a protected scope during boot. |
 | Falsifies | An egress packet observed at the boundary while the machine is booting with protection requested and the policy is not yet present. |
 | Inconclusive | Nothing attempted traffic during the window. |
-| Evidence today | **Partially verified**: the policy is applied, the fallback works without the helper, the console escape works, and an unreadable journal denies rather than guesses — all end to end. **The ordering claim** ("no packet before") is not independently observed yet (G6). |
+| Evidence today | **Partially verified, with the mechanism gap recorded (D-54, G14).** The hermetic suite proves the fallback ruleset applies when the guard runs as plain root, and the console escape and the unreadable-journal refusal are exercised end to end. **As installed, however, the guard cannot deny by either route:** its unit carries only `CAP_NET_ADMIN` (no `CAP_DAC_OVERRIDE`), and both the helper's socket and the fallback copy are `0600` owned by `ghostnector`, so the connect and the `nft -f` on the copy fail with `EACCES`. The final lifecycle run's reboot-with-intent boot showed the guard exiting failed and the control plane's reconcile applying the baseline once it started (the machine ended `Blocked`, but after the network). **The ordering claim** ("no packet before") is therefore not merely unobserved (G6) but not upheld on that boot. |
 
 ### PC-12 — The control plane dying changes nothing
 
@@ -286,6 +286,7 @@ observation is marked **closed**, with the case that closed it; a gap that chang
 | G11 | **Narrowing.** The DHCP exemption is IPv4 only, because IPv6 is denied in every profile. A network whose connectivity can only be maintained by DHCPv6 lease renewal is not supported while protected. | PC-09 |
 | G12 | **New, availability.** A transient loss of connectivity can leave the machine `Blocked` until a person acts, because a verification failure is answered with the fail-closed baseline (observed in AN-1). This is deliberate, and it is a cost rather than a leak. | PC-06, PC-14 |
 | G13 | **New, residual.** The exemption list is derived from the rules that cite it and the invariant checker refuses an accept citing no listed exemption, but a one-by-one kernel-versus-report diff is not executed end to end. | PC-09 |
+| G14 | **New (D-54), requires action before a `v1.0.0` tag.** The installed boot guard cannot apply the fail-closed policy before the network: its unit has no `CAP_DAC_OVERRIDE`, and both the helper socket and the fallback copy are owner-only for `ghostnector`, so the guard's connect and its `nft -f` on the copy fail with `EACCES`. The control plane's reconcile still applies the baseline once it starts, so the machine ends `Blocked`; the gap is the window from network-up to that reconcile. The hermetic `bootguard-test.sh` runs the guard as plain root, which is why it passed. Fix (or an explicit narrowing of PC-10) is required before tagging. | PC-10 |
 
 ## APP scope (M8): what was demonstrated
 
