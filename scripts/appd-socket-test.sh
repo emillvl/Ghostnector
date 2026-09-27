@@ -385,7 +385,17 @@ esac
 ip link show "$BRIDGE" >/dev/null 2>&1 && fail "revert left the bridge behind"
 [ -z "$(ip -o link show | grep -E 'ghav[0-9]+' || true)" ] ||
     fail "revert left host links behind"
-ok "every namespace, link and the bridge are gone"
+# The relay holds its namespace open, so this is the case that proves the helper stops it: no relay
+# process may outlive its group. (Match the relay's own command line; the helper's command line also
+# names the relay binary, so a loose pattern would match the helper itself.)
+relays_gone=0
+for _ in $(seq 1 20); do
+    if ! pgrep -f "ghostnector-appd-relay --id" >/dev/null 2>&1; then relays_gone=1; break; fi
+    sleep 0.5
+done
+[ "$relays_gone" = "1" ] ||
+    fail "revert left a relay process: $(pgrep -af 'ghostnector-appd-relay --id' | tr '\n' ' ')"
+ok "every namespace, link, the bridge and every relay are gone"
 
 echo "[8] the packaged capability set is sufficient, and CAP_SYS_ADMIN is necessary"
 # Exactly the packaged state: bounding {net_admin, sys_admin, chown, setuid, setgid}, ambient
@@ -427,6 +437,16 @@ case "$ANSWER" in
 *) fail "verification failed under the packaged set: $ANSWER" ;;
 esac
 packaged_call '{"verb":"revert"}' >/dev/null
+# The packaged set has no CAP_KILL, so this is the case that proves the shutdown channel: the relay
+# must still be stopped and reaped when the helper cannot signal it.
+relays_gone=0
+for _ in $(seq 1 20); do
+    if ! pgrep -f "ghostnector-appd-relay --id" >/dev/null 2>&1; then relays_gone=1; break; fi
+    sleep 0.5
+done
+[ "$relays_gone" = "1" ] ||
+    fail "the packaged set left a relay process: $(pgrep -af 'ghostnector-appd-relay --id' | tr '\n' ' ')"
+ok "the packaged set stops and reaps the relay without CAP_KILL"
 kill "$APPD3_PID" 2>/dev/null || true
 wait "$APPD3_PID" 2>/dev/null || true
 APPD3_PID=""

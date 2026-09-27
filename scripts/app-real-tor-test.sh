@@ -52,7 +52,7 @@ cleanup() {
     if nft list table inet ghostnector >/dev/null 2>&1; then
         nft destroy table inet ghostnector >>"$LOG" 2>&1 || true
     fi
-    pkill -f ghostnector-appd-relay 2>/dev/null || true
+    pkill -f "ghostnector-appd-relay --id" 2>/dev/null || true
     pkill -f gh-app-real 2>/dev/null || true
     echo "== final state =="
     runuser -u ghost -g ghostnector -- /usr/bin/ghostnector status 2>&1 | head -3
@@ -79,7 +79,22 @@ nft destroy table inet ghostnector 2>/dev/null || true
 rm -f /var/lib/ghostnector/intent.json
 systemctl restart ghostnector-netd.service ghostnector-core.service ghostnector-appd.service
 sleep 2
-HTTP_IP="$(getent ahostsv4 checkip.amazonaws.com | awk 'NR==1{print $1}')"
+# The verification endpoint must answer a bare-IP GET with 200. AWS's edges rotate, and not every
+# resolved address serves the request, so pick the first one that does *before* protection is on
+# (the same request the probe will make; the endpoint does not care about the source).
+HTTP_IP=""
+for candidate in $(getent ahostsv4 checkip.amazonaws.com | awk '{print $1}'); do
+    code="$(timeout 15 curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://$candidate/" || true)"
+    echo "check endpoint candidate $candidate -> $code"
+    if [ "$code" = "200" ]; then
+        HTTP_IP="$candidate"
+        break
+    fi
+done
+if [ -z "$HTTP_IP" ]; then
+    HTTP_IP="$(getent ahostsv4 checkip.amazonaws.com | awk 'NR==1{print $1}')"
+    echo "no candidate answered 200; using $HTTP_IP anyway (the verification may be inconclusive)"
+fi
 [ -n "$HTTP_IP" ] || { echo "no check endpoint address could be resolved"; exit 2; }
 cat >/etc/ghostnector/core.env <<EOF
 GHOSTNECTOR_VERIFY=--udp-check $HOST:18081 --check-url http://$HTTP_IP/ --verify-timeout 10 --verify-interval 5 --verify-stale-after 30
@@ -185,12 +200,19 @@ echo "$LIST"
 ID="$(printf '%s\n' "$LIST" | awk '/^  -/ { print $2; exit }')"
 if [ -n "$ID" ]; then
     "${CLI[@]}" stop-app "$ID" >/dev/null 2>&1 || true
-    sleep 2
-fi
-if pgrep -f ghostnector-appd-relay >/dev/null 2>&1; then
-    note "relays still running (one per remaining group): $(pgrep -f ghostnector-appd-relay | tr '\n' ' ')"
+    stopped=0
+    for _ in $(seq 1 20); do
+        if ! pgrep -f "ghostnector-appd-relay --id $ID " >/dev/null 2>&1; then stopped=1; break; fi
+        sleep 0.5
+    done
+    if [ "$stopped" = "1" ]; then
+        ok "the stopped group's relay is gone"
+    else
+        bad "the stopped group's relay survived: $(pgrep -af "ghostnector-appd-relay --id $ID " | tr '\n' ' ')"
+    fi
+    note "other groups' relays stay while their groups live: $(pgrep -af 'ghostnector-appd-relay --id' | wc -l) relay(s)"
 else
-    ok "the stopped group's relay is gone"
+    bad "no application was listed to stop"
 fi
 
 echo
@@ -200,10 +222,10 @@ FALLBACK="$(run_app after-tor-death)"
 AFTER_IP="$(printf '%s\n' "$FALLBACK" | sed -n 's/^ip=//p' | head -1)"
 [ -z "$AFTER_IP" ] && ok "an application connection produced no address with Tor down" \
     || bad "an application connection still produced an address with Tor down: $AFTER_IP"
-if wait_status "no traffic can leave" 150; then
-    ok "the machine failed closed after Tor stopped"
+if wait_status "no protected application can reach the network" 150; then
+    ok "the APP scope failed closed after Tor stopped"
 else
-    inc "the machine did not report fail-closed within 150s: $(cli_state | head -1)"
+    inc "the APP scope did not report fail-closed within 150s: $(cli_state | head -1)"
 fi
 
 echo
@@ -214,11 +236,15 @@ if wait_status "off" 60; then
 else
     bad "the machine did not return to off: $(cli_state | head -1)"
 fi
-sleep 2
-if pgrep -f ghostnector-appd-relay >/dev/null 2>&1; then
-    bad "a relay process survived the disconnect"
-else
+relays_gone=0
+for _ in $(seq 1 30); do
+    if ! pgrep -f "ghostnector-appd-relay --id" >/dev/null 2>&1; then relays_gone=1; break; fi
+    sleep 0.5
+done
+if [ "$relays_gone" = "1" ]; then
     ok "no relay process survived the disconnect"
+else
+    bad "a relay process survived the disconnect: $(pgrep -af 'ghostnector-appd-relay --id' | tr '\n' ' ')"
 fi
 if [ -n "$(ip netns list 2>/dev/null)" ]; then
     bad "a namespace survived the disconnect: $(ip netns list)"

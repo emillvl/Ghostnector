@@ -55,12 +55,20 @@ cli_state() { "${CLI[@]}" status 2>&1; }
 cli_line() { cli_state | head -1; }
 wait_status() { local i; for i in $(seq 1 "$2"); do cli_state | grep -q "$1" && return 0; sleep 1; done; return 1; }
 # The HTTP check is pinned to a resolved address (the verifier takes a SocketAddr); a public
-# endpoint's address can go stale, and a failed check correctly blocks the machine. Retry the
-# connect with a freshly resolved endpoint so the qualification is not defeated by that.
+# endpoint's address can go stale or stop serving, and a failed check correctly blocks the machine.
+# Pick an address that answers the probe's bare-IP GET with 200 before pinning it.
+check_endpoint() {
+    local candidate code
+    for candidate in $(getent ahostsv4 checkip.amazonaws.com | awk '{print $1}'); do
+        code="$(timeout 15 curl -s -o /dev/null -w '%{http_code}' --max-time 10 "http://$candidate/" || true)"
+        [ "$code" = "200" ] && { echo "$candidate"; return 0; }
+    done
+    getent ahostsv4 checkip.amazonaws.com | awk 'NR==1{print $1}'
+}
 ensure_connect() { # [connect arguments...]
     local attempt ip
     for attempt in 1 2 3; do
-        ip="$(getent ahostsv4 checkip.amazonaws.com | awk 'NR==1{print $1}')"
+        ip="$(check_endpoint)"
         cat >/etc/ghostnector/core.env <<EOF
 GHOSTNECTOR_VERIFY=--udp-check $HOST:18081 --check-url http://$ip/ --verify-timeout 10 --verify-interval 5 --verify-stale-after 30
 EOF
@@ -162,10 +170,11 @@ echo "-- baseline: open, off, short verification interval --"
 timeout 60 "${CLI[@]}" disconnect >/dev/null 2>&1 || true
 nft destroy table inet ghostnector 2>/dev/null || true
 rm -f /var/lib/ghostnector/intent.json
-HTTP_IP="$(getent ahostsv4 checkip.amazonaws.com | awk 'NR==1{print $1}')"
+HTTP_IP="$(check_endpoint)"
 cat >/etc/ghostnector/core.env <<EOF
 GHOSTNECTOR_VERIFY=--udp-check $HOST:18081 --check-url http://$HTTP_IP/ --verify-timeout 10 --verify-interval 5 --verify-stale-after 30
 EOF
+echo "verification endpoint: http://$HTTP_IP/"
 systemctl restart ghostnector-netd.service ghostnector-core.service ghostnector-appd.service
 sleep 2
 cli_state | head -3
@@ -349,9 +358,9 @@ echo "-- Tor APP: two groups stay on the protected path and cannot egress direct
 cat >/usr/local/bin/gh-leak-1 <<'EOF'
 #!/bin/sh
 echo "ip=$(timeout 40 curl -s --max-time 35 http://checkip.amazonaws.com || true)"
-# Under APP scope the namespace's DNAT sends this to the core's transparent proxy, which accepts
-# the TCP connection locally and then refuses the private destination; only data coming back proves
-# a direct path. The far-side observer is the authority either way.
+# A direct connection to a private host is carried by the relay to Tor, which refuses private
+# destinations; only data coming back would prove a direct path. The far-side observer is the
+# authority either way.
 echo "tcp-direct=$(timeout 8 python3 -c 'import socket
 s=socket.socket();s.settimeout(5)
 try:
@@ -360,6 +369,15 @@ try:
  print("answered" if s.recv(64) else "no-answer")
 except OSError:
  print("no-answer")' 2>/dev/null)"
+# A direct connection to the namespace relay has no original destination and must be refused, so the
+# relay can never be used as an open proxy.
+echo "relay-direct=$(timeout 8 python3 -c 'import socket
+s=socket.socket();s.settimeout(5)
+try:
+ s.connect(("127.0.0.1",9041)); data=s.recv(16)
+ print("refused" if data == b"" else "carried")
+except OSError:
+ print("refused")' 2>/dev/null)"
 sleep 30
 EOF
 cat >/usr/local/bin/gh-leak-2 <<'EOF'
@@ -391,13 +409,16 @@ echo "$APPS"
 IP1="$(sed -n 's/^ip=//p' /tmp/gh-leak-1.out 2>/dev/null | head -1 | tr -d '\r\n')"
 IP2="$(sed -n 's/^ip=//p' /tmp/gh-leak-2.out 2>/dev/null | head -1 | tr -d '\r\n')"
 DIRECT1="$(sed -n 's/^tcp-direct=//p' /tmp/gh-leak-1.out 2>/dev/null | head -1 | tr -d '\r\n')"
-note "app exit addresses: 1=${IP1:-none} 2=${IP2:-none}; direct from namespace: ${DIRECT1:-none}"
-[ -n "$IP1" ] && ok "the first application reached the network through the protected path" \
-    || inc "the first application produced no address: $(head -2 /tmp/gh-leak-1.out 2>/dev/null | tr '\n' ' ')"
-[ -n "$IP2" ] && ok "the second application reached the network through the protected path" \
-    || inc "the second application produced no address: $(head -2 /tmp/gh-leak-2.out 2>/dev/null | tr '\n' ' ')"
+RELAY_DIRECT="$(sed -n 's/^relay-direct=//p' /tmp/gh-leak-1.out 2>/dev/null | head -1 | tr -d '\r\n')"
+note "app exit addresses: 1=${IP1:-none} 2=${IP2:-none}; direct from namespace: ${DIRECT1:-none}; relay direct: ${RELAY_DIRECT:-none}"
+[ -n "$IP1" ] && ok "the first application reached the network through Tor (the relay carried it)" \
+    || bad "the first application produced no address: $(head -2 /tmp/gh-leak-1.out 2>/dev/null | tr '\n' ' ')"
+[ -n "$IP2" ] && ok "the second application reached the network through Tor (the relay carried it)" \
+    || bad "the second application produced no address: $(head -2 /tmp/gh-leak-2.out 2>/dev/null | tr '\n' ' ')"
 [ "$DIRECT1" = "no-answer" ] && ok "a direct connection from inside the namespace produced no application data" \
-    || inc "the in-namespace direct probe said: ${DIRECT1:-nothing}"
+    || bad "the in-namespace direct probe said: ${DIRECT1:-nothing}"
+[ "$RELAY_DIRECT" = "refused" ] && ok "a direct connection to the namespace relay is refused" \
+    || bad "the relay carried a connection with no original destination: ${RELAY_DIRECT:-nothing}"
 if [ -n "$IP1" ] && [ -n "$IP2" ] && [ "$IP1" != "$IP2" ]; then
     note "the two groups left through different observed addresses (circuits differ in effect)"
 fi
