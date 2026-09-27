@@ -63,7 +63,7 @@ pub enum SupervisorError {
     /// The service manager refused.
     #[error("the service could not be {action}")]
     Refused {
-        /// What was attempted: "started" or "stopped".
+        /// What was attempted: "started", "stopped" or "restarted".
         action: &'static str,
         /// The unit.
         unit: String,
@@ -78,6 +78,8 @@ pub trait Supervisor: Send + Sync {
     fn start(&self, unit: &str) -> Result<(), SupervisorError>;
     /// Stop a unit.
     fn stop(&self, unit: &str) -> Result<(), SupervisorError>;
+    /// Restart a unit so it loads a changed configuration, starting it if it was not running.
+    fn restart(&self, unit: &str) -> Result<(), SupervisorError>;
     /// Ask what a unit is doing.
     fn state(&self, unit: &str) -> Result<ServiceState, SupervisorError>;
 }
@@ -144,6 +146,21 @@ impl Supervisor for SystemdUnits {
             eprintln!("ghostnector-core: systemctl stop {unit} failed: {output}");
             Err(SupervisorError::Refused {
                 action: "stopped",
+                unit: unit.to_string(),
+                reason: output,
+            })
+        }
+    }
+
+    fn restart(&self, unit: &str) -> Result<(), SupervisorError> {
+        validate_unit(unit)?;
+        let (ok, output) = self.run(&["restart", unit])?;
+        if ok {
+            Ok(())
+        } else {
+            eprintln!("ghostnector-core: systemctl restart {unit} failed: {output}");
+            Err(SupervisorError::Refused {
+                action: "restarted",
                 unit: unit.to_string(),
                 reason: output,
             })

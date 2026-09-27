@@ -159,7 +159,31 @@ run_app() { # label
 }
 
 echo
+echo "-- a machine-wide Tor session first, so the APP apply must reload Tor (D-53) --"
+HTTP_IP="$(check_endpoint)"
+cat >/etc/ghostnector/core.env <<EOF
+GHOSTNECTOR_VERIFY=--check-url http://$HTTP_IP/ --verify-timeout 10 --verify-interval 5 --verify-stale-after 30
+EOF
+systemctl restart ghostnector-core.service
+sleep 2
+"${CLI[@]}" connect >/dev/null 2>&1 || true
+if wait_status "and verified" 240; then
+    ok "machine-wide Tor came up first (its listeners are on loopback)"
+else
+    inc "machine-wide Tor did not verify: $(cli_state | head -1)"
+fi
+"${CLI[@]}" disconnect >/dev/null 2>&1 || true
+wait_status "off" 90 || true
+
+echo
 echo "-- protection on through the window's core, then the application --"
+# APP scope is verified deterministically by the UDP check (see the baseline note); re-pin it now
+# that the machine-wide pre-phase has rewritten the configuration.
+cat >/etc/ghostnector/core.env <<'EOF'
+GHOSTNECTOR_VERIFY=--udp-check 10.0.2.2:18081 --verify-timeout 10 --verify-interval 5 --verify-stale-after 30
+EOF
+systemctl restart ghostnector-core.service
+sleep 2
 "${CLI[@]}" connect --scope app >/dev/null 2>&1 || true
 if wait_status "chosen applications" 240; then
     ok "the APP scope applied: $(cli_state | head -1)"

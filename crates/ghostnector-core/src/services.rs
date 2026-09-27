@@ -237,6 +237,15 @@ impl Services for SystemdServices {
             settings = settings.with_app_core(core);
         }
         let rendered = torrc::render(&settings);
+        // The listeners depend on the profile: APP scope moves the SOCKS listener to the core
+        // address the namespace relay dials and drops the TransPort. A Tor instance left running
+        // from another profile would keep the old listeners, so a changed file means a restart,
+        // not a start (D-53: the first post-fix leakage run applied APP scope over a Tor instance
+        // from the machine-wide phases, whose SocksPort was on loopback, and every application
+        // fetch failed with an empty reply while the relay was healthy).
+        let changed = std::fs::read(&self.torrc_path)
+            .map(|old| old != rendered.as_bytes())
+            .unwrap_or(false);
         write_atomic(&self.torrc_path, rendered.as_bytes()).map_err(|error| {
             ServiceError::Config(format!(
                 "'{}' could not be written: {error}",
@@ -244,7 +253,11 @@ impl Services for SystemdServices {
             ))
         })?;
 
-        self.supervisor.start(&self.unit)?;
+        if changed {
+            self.supervisor.restart(&self.unit)?;
+        } else {
+            self.supervisor.start(&self.unit)?;
+        }
         self.tor.wait_until_ready(self.budget)?;
         Ok(())
     }
@@ -734,6 +747,64 @@ mod tests {
         );
         assert!(text.contains("SocksPort 10.200.0.1:19050"), "{text}");
         assert!(!text.contains("0.0.0.0"), "{text}");
+    }
+
+    #[test]
+    fn app_scope_restarts_tor_when_the_listeners_move() {
+        let (address, cookie, _dir) = ready_control(0);
+        let tor = TorControl::new(address, cookie, Duration::from_secs(2));
+        let dir = TempDir::new("app-torrc-restart");
+        let torrc = dir.0.join("torrc");
+        let supervisor = Arc::new(crate::testing::MockSupervisor::new());
+        let services = SystemdServices::new(
+            supervisor.clone(),
+            tor,
+            "ghostnector-tor.service",
+            &torrc,
+            TorSettings::default(),
+            Duration::from_secs(2),
+        );
+        // Machine-wide first: the SOCKS and TransPort listeners are on loopback.
+        services
+            .bring_up(ProfileId::TorSystem, ports(), None, I2pPorts::default())
+            .expect("machine-wide services come up");
+        assert_eq!(supervisor.started().len(), 1, "the first apply starts Tor");
+        assert!(
+            supervisor.restarted().is_empty(),
+            "the first apply has no running instance to reload"
+        );
+        // APP scope moves the SOCKS listener to the core address the namespace relay dials. The
+        // running instance must be restarted, or it keeps listening on loopback and every
+        // application connection fails (D-53).
+        services
+            .bring_up(
+                ProfileId::TorApp,
+                ports(),
+                Some(std::net::Ipv4Addr::new(10, 200, 0, 1)),
+                I2pPorts::default(),
+            )
+            .expect("APP services come up");
+        assert_eq!(
+            supervisor.restarted().len(),
+            1,
+            "a changed torrc must restart the running instance"
+        );
+        let text = std::fs::read_to_string(&torrc).expect("torrc");
+        assert!(text.contains("SocksPort 10.200.0.1:19050"), "{text}");
+        // Applying the same profile again leaves the file unchanged, so nothing is restarted.
+        services
+            .bring_up(
+                ProfileId::TorApp,
+                ports(),
+                Some(std::net::Ipv4Addr::new(10, 200, 0, 1)),
+                I2pPorts::default(),
+            )
+            .expect("APP services come up again");
+        assert_eq!(
+            supervisor.restarted().len(),
+            1,
+            "an unchanged torrc must not restart the running instance"
+        );
     }
 
     #[test]

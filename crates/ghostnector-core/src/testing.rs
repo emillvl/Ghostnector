@@ -19,6 +19,7 @@ use crate::verify::Outcome;
 pub struct MockSupervisor {
     started: Mutex<Vec<String>>,
     stopped: Mutex<Vec<String>>,
+    restarted: Mutex<Vec<String>>,
 }
 
 impl MockSupervisor {
@@ -36,6 +37,11 @@ impl MockSupervisor {
     pub fn stopped(&self) -> Vec<String> {
         self.stopped.lock().expect("mock lock").clone()
     }
+
+    /// Units that were restarted, in order.
+    pub fn restarted(&self) -> Vec<String> {
+        self.restarted.lock().expect("mock lock").clone()
+    }
 }
 
 impl crate::supervisor::Supervisor for MockSupervisor {
@@ -49,6 +55,14 @@ impl crate::supervisor::Supervisor for MockSupervisor {
 
     fn stop(&self, unit: &str) -> Result<(), crate::supervisor::SupervisorError> {
         self.stopped
+            .lock()
+            .expect("mock lock")
+            .push(unit.to_string());
+        Ok(())
+    }
+
+    fn restart(&self, unit: &str) -> Result<(), crate::supervisor::SupervisorError> {
+        self.restarted
             .lock()
             .expect("mock lock")
             .push(unit.to_string());
