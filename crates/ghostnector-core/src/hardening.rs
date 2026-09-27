@@ -90,6 +90,24 @@ mod tests {
         }
     }
 
+    /// A managed router that ignores SIGTERM must not freeze the interface for the systemd default
+    /// of 90 s: two of three measured disconnects took the full default before the SIGKILL (D-51).
+    /// Both routers are clients with disposable state, so a bounded stop is safe.
+    #[test]
+    fn a_router_that_ignores_sigterm_does_not_freeze_the_interface() {
+        for unit in [
+            "systemd/ghostnector-tor.service",
+            "systemd/ghostnector-i2pd.service",
+        ] {
+            let text = packaging_file(unit);
+            assert_eq!(
+                line_value(&text, "TimeoutStopSec"),
+                Some("20"),
+                "{unit} must bound TimeoutStopSec (D-51)"
+            );
+        }
+    }
+
     /// The namespace helper's start can fail for a permanent reason; it must not restart forever.
     /// Before this bound existed it was observed restarting more than a thousand times in half an
     /// hour (D-33). The keys belong in `[Unit]`: systemd ignores them in `[Service]`, which is

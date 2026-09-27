@@ -188,12 +188,12 @@ echo "-- product resource use while protected and idle --"
 sample_resources() { # label
     local label="$1" i
     for i in $(seq 1 10); do
-        ps -eo comm=,rss=,pcpu= 2>/dev/null | grep -E 'ghostnector|^tor$' | awk -v l="$label" '{print l, $1, $2, $3}'
+        ps -eo comm=,rss=,pcpu= 2>/dev/null | grep -E '^ghostnector-(cor|net|app|dns)|^tor$' | awk -v l="$label" '{print l, $1, $2, $3}'
         sleep 1
     done
 }
 sample_resources product-idle >/tmp/gh-perf-res-product.txt
-awk '{sum[$2]+=$4; n[$2]++} END {for (c in sum) printf "product %s mean_rss_kb=%.0f mean_cpu_pct=%.2f\n", c, sum[c]/n[c], 0}' /tmp/gh-perf-res-product.txt | head -8
+awk '{sum[$2]+=$3; cpu[$2]+=$4; n[$2]++} END {for (c in sum) printf "product %s mean_rss_kb=%.0f mean_cpu_pct=%.2f\n", c, sum[c]/n[c], cpu[c]/n[c]}' /tmp/gh-perf-res-product.txt | head -8
 CPU_BEFORE="$(awk '{s+=$4} END {print s}' /tmp/gh-perf-res-product.txt)"
 note "product CPU percent samples summed: $CPU_BEFORE"
 
@@ -249,7 +249,7 @@ done | tee /tmp/gh-perf-baseline-throughput.txt
 BASELINE_THROUGHPUT="$(grep -v '^0$' /tmp/gh-perf-baseline-throughput.txt | median)"
 note "baseline Tor throughput median: ${BASELINE_THROUGHPUT} bytes/s"
 sample_resources baseline-idle >/tmp/gh-perf-res-baseline.txt
-awk '{sum[$2]+=$4; n[$2]++} END {for (c in sum) printf "baseline %s mean_rss_kb=%.0f\n", c, sum[c]/n[c]}' /tmp/gh-perf-res-baseline.txt | head -8
+awk '{sum[$2]+=$3; cpu[$2]+=$4; n[$2]++} END {for (c in sum) printf "baseline %s mean_rss_kb=%.0f mean_cpu_pct=%.2f\n", c, sum[c]/n[c], cpu[c]/n[c]}' /tmp/gh-perf-res-baseline.txt | head -8
 kill "$BASELINE_PID" 2>/dev/null || true
 pkill -x tor 2>/dev/null || true
 sleep 1
@@ -312,18 +312,25 @@ app_in_namespace() {
     return 1
 }
 for _ in 1 2 3; do
+    # A leftover application from the previous run must not count as this run's launch.
+    pkill -f gh-perf-app 2>/dev/null || true
+    for _ in $(seq 1 50); do app_in_namespace || break; sleep 0.2; done
     START="$(now)"
-    ( sleep 30 | "${CLI[@]}" run /usr/local/bin/gh-perf-app >/dev/null 2>&1 ) &
+    ( sleep 40 | "${CLI[@]}" run /usr/local/bin/gh-perf-app >/dev/null 2>&1 ) &
     RUN_PID=$!
-    for _ in $(seq 1 100); do
+    for _ in $(seq 1 300); do
         app_in_namespace && break
         sleep 0.1
     done
     END="$(now)"
-    python3 -c "print(f'app-scope launch {float('$END')-float('$START'):.3f}s')"
+    python3 - "$START" "$END" <<'PY'
+import sys
+print(f"app-scope launch {float(sys.argv[2]) - float(sys.argv[1]):.3f}s")
+PY
     kill "$RUN_PID" 2>/dev/null || true
     wait "$RUN_PID" 2>/dev/null || true
     pkill -f gh-perf-app 2>/dev/null || true
+    for _ in $(seq 1 50); do app_in_namespace || break; sleep 0.2; done
     sleep 1
 done
 "${CLI[@]}" disconnect >/dev/null 2>&1 || true

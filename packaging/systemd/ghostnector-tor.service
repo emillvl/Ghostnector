@@ -24,6 +24,11 @@ ProtectProc=invisible
 ProcSubset=pid
 ReadWritePaths=/var/lib/tor /run/ghostnector-tor
 StateDirectory=tor
+# Tor is a client with disposable state, and its shutdown can hang: two of three measured
+# disconnects took the systemd default of 90 s because SIGTERM was ignored until the SIGKILL. That
+# would freeze the interface in `applying` for 90 s. Bound the stop so the final reset happens after
+# 20 s instead (D-51).
+TimeoutStopSec=20
 Restart=on-failure
 RestartSec=3
 

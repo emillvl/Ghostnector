@@ -40,6 +40,9 @@ ProcSubset=pid
 # Its own data directory, and the configuration the control plane writes.
 ReadWritePaths=/var/lib/ghostnector-i2pd /run/ghostnector
 StateDirectory=ghostnector-i2pd
+# The router's shutdown can hang the same way Tor's does (observed: `stop-sigterm` timed out until
+# the SIGKILL); bound the stop so a hung router costs at most 20 s of the interface's time (D-51).
+TimeoutStopSec=20
 Restart=on-failure
 RestartSec=3
 

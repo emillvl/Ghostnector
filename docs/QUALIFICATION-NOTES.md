@@ -208,6 +208,28 @@ the user's application are children of the helper, so their `AF_INET` sockets fa
 `EAFNOSUPPORT`, the verification failed (correctly) and the engine removed every namespace. The unit
 now allows `AF_INET`/`AF_INET6`; the helper's own code still opens only unix and netlink sockets.
 
+## Performance qualification (installed, 2026-09-27)
+
+Method: the same machine, the same network, measured twice — through the product's transparent Tor
+path and through a standalone Tor instance started on the same VM for the baseline. Medians over
+repeated samples; every sample is in `perf-20260927T082830Z.log`.
+
+| Measurement | Product | Baseline Tor | Notes |
+|---|---|---|---|
+| Direct DNS (open) | 2.61 ms | — | the VM's own resolver |
+| DNS through the chokepoint | 158.3 ms | 287.5 ms (Tor `DNSPort`) | the chokepoint adds Tor's DNS path in both cases |
+| HTTP latency (checkip) | 1.469 s | 0.543 s | five samples each; the product path includes the transparent redirect |
+| Throughput (1 MB) | 390.8 kB/s | 436.1 kB/s | two samples each; ~10% below baseline on this VM |
+| Connect to return | 27.5–44.3 s | — | cold Tor bootstrap each run |
+| Return to `protected` after connect | 2.6–13.6 s | — | first verification through Tor |
+| Disconnect | 0.527 s normally; two of three run samples hit 90.5 s | — | the 90 s samples are D-51; bounded to 20 s from here |
+| APP-scope launch | 0.72 s / 0.94 s / 0.95 s (focused rerun) | direct launch 0.33 s | the run's own APP numbers were polluted by leftover processes and are superseded by the focused rerun |
+| Product idle cost while protected | netd 3.68 MB / 0.5%, core 3.19 MB / 0.5%, appd 2.68 MB / 0.2%, DNS relay 2.02 MB / 0.0% | — | 10 samples, 1 s apart, excluding Tor itself |
+
+The performance script's resource summary and APP-launch sampling were corrected after this run
+(the `ps` field/comm mismatch printed zero means, and a leftover application could satisfy the
+launch check); the table above uses the focused re-measurement.
+
 ## Leakage qualification (installed, far-side observation)
 
 Method: a host-side observer (outside the VM, reached through the NAT as `10.0.2.2`) listens on UDP
