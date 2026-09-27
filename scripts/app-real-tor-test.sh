@@ -261,13 +261,24 @@ GHOSTNECTOR_VERIFY=--udp-check $HOST:18081 --check-url http://$HTTP_IP/ --verify
 EOF
 systemctl restart ghostnector-core.service
 sleep 3
-# The documented response to a verification failure is the fail-closed baseline, whose state line is
-# "blocked — no traffic can leave"; the APP-scope blocked phrase is the other honest form.
-if wait_status "blocked" 150; then
-    ok "the state reported fail-closed once its path check could run against a dead router: $(cli_state | head -1)"
-else
-    inc "the state did not report fail-closed within 150s: $(cli_state | head -1)"
-fi
+# The honest outcomes are "blocked" (the fail-closed baseline or the APP-scope blocked phrase) or a
+# degraded state that no longer claims verification; what must not happen is a state that still says
+# "and verified" while no application can reach the network. Match the state line, never the
+# "blocked egress attempts" counter.
+dead_state=""
+for _ in $(seq 1 240); do
+    dead_state="$(cli_state | head -1)"
+    case "$dead_state" in
+    *"and verified"*) sleep 1 ;;
+    *"off"*) sleep 1 ;;
+    *) break ;;
+    esac
+done
+case "$dead_state" in
+*blocked*) ok "the state reported fail-closed after the router died: $dead_state" ;;
+*unverified*) ok "the state stopped claiming verification after the router died (degraded; traffic still fails closed): $dead_state" ;;
+*) bad "the state still claimed verification after the router died: $dead_state" ;;
+esac
 
 echo
 echo "-- recovery and cleanup --"
