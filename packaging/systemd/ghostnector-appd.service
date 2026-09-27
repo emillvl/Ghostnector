@@ -51,8 +51,12 @@ CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_CHOWN CAP_SETUID CAP_SETGI
 AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SETUID CAP_SETGID
 NoNewPrivileges=yes
 
-# It speaks netlink and unix sockets. It never opens an internet socket itself.
-RestrictAddressFamilies=AF_UNIX AF_NETLINK
+# The helper's own code speaks only netlink and unix sockets, but this restriction applies to the
+# whole unit tree: the verification probe and the user's application are children of this process
+# and must open AF_INET sockets inside their namespace (through the namespace's DNAT to the core's
+# transparent proxy). With AF_INET/6 excluded, every APP verification failed with EAFNOSUPPORT and
+# every launched application was unable to use the network at all (D-49).
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
 # `net` for the namespaces it owns; `mnt` for the launch helper's private mount namespace, which
 # bind-mounts each group's resolver configuration over /etc/resolv.conf.
 RestrictNamespaces=net mnt

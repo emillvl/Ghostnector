@@ -36,7 +36,12 @@ mod tests {
                 "CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SETUID CAP_SETGID",
             ),
             ("NoNewPrivileges", "yes"),
-            ("RestrictAddressFamilies", "AF_UNIX AF_NETLINK"),
+            // The probe and the user's application are children of this unit and need AF_INET;
+            // excluding it made every APP verification fail with EAFNOSUPPORT (D-49).
+            (
+                "RestrictAddressFamilies",
+                "AF_UNIX AF_NETLINK AF_INET AF_INET6",
+            ),
             ("RestrictNamespaces", "net mnt"),
             // `ip netns add` needs `mount --make-shared /run/netns`, and `mount` is not in
             // `@system-service`; without `@mount` every namespace creation failed with EPERM on

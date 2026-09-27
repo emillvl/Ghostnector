@@ -201,6 +201,13 @@ before it execs the user's shell (measured: `CapPrm=CapEff=CapAmb=0`), and the s
 shared by hand during the D-44 investigation. The hardening test now names the ambient set and
 refuses `CAP_CHOWN` ambient.
 
+**D-49** was the last link: with the launcher working, the group was still torn down within three
+seconds and no application could use the network. The helper's unit restricted address families to
+`AF_UNIX AF_NETLINK`, and systemd applies that to the whole unit tree — the verification probe and
+the user's application are children of the helper, so their `AF_INET` sockets failed with
+`EAFNOSUPPORT`, the verification failed (correctly) and the engine removed every namespace. The unit
+now allows `AF_INET`/`AF_INET6`; the helper's own code still opens only unix and netlink sockets.
+
 ## Leakage qualification (installed, far-side observation)
 
 Method: a host-side observer (outside the VM, reached through the NAT as `10.0.2.2`) listens on UDP
