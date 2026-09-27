@@ -491,7 +491,11 @@ fn write_fallback(path: &std::path::Path, script: &str, owner: u32) -> Result<()
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    let temporary = path.with_extension("nft.tmp");
+    // The temporary name is unique per write: two applies in flight must not share one temporary
+    // file, and a stale temporary from a crashed run must never be picked up.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temporary = path.with_extension(format!("nft.{}.{unique}.tmp", std::process::id()));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -583,12 +587,23 @@ mod tests {
     const TOR_UID: u32 = 987;
 
     fn config() -> Config {
+        // The fallback copy is per test: the default is the installed product's state directory, and
+        // a unit test must never write there (D-54 hygiene). The peer uid stays 1000 so the tests
+        // exercise the handover to a non-root identity.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let fallback = std::env::temp_dir().join(format!(
+            "ghostnector-netd-test-{}-{}.nft",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         match Config::parse(
             [
                 "--socket",
                 "/run/ghostnector/test.sock",
                 "--peer-uid",
                 "1000",
+                "--fallback-path",
+                fallback.to_str().expect("a UTF-8 temporary path"),
             ]
             .iter()
             .map(|value| value.to_string()),
