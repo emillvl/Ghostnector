@@ -474,10 +474,16 @@ impl<B: Backend + 'static, I: Identities + 'static> Server<B, I> {
 /// Keep a copy of a rendered policy where the boot guard can read it, and nowhere else.
 ///
 /// The file is written by this helper (root, but without any capability that bypasses file
-/// permissions) into its own state directory, then handed to the control plane's user with `chown`
-/// — the same handover as the socket, and the reason `CAP_CHOWN` is in this unit's bounding set.
-/// The boot guard runs as that user, so it can read the copy with only `CAP_NET_ADMIN` and no
-/// permission-bypassing capability (D-54). Mode `0600` keeps every other user out.
+/// permissions) into its own state directory, handed to the control plane's user with `chown` — the
+/// same handover as the socket, and the reason `CAP_CHOWN` is in this unit's bounding set — and put
+/// in place with `rename`. The boot guard runs as that user, so it can read the copy with only
+/// `CAP_NET_ADMIN` and no permission-bypassing capability (D-54). Mode `0600` keeps every other user
+/// out.
+///
+/// Writing the target in place would fail on the second apply: after the handover the file belongs
+/// to the control plane's user, and this helper deliberately cannot override file permissions.
+/// `rename` needs write permission on the *directory* instead, and that directory is this helper's
+/// own root-owned state directory.
 fn write_fallback(path: &std::path::Path, script: &str, owner: u32) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -485,19 +491,21 @@ fn write_fallback(path: &std::path::Path, script: &str, owner: u32) -> Result<()
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
+    let temporary = path.with_extension("nft.tmp");
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(path)
-        .map_err(|error| error.to_string())?;
+        .open(&temporary)
+        .map_err(|error| format!("'{}': {error}", temporary.display()))?;
     file.write_all(script.as_bytes())
         .map_err(|error| error.to_string())?;
     file.sync_all().map_err(|error| error.to_string())?;
     drop(file);
-    nix::unistd::chown(path, Some(nix::unistd::Uid::from_raw(owner)), None)
+    nix::unistd::chown(&temporary, Some(nix::unistd::Uid::from_raw(owner)), None)
         .map_err(|error| format!("the copy could not be handed to uid {owner}: {error}"))?;
+    std::fs::rename(&temporary, path).map_err(|error| format!("'{}': {error}", path.display()))?;
     Ok(())
 }
 

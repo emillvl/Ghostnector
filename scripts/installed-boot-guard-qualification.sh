@@ -52,7 +52,12 @@ mode="${1:-}"
 cli_state() { "${CLI[@]}" status 2>&1; }
 wait_status() { local i; for i in $(seq 1 "$2"); do cli_state | head -1 | grep -q "$1" && return 0; sleep 1; done; return 1; }
 guard_status() { systemctl show ghostnector-bootguard.service -p ExecMainStatus --value; }
-guard_message() { journalctl -b -u ghostnector-bootguard.service --no-pager 2>/dev/null | tail -3; }
+guard_message() {
+    # The program's own lines (journald prefixes them with the unit name); the systemd "Finished"
+    # line says nothing about what the guard did.
+    journalctl -b -u ghostnector-bootguard.service --no-pager 2>/dev/null |
+        grep -v "systemd\[1\]" | tail -5
+}
 
 case "$mode" in
 prepare)
