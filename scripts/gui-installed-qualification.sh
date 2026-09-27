@@ -136,8 +136,27 @@ ui_labels() { atspi labels; }
 shot() { import -window root "$SHOTS/$1.png" 2>/dev/null; }
 key() { xdotool key --clearmodifiers "$@"; sleep 0.4; }
 focus_gui() { wmctrl -a Ghostnector 2>/dev/null || true; sleep 0.4; }
+gui_alive() { pgrep -f '/usr/bin/ghostnector-gui' >/dev/null 2>&1; }
+start_gui() {
+    BUS="$(dbus-daemon --session --fork --print-address 2>/dev/null)"
+    setsid nohup runuser -u "$GUI_USER" -- bash -c "env DISPLAY=:90 HOME=/home/ghost \
+        DBUS_SESSION_BUS_ADDRESS='$BUS' XDG_RUNTIME_DIR=/run/user/1000 \
+        GSK_RENDERER=cairo GDK_BACKEND=x11 /usr/bin/ghostnector-gui; \
+        echo gui-exit=\$? at \$(date -u)" </dev/null >>"$SHOTS/gui-stdout.log" 2>&1 &
+    for _ in $(seq 1 40); do wmctrl -l 2>/dev/null | grep -q Ghostnector && break; sleep 0.5; done
+}
+ensure_gui() {
+    if gui_alive; then
+        return 0
+    fi
+    note "the window process is gone; restarting it (its output is in $SHOTS/gui-stdout.log)"
+    pkill -f '/usr/bin/ghostnector-gui' 2>/dev/null || true
+    start_gui
+    gui_alive
+}
 
 protection_on() {
+    ensure_gui
     focus_gui
     wait_not_applying 90
     ui_click Protection >/dev/null 2>&1 || true
@@ -147,8 +166,13 @@ protection_on() {
         ui_click Protection >/dev/null 2>&1 || true
         sleep 1
     fi
+    if off_now; then
+        note "the switch click did not take; using the keyboard path"
+        focus_by_tab Protection >/dev/null 2>&1 && { xdotool key --clearmodifiers space; sleep 1; }
+    fi
 }
 protection_off() {
+    ensure_gui
     focus_gui
     wait_not_applying 90
     ui_click Protection >/dev/null 2>&1 || true
@@ -157,6 +181,10 @@ protection_off() {
         note "the first switch activation did not take; trying once more"
         ui_click Protection >/dev/null 2>&1 || true
         sleep 1
+    fi
+    if ! off_now; then
+        note "the switch click did not take; using the keyboard path"
+        focus_by_tab Protection >/dev/null 2>&1 && { xdotool key --clearmodifiers space; sleep 1; }
     fi
 }
 diag_copy() {
@@ -239,18 +267,14 @@ setsid nohup runuser -u "$GUI_USER" -- env DISPLAY=:90 HOME=/home/ghost \
     xfwm4 --compositor=off </dev/null >/tmp/gui-xfwm4.log 2>&1 &
 sleep 2
 # One session bus shared by the window and the AT-SPI driver; without it GApplication never reaches
-# activate and the window is never mapped.
-BUS="$(dbus-daemon --session --fork --print-address 2>/dev/null)"
-if [ -z "$BUS" ]; then bad "no session bus"; else ok "session bus: ${BUS%%guid=*}"; fi
-setsid nohup runuser -u "$GUI_USER" -- env DISPLAY=:90 HOME=/home/ghost \
-    DBUS_SESSION_BUS_ADDRESS="$BUS" XDG_RUNTIME_DIR=/run/user/1000 \
-    GSK_RENDERER=cairo GDK_BACKEND=x11 /usr/bin/ghostnector-gui \
-    </dev/null >/tmp/gui-stdout.log 2>&1 &
-for _ in $(seq 1 40); do wmctrl -l 2>/dev/null | grep -q Ghostnector && break; sleep 0.5; done
+# activate and the window is never mapped. start_gui records the window's exit status in the
+# durable shots directory, so a window that dies mid-run leaves its reason behind.
+start_gui
+if [ -n "$BUS" ]; then ok "session bus: ${BUS%%guid=*}"; else bad "no session bus"; fi
 if wmctrl -l 2>/dev/null | grep -q Ghostnector; then
     ok "the window is on screen ($(wmctrl -l | grep Ghostnector | head -1 | cut -c1-60))"
 else
-    bad "the GUI window never appeared; stdout: $(head -3 /tmp/gui-stdout.log)"
+    bad "the GUI window never appeared; output: $(tail -3 "$SHOTS/gui-stdout.log" 2>/dev/null)"
 fi
 atspi wait Ghostnector 20 >/dev/null 2>&1 && ok "the window is visible to AT-SPI" || bad "AT-SPI cannot see the window"
 
@@ -362,6 +386,7 @@ shot gui-03-protected
 # ---------------------------------------------------------------- T4: selection changes are confirmed
 echo
 echo "-- T4: changing the selection while protected asks first --"
+ensure_gui
 dialog_open() { ui_labels | grep -q "Change what is protected"; }
 wait_dialog_gone() { local i; for i in $(seq 1 40); do dialog_open || return 0; sleep 0.25; done; return 1; }
 ui_click I2P >/dev/null 2>&1 || bad "could not select I2P while protected"
@@ -407,6 +432,7 @@ fi
 # ---------------------------------------------------------------- T5: the APP lifecycle
 echo
 echo "-- T5: selected applications: add, run, list, stop --"
+ensure_gui
 cat >/usr/local/bin/gh-qual-app <<'EOF'
 #!/bin/sh
 sleep 600
@@ -467,6 +493,7 @@ echo "apps after stop: $APPS"
 # ---------------------------------------------------------------- T6: panic behind a confirmation
 echo
 echo "-- T6: panic needs the menu and a confirmation --"
+ensure_gui
 focus_gui
 if focus_by_tab "More actions"; then
     key space
@@ -511,6 +538,7 @@ nft list table inet ghostnector >/dev/null 2>&1 && bad "a table survived the pan
 # ---------------------------------------------------------------- T7: core restart and reconnect
 echo
 echo "-- T7: the window survives a core restart and reconnects --"
+ensure_gui
 systemctl stop ghostnector-core.service
 for _ in $(seq 1 60); do systemctl is-active --quiet ghostnector-core.service || break; sleep 1; done
 sleep 1
@@ -571,6 +599,7 @@ wait_off 60 && ok "the machine returned to off after the helper test" || bad "no
 # ---------------------------------------------------------------- T9: a clean stand-down
 echo
 echo "-- T9: the window leaves the machine open and off --"
+ensure_gui
 DIAG="$(diag_copy)"
 case "$DIAG" in
 *"state: off"*) ok "the window reports the final off state" ;;
