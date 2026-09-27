@@ -283,3 +283,35 @@ have to re-derive them:
    has been processed; destroying it inside its own close handler makes X11 report `BadDrawable`.
    With a window manager and the real `WM_DELETE_WINDOW` path, closing diagnostics leaves the
    application running (proved on the VM).
+
+---
+
+## Decisions taken during the qualification campaign (M10 + full release)
+
+These were forced by installed-product defects found while qualifying. Each preserves the M1–M9
+boundaries; the alternatives that would have widened them were rejected and are recorded in the
+defect ledger (`docs/ADVERSARIAL-TEST-PLAN.md`, D-40…D-46).
+
+1. **I2P bring-up order (D-41).** The I2P profile — itself a deny-everything-except-the-router
+   policy — is applied *before* the router starts, because the router resolves its reseed hosts by
+   name and the fail-closed baseline (correctly) exempts only Tor's uid. At the moment the profile
+   lands, the exemption belongs to a process that does not exist yet and everything else stays
+   denied, so deny-first is preserved. The rejected alternative was adding the I2P uid to the
+   baseline; that would have widened the blocked-machine policy and contradicted PC-22's
+   mutually-exclusive exemption model.
+2. **The router resolves from its own uid (D-42).** The engine discovers the machine's real upstream
+   nameservers and writes `/run/ghostnector/i2pd-resolv.conf` plus a minimal nsswitch; the i2pd unit
+   bind-mounts them over `/etc/resolv.conf` and `/etc/nsswitch.conf`. Name resolution therefore
+   happens under the one identity I2P mode exempts. No exemption was added, and no other process can
+   use those files. A Tor→I2P switch also restores the machine's resolver first, because I2P starts
+   no chokepoint (D-43).
+3. **The APP helper's sandbox names the syscalls and capabilities its job needs (D-44, D-46).**
+   `@mount` is allowed because `ip netns add` must make `/run/netns` shared so a named namespace can
+   persist; `CAP_SETUID`/`CAP_SETGID` are allowed because the launcher drops to the invoking user.
+   Both were previously blocked by a filter/bounding set that the source-tree suites never applied;
+   the appd hardening test now names the complete allowed set and refuses anything else. The
+   unit keeps `NoNewPrivileges`, its syscall filter, and no `CAP_DAC_OVERRIDE`.
+4. **The group session socket is reachable by its user (D-45).** `/run/ghostnector/apps` is
+   `0710 root:ghostnector` (traversable by the accounts that may control Ghostnector, not listable);
+   each socket stays `0600` owned by the invoking user and the launcher's peer check still decides
+   who may use it.
