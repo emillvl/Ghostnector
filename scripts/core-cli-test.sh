@@ -247,6 +247,7 @@ sleep 0.3
 
 start_stack() {
     in_ns "$BINDIR/ghostnector-netd" --socket "$RUNDIR/netd.sock" --peer-uid "$CORE_UID" \
+        --fallback-path "$WORKDIR/fail-closed.nft" \
         >/tmp/gh-netd-stack.log 2>&1 &
     NETD_PID=$!
     wait_for_socket "$RUNDIR/netd.sock" || fail "the helper did not start"

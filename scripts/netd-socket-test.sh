@@ -1,7 +1,7 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 #
 # Exercises the privileged helper end to end: socket ownership, peer credentials, the closed verb
-# set, and a real nftables apply/revert — all inside a throwaway network namespace, so nothing the
+# set, and a real nftables apply/revert â€” all inside a throwaway network namespace, so nothing the
 # host depends on is touched.
 #
 #   scripts/netd-socket-test.sh <path-to-ghostnector-netd>
@@ -25,6 +25,10 @@ SOCK="$RUNDIR/netd.sock"
 CAPDIR="/run/ghostnector-cap"
 SOCK_PACKAGED="$CAPDIR/netd-packaged.sock"
 SOCK_NOCHOWN="$CAPDIR/netd-nochown.sock"
+# The helper keeps a copy of the fail-closed policy for the boot guard; this test must keep its own
+# (D-54: it used the default, which is the installed product's state directory, and overwrote it
+# with the test peer as the owner).
+FALLBACK="$CAPDIR/fail-closed.nft"
 PEER_USER="ghostnector-core"
 OUTSIDER_USER="ghostnector-outsider"
 CLIENT="/tmp/gh-netd-client.py"
@@ -117,7 +121,7 @@ for label, request in (
 PY
 
 # ---------------------------------------------------------------- start the helper
-ip netns exec "$NS" "$NETD" --socket "$SOCK" --peer-uid "$PEER_UID" >"$LOG" 2>&1 &
+ip netns exec "$NS" "$NETD" --socket "$SOCK" --peer-uid "$PEER_UID" --fallback-path "$FALLBACK" >"$LOG" 2>&1 &
 NETD_PID=$!
 for _ in $(seq 1 50); do
     [ -S "$SOCK" ] && break
@@ -204,7 +208,7 @@ rm -f "$SOCK_PACKAGED" "$SOCK_NOCHOWN"
 ip netns exec "$NS" setpriv --reuid=0 --regid=0 --clear-groups \
     --bounding-set=-all,+net_admin,+chown \
     --inh-caps +net_admin --ambient-caps +net_admin \
-    "$NETD" --socket "$SOCK_PACKAGED" --peer-uid "$PEER_UID" >/tmp/gh-netd-packaged.log 2>&1 &
+    "$NETD" --socket "$SOCK_PACKAGED" --peer-uid "$PEER_UID" --fallback-path "$FALLBACK" >/tmp/gh-netd-packaged.log 2>&1 &
 PACKAGED_PID=$!
 for _ in $(seq 1 50); do
     [ -S "$SOCK_PACKAGED" ] && break
@@ -236,7 +240,7 @@ set +e
 timeout 10 ip netns exec "$NS" setpriv --reuid=0 --regid=0 --clear-groups \
     --bounding-set=-all,+net_admin \
     --inh-caps +net_admin --ambient-caps +net_admin \
-    "$NETD" --socket "$SOCK_NOCHOWN" --peer-uid "$PEER_UID" >/tmp/gh-netd-nochown.log 2>&1
+    "$NETD" --socket "$SOCK_NOCHOWN" --peer-uid "$PEER_UID" --fallback-path "$FALLBACK" >/tmp/gh-netd-nochown.log 2>&1
 RC=$?
 set -e
 [ "$RC" != "0" ] && [ "$RC" != "124" ] ||
@@ -249,3 +253,4 @@ ok "without CAP_CHOWN the handoff fails closed (EPERM) with the socket already r
 rm -f "$SOCK_NOCHOWN"
 
 echo "PASS: netd socket"
+
