@@ -34,13 +34,15 @@ ExecStart=/usr/libexec/ghostnector-appd \
 #   * links, addresses, routes, bridge membership and per-namespace sysctls need CAP_NET_ADMIN;
 #   * handing the socket to the control plane's uid needs CAP_CHOWN (the mode is set before the
 #     chown, so CAP_FOWNER is not needed and the socket is never briefly peer-owned with a
-#     permissive mode).
+#     permissive mode);
+#   * the launcher drops to the invoking user with setgroups/setgid/setuid, which need CAP_SETGID
+#     and CAP_SETUID (D-46); those are used for that one transition and nothing else.
 # The helper runs as root, so the bounding set above is also the permitted and effective set
 # (measured on the installed machine: cap_chown,cap_sys_admin,cap_net_admin+ep). Only
 # CAP_NET_ADMIN is ambient, so the tools this helper runs (`ip`, `bridge`, `nft`) never inherit
 # CAP_SYS_ADMIN or CAP_CHOWN. There is no `KeepCapabilities=` directive in systemd; an earlier
 # revision of this unit named one, and systemd ignored it (D-36).
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_CHOWN
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_CHOWN CAP_SETUID CAP_SETGID
 AmbientCapabilities=CAP_NET_ADMIN
 NoNewPrivileges=yes
 

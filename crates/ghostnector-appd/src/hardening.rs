@@ -28,7 +28,8 @@ mod tests {
         let expected = [
             (
                 "CapabilityBoundingSet",
-                "CAP_NET_ADMIN CAP_SYS_ADMIN CAP_CHOWN",
+                // Dropping to the invoking user needs CAP_SETUID/CAP_SETGID (D-46).
+                "CAP_NET_ADMIN CAP_SYS_ADMIN CAP_CHOWN CAP_SETUID CAP_SETGID",
             ),
             ("AmbientCapabilities", "CAP_NET_ADMIN"),
             ("NoNewPrivileges", "yes"),
@@ -65,9 +66,15 @@ mod tests {
             problems.push("the unit does not name the launch helper".to_string());
         }
 
-        // The bounding set may contain exactly the three capabilities the design names. Anything
-        // else would be a widening that a review must see.
-        let allowed = ["CAP_NET_ADMIN", "CAP_SYS_ADMIN", "CAP_CHOWN"];
+        // The bounding set may contain exactly the capabilities the design names. Anything else
+        // would be a widening that a review must see.
+        let allowed = [
+            "CAP_NET_ADMIN",
+            "CAP_SYS_ADMIN",
+            "CAP_CHOWN",
+            "CAP_SETUID",
+            "CAP_SETGID",
+        ];
         if let Some(line) = line_value(text, "CapabilityBoundingSet") {
             for capability in line.split_whitespace() {
                 if !allowed.contains(&capability) {
