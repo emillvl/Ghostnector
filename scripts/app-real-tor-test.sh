@@ -261,10 +261,12 @@ GHOSTNECTOR_VERIFY=--udp-check $HOST:18081 --check-url http://$HTTP_IP/ --verify
 EOF
 systemctl restart ghostnector-core.service
 sleep 3
-if wait_status "no protected application can reach the network" 150; then
-    ok "the APP scope failed closed once its path check could run against a dead router"
+# The documented response to a verification failure is the fail-closed baseline, whose state line is
+# "blocked — no traffic can leave"; the APP-scope blocked phrase is the other honest form.
+if wait_status "blocked" 150; then
+    ok "the state reported fail-closed once its path check could run against a dead router: $(cli_state | head -1)"
 else
-    inc "the APP scope did not report fail-closed within 150s: $(cli_state | head -1)"
+    inc "the state did not report fail-closed within 150s: $(cli_state | head -1)"
 fi
 
 echo
