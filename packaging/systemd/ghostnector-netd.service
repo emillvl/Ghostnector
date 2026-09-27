@@ -45,6 +45,11 @@ PrivateTmp=yes
 PrivateDevices=yes
 ProtectProc=invisible
 ProcSubset=pid
+# The fallback policy file lives here, and core writes its journal here too; systemd creates the
+# directory before the unit's namespaces are set up, so netd can never race core for it. Without
+# this, the first start after a fresh install failed with `226/NAMESPACE` because nothing had
+# created `/var/lib/ghostnector` yet and `ReadWritePaths=` requires it to exist (D-52).
+StateDirectory=ghostnector
 ReadWritePaths=/run/ghostnector /var/lib/ghostnector
 
 Restart=on-failure

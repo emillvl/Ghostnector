@@ -90,6 +90,49 @@ mod tests {
         }
     }
 
+    /// D-52: a `ReadWritePaths=` entry under `/var/lib` must be created before the unit starts.
+    /// `StateDirectory=` is the mechanism (systemd creates it as part of the unit's setup);
+    /// otherwise nothing creates it on a fresh install and the unit fails with `226/NAMESPACE`.
+    /// netd raced core for `/var/lib/ghostnector` on the first start after an install.
+    #[test]
+    fn every_state_directory_a_unit_writes_is_created_before_the_unit_starts() {
+        let created = tmpfiles_directories();
+        let units = [
+            "ghostnector-netd.service",
+            "ghostnector-core.service",
+            "ghostnector-appd.service",
+            "ghostnector-tor.service",
+            "ghostnector-bootguard.service",
+        ];
+        for unit in units {
+            let text = packaging_file(&format!("systemd/{unit}"));
+            let states: Vec<String> = text
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix("StateDirectory="))
+                .flat_map(str::split_whitespace)
+                .map(|name| format!("/var/lib/{name}"))
+                .collect();
+            for line in text.lines().map(str::trim) {
+                let Some(value) = line.strip_prefix("ReadWritePaths=") else {
+                    continue;
+                };
+                for entry in value.split_whitespace() {
+                    let path = entry.strip_prefix('-').unwrap_or(entry);
+                    if !path.starts_with("/var/lib/") {
+                        continue;
+                    }
+                    assert!(
+                        states.iter().any(|state| state == path)
+                            || created.iter().any(|candidate| candidate == path),
+                        "{unit} lists ReadWritePaths={path}, but neither its StateDirectory= nor a \
+                         tmpfiles entry creates it; on a fresh install the unit fails with \
+                         226/NAMESPACE (D-52)"
+                    );
+                }
+            }
+        }
+    }
+
     /// A managed router that ignores SIGTERM must not freeze the interface for the systemd default
     /// of 90 s: two of three measured disconnects took the full default before the SIGKILL (D-51).
     /// Both routers are clients with disposable state, so a bounded stop is safe.
