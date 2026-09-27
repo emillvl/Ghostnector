@@ -33,7 +33,11 @@ mod tests {
             ("RestrictNamespaces", "yes"),
             ("SystemCallFilter", "@system-service"),
             ("ProtectSystem", "strict"),
-            ("ReadWritePaths", "/run/ghostnector /var/lib/ghostnector"),
+            (
+                "ReadWritePaths",
+                "/run/ghostnector /var/lib/ghostnector-netd",
+            ),
+            ("StateDirectory", "ghostnector-netd"),
         ];
         for (key, value) in expected {
             match line_value(text, key) {
@@ -41,6 +45,15 @@ mod tests {
                 Some(found) => problems.push(format!("{key} is '{found}', expected '{value}'")),
                 None => problems.push(format!("{key} is missing")),
             }
+        }
+        // The control plane owns /var/lib/ghostnector; this helper must not touch it. Sharing it
+        // was the latent ownership fight (and part of D-54): netd runs as root, so systemd would
+        // hand the directory to root on its next start while the core was writing its journal.
+        if text.contains("/var/lib/ghostnector ") || text.contains("=/var/lib/ghostnector\n") {
+            problems.push(
+                "the unit must not use the control plane's /var/lib/ghostnector directory"
+                    .to_string(),
+            );
         }
         if !text.contains("/usr/libexec/ghostnector-netd") {
             problems.push("the unit does not start the helper from /usr/libexec".to_string());

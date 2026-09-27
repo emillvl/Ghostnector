@@ -30,7 +30,7 @@ use ghostnector_spec::ipc::{HelperResponse, PROTOCOL_VERSION};
 
 const DEFAULT_NETD: &str = "/run/ghostnector/netd/netd.sock";
 const DEFAULT_INTENT: &str = "/var/lib/ghostnector/intent.json";
-const DEFAULT_FALLBACK: &str = "/var/lib/ghostnector/fail-closed.nft";
+const DEFAULT_FALLBACK: &str = "/var/lib/ghostnector-netd/fail-closed.nft";
 const DEFAULT_CMDLINE: &str = "/proc/cmdline";
 const DEFAULT_NFT: &str = "/usr/sbin/nft";
 const DEFAULT_WAIT_SECONDS: u64 = 15;
@@ -66,7 +66,7 @@ OPTIONS:
     --intent <PATH>      the journal that records what the user asked for
                                           [default: /var/lib/ghostnector/intent.json]
     --fallback <PATH>    a copy of the fail-closed policy, for when the helper is
-                           not available [default: /var/lib/ghostnector/fail-closed.nft]
+                           not available [default: /var/lib/ghostnector-netd/fail-closed.nft]
     --nft <PATH>         the policy tool used for that copy
                                                   [default: /usr/sbin/nft]
     --cmdline <PATH>     where the kernel command line can be read

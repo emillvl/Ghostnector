@@ -20,7 +20,11 @@ pub const DEFAULT_CONNTRACK: &str = "/usr/sbin/conntrack";
 /// Where a copy of the fail-closed policy is kept, so the boot guard can apply it when this helper
 /// is not available. It is this helper's own rendered output, written by root and readable only by
 /// root.
-pub const DEFAULT_FALLBACK: &str = "/var/lib/ghostnector/fail-closed.nft";
+/// Where the fail-closed copy the boot guard applies lives. It is netd's own state directory
+/// (root-owned, because netd runs as root), not the control plane's: the helper must be able to
+/// write it without a capability that bypasses file permissions, and it hands the finished file to
+/// the control plane's user, which is the identity the boot guard runs as (D-54).
+pub const DEFAULT_FALLBACK: &str = "/var/lib/ghostnector-netd/fail-closed.nft";
 
 /// Default system user Tor runs as on Debian and Ubuntu.
 pub const DEFAULT_TOR_USER: &str = "debian-tor";
@@ -149,7 +153,7 @@ OPTIONS:
     --conntrack <PATH>     conntrack tool              [default: /usr/sbin/conntrack]
     --fallback-path <PATH> where to keep a copy of the fail-closed policy, for the
                            boot guard to apply if this helper is unavailable
-                                       [default: /var/lib/ghostnector/fail-closed.nft]
+                                       [default: /var/lib/ghostnector-netd/fail-closed.nft]
     --tor-user <NAME>      system user Tor runs as     [default: debian-tor]
     --dnscrypt-user <NAME> system user the resolver runs as
                                                       [default: dnscrypt-proxy]

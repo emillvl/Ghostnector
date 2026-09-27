@@ -84,6 +84,7 @@ done
 ok "no packaged file survived the uninstall"
 [ -d /run/ghostnector ] && bad "/run/ghostnector survived the uninstall" || ok "/run/ghostnector is gone"
 [ -d /var/lib/ghostnector ] && bad "/var/lib/ghostnector survived the uninstall" || ok "/var/lib/ghostnector is gone"
+[ -d /var/lib/ghostnector-netd ] && bad "/var/lib/ghostnector-netd survived the uninstall" || ok "/var/lib/ghostnector-netd is gone"
 [ -d /etc/ghostnector ] && bad "/etc/ghostnector survived the uninstall" || ok "/etc/ghostnector is gone"
 [ -d /usr/share/doc/ghostnector ] && bad "/usr/share/doc/ghostnector survived the uninstall" || ok "the installed docs are gone"
 nft list table inet ghostnector >/dev/null 2>&1 && bad "the policy table survived the uninstall" || ok "no policy table after the uninstall"

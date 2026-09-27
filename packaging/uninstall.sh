@@ -40,7 +40,7 @@ rm -f /usr/share/polkit-1/rules.d/50-ghostnector.rules
 rm -f /usr/share/polkit-1/rules.d/51-ghostnector-resolved.rules
 rm -f /usr/share/applications/ghostnector.desktop
 rm -f /usr/share/icons/hicolor/scalable/apps/ghostnector.svg
-rm -rf /var/lib/ghostnector /run/ghostnector /etc/ghostnector /usr/share/doc/ghostnector
+rm -rf /var/lib/ghostnector /var/lib/ghostnector-netd /run/ghostnector /etc/ghostnector /usr/share/doc/ghostnector
 
 systemctl daemon-reload
 systemctl reset-failed ghostnector-core.service ghostnector-netd.service ghostnector-appd.service \

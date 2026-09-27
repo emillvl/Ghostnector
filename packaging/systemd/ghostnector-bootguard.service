@@ -12,12 +12,19 @@ Wants=network-pre.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# It runs as the control plane's own user: netd hands both its socket and the fail-closed copy to
+# that user, so the guard can reach them with no capability that bypasses file permissions. It needs
+# exactly one capability, NET_ADMIN, to apply the ruleset with nft.
+User=ghostnector
+Group=ghostnector
 ExecStart=/usr/libexec/ghostnector-bootguard \
     --netd /run/ghostnector/netd/netd.sock \
     --intent /var/lib/ghostnector/intent.json \
-    --fallback /var/lib/ghostnector/fail-closed.nft
+    --fallback /var/lib/ghostnector-netd/fail-closed.nft
 
-# It may apply the helper's own copy of the policy, so it needs the capability to do that.
+# It may apply the helper's own copy of the policy, so it needs the capability to do that - and
+# nothing else. In particular there is no CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH: the files it
+# reads are owned by the user it runs as (D-54).
 CapabilityBoundingSet=CAP_NET_ADMIN
 AmbientCapabilities=CAP_NET_ADMIN
 NoNewPrivileges=yes
@@ -29,11 +36,8 @@ ProtectHome=yes
 PrivateTmp=yes
 ProtectProc=invisible
 ProcSubset=pid
-# The journal and the fallback policy live here; systemd creates the directory as part of this
-# unit's setup, so the boot guard cannot fail with 226/NAMESPACE when the directory is missing on a
-# fresh install (the same class as D-52).
-StateDirectory=ghostnector
-ReadWritePaths=/run/ghostnector /var/lib/ghostnector
+# The guard only reads (the intent, the copy, the helper's socket); it writes nothing, so it has no
+# state directory and no writable path at all.
 
 [Install]
 WantedBy=sysinit.target

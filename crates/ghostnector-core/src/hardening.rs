@@ -553,4 +553,67 @@ ExecStart=/usr/bin/i2pd --conf=/run/ghostnector/i2pd.conf
             "{problems:?}"
         );
     }
+
+    /// D-54: the boot guard must reach the helper's socket and the fail-closed copy with nothing but
+    /// NET_ADMIN. It runs as the control plane's own user, to which netd hands both files, so the
+    /// unit carries no capability that bypasses file permissions; and it writes nothing, so it needs
+    /// no state directory and no writable path.
+    #[test]
+    fn the_boot_guard_reaches_the_helper_and_the_copy_with_only_net_admin() {
+        let text = packaging_file("systemd/ghostnector-bootguard.service");
+        let value = |key: &str| {
+            text.lines()
+                .map(str::trim)
+                .find_map(|line| line.strip_prefix(&format!("{key}=")))
+        };
+        assert_eq!(value("User"), Some("ghostnector"), "{text}");
+        assert_eq!(value("Group"), Some("ghostnector"), "{text}");
+        assert_eq!(
+            value("CapabilityBoundingSet"),
+            Some("CAP_NET_ADMIN"),
+            "{text}"
+        );
+        assert_eq!(
+            value("AmbientCapabilities"),
+            Some("CAP_NET_ADMIN"),
+            "{text}"
+        );
+        assert_eq!(value("NoNewPrivileges"), Some("yes"), "{text}");
+        assert!(
+            value("StateDirectory").is_none(),
+            "the guard writes nothing and needs no state directory: {text}"
+        );
+        assert!(
+            value("ReadWritePaths").is_none(),
+            "the guard writes nothing and needs no writable path: {text}"
+        );
+        // The two capability directives are pinned exactly above; nothing else in the unit may add
+        // one. (Comments may *name* the capabilities this unit deliberately does not carry.)
+        for key in [
+            "CapabilityBoundingSet",
+            "AmbientCapabilities",
+            "User",
+            "Group",
+        ] {
+            let count = text
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with(&format!("{key}=")))
+                .count();
+            assert_eq!(count, 1, "{key} must appear exactly once: {text}");
+        }
+        assert!(
+            text.contains("--fallback /var/lib/ghostnector-netd/fail-closed.nft"),
+            "the guard must read the copy from the helper's own state directory: {text}"
+        );
+        // The helper hands the socket and the copy to the same user the guard runs as, and it keeps
+        // its own state directory rather than the control plane's.
+        let netd = packaging_file("systemd/ghostnector-netd.service");
+        assert!(netd.contains("--peer-user ghostnector"), "{netd}");
+        assert!(netd.contains("StateDirectory=ghostnector-netd"), "{netd}");
+        assert!(
+            netd.contains("--fallback-path /var/lib/ghostnector-netd/fail-closed.nft"),
+            "{netd}"
+        );
+    }
 }

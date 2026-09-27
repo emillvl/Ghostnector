@@ -308,15 +308,31 @@ impl<B: Backend + 'static, I: Identities + 'static> Server<B, I> {
             ));
         }
 
-        // Keep a copy of the fail-closed policy where the boot guard can reach it. This is the one
-        // place a second writer is tolerated, and it is this helper's own rendered output: if this
-        // process is ever unavailable at boot, the machine can still deny everything.
-        if profile == ProfileId::FailClosed {
-            if let Err(reason) = write_fallback(&self.config.fallback_path, &script) {
-                notes.push(format!(
-                    "a copy of the fail-closed policy could not be kept for the boot guard: {reason}"
-                ));
+        // Keep a fresh copy of the fail-closed policy where the boot guard can reach it. This is
+        // the one place a second writer is tolerated, and it is this helper's own rendered output:
+        // if this process is ever unavailable at boot, the machine can still deny everything.
+        //
+        // It is written on *every* apply, not only a fail-closed one (D-54): a fresh install's
+        // first protected session must leave the copy behind for the next boot, and a copy that is
+        // only written when something has already gone wrong is a copy that may not exist when the
+        // guard needs it. The file is handed to the control plane's user, because that is the
+        // identity the boot guard runs as and it must read the copy without any capability that
+        // bypasses file permissions.
+        match compile(ProfileId::FailClosed, params, &environment) {
+            Ok(fail_closed) => {
+                let fallback = render_replace_script(&fail_closed.ruleset);
+                if let Err(reason) =
+                    write_fallback(&self.config.fallback_path, &fallback, self.config.peer_uid)
+                {
+                    notes.push(format!(
+                        "a copy of the fail-closed policy could not be kept for the boot guard: \
+                         {reason}"
+                    ));
+                }
             }
+            Err(error) => notes.push(format!(
+                "a copy of the fail-closed policy could not be rendered for the boot guard: {error}"
+            )),
         }
 
         {
@@ -455,8 +471,14 @@ impl<B: Backend + 'static, I: Identities + 'static> Server<B, I> {
     }
 }
 
-/// Keep a copy of a rendered policy where only root can read it.
-fn write_fallback(path: &std::path::Path, script: &str) -> Result<(), String> {
+/// Keep a copy of a rendered policy where the boot guard can read it, and nowhere else.
+///
+/// The file is written by this helper (root, but without any capability that bypasses file
+/// permissions) into its own state directory, then handed to the control plane's user with `chown`
+/// — the same handover as the socket, and the reason `CAP_CHOWN` is in this unit's bounding set.
+/// The boot guard runs as that user, so it can read the copy with only `CAP_NET_ADMIN` and no
+/// permission-bypassing capability (D-54). Mode `0600` keeps every other user out.
+fn write_fallback(path: &std::path::Path, script: &str, owner: u32) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -472,7 +494,11 @@ fn write_fallback(path: &std::path::Path, script: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     file.write_all(script.as_bytes())
         .map_err(|error| error.to_string())?;
-    file.sync_all().map_err(|error| error.to_string())
+    file.sync_all().map_err(|error| error.to_string())?;
+    drop(file);
+    nix::unistd::chown(path, Some(nix::unistd::Uid::from_raw(owner)), None)
+        .map_err(|error| format!("the copy could not be handed to uid {owner}: {error}"))?;
+    Ok(())
 }
 
 /// Whether a peer with this uid may talk to the helper.
