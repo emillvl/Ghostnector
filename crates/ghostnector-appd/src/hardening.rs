@@ -34,7 +34,10 @@ mod tests {
             ("NoNewPrivileges", "yes"),
             ("RestrictAddressFamilies", "AF_UNIX AF_NETLINK"),
             ("RestrictNamespaces", "net mnt"),
-            ("SystemCallFilter", "@system-service"),
+            // `ip netns add` needs `mount --make-shared /run/netns`, and `mount` is not in
+            // `@system-service`; without `@mount` every namespace creation failed with EPERM on
+            // the installed product (D-44).
+            ("SystemCallFilter", "@system-service @mount"),
             ("ProtectSystem", "strict"),
             ("ReadWritePaths", "/run/ghostnector /run/netns"),
         ];

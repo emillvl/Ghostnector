@@ -169,3 +169,18 @@ Verified on the installed VM after a rebuild: `connect --network i2p` applies `I
 returns to `off`. The state is `Degraded` rather than `Protected` because the shipped unit has no
 I2P canary configured; the canary path was qualified natively in M9.5 (real i2pd, real canary) and
 can be configured per machine with the operator's canary.
+
+## Installed APP scope: D-44
+
+The GUI qualification's APP lifecycle found that `ghostnector run` could not create a namespace on
+the installed product: `ghostnector-appd.service` had `SystemCallFilter=@system-service`, and
+`ip netns add` needs `mount --make-shared /run/netns`; `mount` is not in that set, so every launch
+failed with `mount --make-shared /run/netns failed: Operation not permitted`. The unit now allows
+`@mount` (the helper already holds `CAP_SYS_ADMIN` for exactly this work), the hardening test
+requires it, and the installed `ghostnector run` launches an application inside its namespace while
+the window lists and stops it.
+
+The GTK file picker remains a harness limitation: under Xvfb the chooser opens and its tree is
+visible, but its location entry did not accept a typed path from the automation, so the launch is
+performed through the same core API the picker calls. The picker's own widgets are GTK's, not the
+product's.

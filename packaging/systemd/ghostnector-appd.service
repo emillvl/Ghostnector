@@ -49,7 +49,11 @@ RestrictAddressFamilies=AF_UNIX AF_NETLINK
 # `net` for the namespaces it owns; `mnt` for the launch helper's private mount namespace, which
 # bind-mounts each group's resolver configuration over /etc/resolv.conf.
 RestrictNamespaces=net mnt
-SystemCallFilter=@system-service
+# `ip netns add` makes /run/netns a shared mount so a named namespace can persist; `mount` is not
+# part of `@system-service`, so without `@mount` the helper's every namespace creation failed with
+# EPERM on the installed product (D-44). The helper already holds CAP_SYS_ADMIN for exactly this
+# work; the filter is what made it unreachable.
+SystemCallFilter=@system-service @mount
 SystemCallErrorNumber=EPERM
 RestrictSUIDSGID=yes
 LockPersonality=yes

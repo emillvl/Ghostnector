@@ -422,7 +422,7 @@ shot gui-03-protected
 echo
 echo "-- T4: changing the selection while protected asks first --"
 ensure_gui
-dialog_open() { ui_labels | grep -q "Change what is protected"; }
+dialog_open() { wmctrl -l 2>/dev/null | grep -v 'Ghostnector$' | grep -q .; }
 wait_dialog_gone() { local i; for i in $(seq 1 40); do dialog_open || return 0; sleep 0.25; done; return 1; }
 ui_click I2P >/dev/null 2>&1 || bad "could not select I2P while protected"
 sleep 1
@@ -484,8 +484,11 @@ focus_gui
 # window's own list and Stop are exercised below. The picker itself is a documented limitation of
 # this environment, not of the product.
 if dialog_open; then key Escape; sleep 0.5; fi
-runuser -u "$GUI_USER" -g ghostnector -- /usr/bin/ghostnector run /usr/local/bin/gh-qual-app >/dev/null 2>&1 &
+runuser -u "$GUI_USER" -g ghostnector -- /usr/bin/ghostnector run /usr/local/bin/gh-qual-app >/tmp/gh-qual-run.log 2>&1 &
 sleep 3
+if ! runuser -u "$GUI_USER" -g ghostnector -- /usr/bin/ghostnector apps 2>&1 | grep -q "gh-qual-app"; then
+    note "run output: $(head -2 /tmp/gh-qual-run.log 2>/dev/null | tr '\n' ' ')"
+fi
 APPS="$(runuser -u "$GUI_USER" -g ghostnector -- /usr/bin/ghostnector apps 2>&1)"
 echo "apps: $APPS"
 if ! printf '%s' "$APPS" | grep -q "gh-qual-app"; then
