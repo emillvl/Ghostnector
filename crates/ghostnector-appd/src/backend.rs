@@ -16,6 +16,7 @@
 //! helper holds `CAP_SYS_ADMIN` itself (it runs as root under a bounded capability set) but never
 //! passes it to a child, so a compromised `nft` or `ip` does not get it.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::MetadataExt;
@@ -24,7 +25,7 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use ghostnector_spec::app::{APP_LINK_PREFIX, APP_NETNS_PREFIX, MAX_APP_GROUPS};
+use ghostnector_spec::app::{APP_LINK_PREFIX, APP_NETNS_PREFIX, APP_RELAY_PORT, MAX_APP_GROUPS};
 use ghostnector_spec::appd::{CheckVerdict, ProbeConfig};
 use ghostnector_spec::backend::Ports;
 use nix::sched::{setns, CloneFlags};
@@ -67,6 +68,8 @@ fn bounded(id: u32) -> Result<(), BackendError> {
 pub struct GroupRequest {
     /// The group's id.
     pub id: u32,
+    /// The user the group belongs to; the relay runs as this uid.
+    pub owner_uid: u32,
     /// The address assigned inside the namespace.
     pub address: Ipv4Addr,
     /// The bridge carrying app links.
@@ -133,10 +136,15 @@ pub trait Namespaces: Send + Sync {
     fn destroy_bridge(&self) -> Result<(), BackendError>;
     /// Whether the group's namespace and link both exist.
     fn group_present(&self, id: u32) -> Result<bool, BackendError>;
-    /// Create the whole group: namespace, link, routes, sysctls, and the namespace policy.
+    /// Create the whole group: namespace, link, routes, sysctls, the namespace policy, and the
+    /// group's transparent relay.
     fn create(&self, request: &GroupRequest) -> Result<(), BackendError>;
-    /// Destroy the group. Idempotent.
+    /// Destroy the group. Idempotent. Stops the relay first, so no process survives.
     fn destroy(&self, id: u32) -> Result<(), BackendError>;
+    /// Start the group's transparent relay inside its namespace (called by `create`).
+    fn start_relay(&self, request: &GroupRequest) -> Result<(), BackendError>;
+    /// Stop and reap the group's relay (called by `destroy`).
+    fn stop_relay(&self, id: u32);
     /// The kernel's own report of the namespace's ruleset, or an empty string when absent.
     fn applied_policy(&self, id: u32) -> Result<String, BackendError>;
     /// Run the fixed verification probe inside one group, as an unprivileged user.
@@ -151,6 +159,22 @@ pub trait Namespaces: Send + Sync {
     fn shape_problems(&self, request: &GroupRequest) -> Result<Vec<String>, BackendError>;
 }
 
+/// The external tools the helper runs. Every one is verified (root-owned, not writable by anyone
+/// else) before the helper serves anything.
+#[derive(Debug, Clone)]
+pub struct Tools {
+    /// Absolute path to `nft`.
+    pub nft: PathBuf,
+    /// Absolute path to `ip`.
+    pub ip: PathBuf,
+    /// Absolute path to `bridge` (used only for port isolation).
+    pub bridge_ctl: PathBuf,
+    /// Absolute path to the fixed verification probe.
+    pub probe: PathBuf,
+    /// Absolute path to the per-namespace transparent relay.
+    pub relay: PathBuf,
+}
+
 /// The real backend: `ip`, `bridge`, `nft`, and the per-namespace sysctl files.
 #[derive(Debug)]
 pub struct SystemNamespaces {
@@ -158,37 +182,40 @@ pub struct SystemNamespaces {
     ip: PathBuf,
     bridge_ctl: PathBuf,
     probe: PathBuf,
+    relay: PathBuf,
     bridge: String,
     core: Ipv4Addr,
     prefix: u8,
     /// Serialises namespace entry: one thread is inside a namespace at a time.
     namespace_lock: Mutex<()>,
+    /// The transparent relay each group is running, by group id.
+    relays: Mutex<HashMap<u32, u32>>,
 }
 
 impl SystemNamespaces {
     /// Verify the tools and build the backend.
     pub fn new(
-        nft: PathBuf,
-        ip: PathBuf,
-        bridge_ctl: PathBuf,
-        probe: PathBuf,
+        tools: Tools,
         bridge: String,
         core: Ipv4Addr,
         prefix: u8,
     ) -> Result<Self, BackendError> {
-        check_tool(&nft)?;
-        check_tool(&ip)?;
-        check_tool(&bridge_ctl)?;
-        check_tool(&probe)?;
+        check_tool(&tools.nft)?;
+        check_tool(&tools.ip)?;
+        check_tool(&tools.bridge_ctl)?;
+        check_tool(&tools.probe)?;
+        check_tool(&tools.relay)?;
         Ok(Self {
-            nft,
-            ip,
-            bridge_ctl,
-            probe,
+            nft: tools.nft,
+            ip: tools.ip,
+            bridge_ctl: tools.bridge_ctl,
+            probe: tools.probe,
+            relay: tools.relay,
             bridge,
             core,
             prefix,
             namespace_lock: Mutex::new(()),
+            relays: Mutex::new(HashMap::new()),
         })
     }
 
@@ -511,16 +538,123 @@ impl Namespaces for SystemNamespaces {
             let _ = self.destroy(request.id);
             return Err(error);
         }
+
+        // 6. The namespace's transparent relay, as the application's own uid. It starts only after
+        //    the policy is in force, so it can reach nothing but the core's SOCKS listener; if it
+        //    does not come up the group is destroyed rather than left half-usable (D-50).
+        if let Err(error) = self.start_relay(request) {
+            let _ = self.destroy(request.id);
+            return Err(error);
+        }
         Ok(())
     }
 
     fn destroy(&self, id: u32) -> Result<(), BackendError> {
+        // The relay goes first: it is the only process the group owns, and it must not outlive the
+        // namespace it was created in.
+        self.stop_relay(id);
         let name = netns_name(id)?;
         let link = host_link(id)?;
         // Deleting either side of the veth removes both; deleting the namespace removes the rest.
         let _ = self.run(&self.ip, &["link", "del", &link]);
         let _ = self.run(&self.ip, &["netns", "del", &name]);
         Ok(())
+    }
+
+    /// Start the group's transparent relay inside its namespace, as the application's uid.
+    fn start_relay(&self, request: &GroupRequest) -> Result<(), BackendError> {
+        let name = netns_name(request.id)?;
+        let directory = request.state_dir.join(request.id.to_string());
+        let _ = std::fs::create_dir_all(&directory);
+        let log = directory.join("relay.log");
+        let stdout = std::fs::File::create(&log)
+            .map(Stdio::from)
+            .unwrap_or(Stdio::null());
+        let stderr = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .map(Stdio::from)
+            .unwrap_or(Stdio::null());
+        let child = Command::new(&self.ip)
+            .arg("netns")
+            .arg("exec")
+            .arg(&name)
+            .arg(&self.relay)
+            .arg("--id")
+            .arg(request.id.to_string())
+            .arg("--uid")
+            .arg(request.owner_uid.to_string())
+            .arg("--listen-port")
+            .arg(APP_RELAY_PORT.to_string())
+            .arg("--core")
+            .arg(self.core.to_string())
+            .arg("--socks-port")
+            .arg(request.ports.socks.to_string())
+            .arg("--source")
+            .arg(request.address.to_string())
+            .stdin(Stdio::null())
+            .stdout(stdout)
+            .stderr(stderr)
+            .spawn()
+            .map_err(|error| BackendError::Io {
+                path: self.relay.clone(),
+                reason: error.to_string(),
+            })?;
+        let pid = child.id();
+        self.relays
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(request.id, pid);
+
+        // Wait until it accepts connections on the namespace's loopback. A relay that cannot come
+        // up means the group has no usable path, so the caller destroys it.
+        let name = netns_name(request.id)?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let listening = self.with_namespace(&name, || {
+                std::net::TcpStream::connect_timeout(
+                    &std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, APP_RELAY_PORT)),
+                    Duration::from_millis(500),
+                )
+                .map(|_| ())
+                .map_err(|error| {
+                    BackendError::Refused(format!("the relay is not listening: {error}"))
+                })
+            });
+            if listening.is_ok() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(BackendError::Refused(
+                    "the namespace relay did not start".to_string(),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Stop and reap the group's relay, so no process survives the group.
+    fn stop_relay(&self, id: u32) {
+        let pid = self
+            .relays
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&id);
+        let Some(pid) = pid else {
+            return;
+        };
+        let pid = nix::unistd::Pid::from_raw(pid as i32);
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
+        for _ in 0..20 {
+            match nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+                Ok(nix::sys::wait::WaitStatus::StillAlive) => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                _ => return,
+            }
+        }
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+        let _ = nix::sys::wait::waitpid(pid, None);
     }
 
     fn applied_policy(&self, id: u32) -> Result<String, BackendError> {

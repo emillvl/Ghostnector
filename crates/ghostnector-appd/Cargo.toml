@@ -22,11 +22,15 @@ path = "src/bin/launch.rs"
 name = "ghostnector-appd-probe"
 path = "src/bin/probe.rs"
 
+[[bin]]
+name = "ghostnector-appd-relay"
+path = "src/bin/relay.rs"
+
 [dependencies]
 ghostnector-spec = { path = "../ghostnector-spec" }
 ghostnector-policy = { path = "../ghostnector-policy" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-nix = { workspace = true, features = ["mount"] }
+nix = { workspace = true, features = ["mount", "signal"] }
 caps = { workspace = true }

@@ -73,11 +73,13 @@ impl TorSettings {
         self
     }
 
-    /// Move the transparent proxy and SOCKS listeners to the APP core address.
+    /// Move the SOCKS listener to the APP core address.
     ///
-    /// This is what makes an APP session usable: the namespace's DNAT delivers to `core:trans`, and
-    /// the core address exists only on the host's private bridge. The DNS and control listeners stay
-    /// on loopback; there is no wildcard bind in either mode.
+    /// This is what makes an APP session usable: the namespace relay (running as the application's
+    /// own uid inside the namespace) speaks SOCKS to this listener as the application's address,
+    /// and the core address exists only on the host's private bridge. The DNS and control listeners
+    /// stay on loopback, and the TransPort is omitted in APP scope — nothing in a namespace reaches
+    /// it any more (D-50). There is no wildcard bind in either mode.
     pub fn with_app_core(mut self, core: std::net::Ipv4Addr) -> Self {
         self.app_core = Some(core);
         self
@@ -98,10 +100,12 @@ pub fn render(settings: &TorSettings) -> String {
     out.push_str(
         "# Transparent proxying. The listeners are loopback-only in the machine-wide profiles,\n\
          # because the firewall's redirect targets 127.0.0.1 and the input chain drops anything\n\
-         # arriving for these ports from off-host. In APP scope they move to the private core\n\
-         # address that app namespaces DNAT to; never a wildcard. SOCKS keeps a per-credential\n\
-         # circuit, which is how a browser profile gets its own circuits without this file knowing\n\
-         # about it.\n",
+         # arriving for these ports from off-host. In APP scope the SOCKS listener moves to the\n\
+         # private core address that app namespaces reach, and the TransPort is omitted entirely:\n\
+         # every application connection goes to the namespace relay, which speaks SOCKS as the\n\
+         # application's own address (D-50). SOCKS keeps a per-credential circuit, which is how a\n\
+         # browser profile (or one APP group) gets its own circuits without this file knowing about\n\
+         # it.\n",
     );
     let proxy_address = match settings.app_core {
         Some(core) => core.to_string(),
@@ -111,10 +115,12 @@ pub fn render(settings: &TorSettings) -> String {
         "SocksPort {proxy_address}:{} IsolateSOCKSAuth KeepAliveIsolateSOCKSAuth\n",
         settings.socks_port
     ));
-    out.push_str(&format!(
-        "TransPort {proxy_address}:{}\n",
-        settings.trans_port
-    ));
+    if settings.app_core.is_none() {
+        out.push_str(&format!(
+            "TransPort {proxy_address}:{}\n",
+            settings.trans_port
+        ));
+    }
     out.push_str(&format!("DNSPort 127.0.0.1:{}\n\n", settings.dns_port));
 
     out.push_str(
@@ -186,14 +192,23 @@ mod tests {
         assert!(text.contains("ControlPort 127.0.0.1:9051"), "{text}");
         assert!(!text.contains("0.0.0.0"), "{text}");
 
-        // APP scope: the proxies move to the private core address; DNS and control stay loopback.
+        // APP scope: the SOCKS listener moves to the private core address; DNS and control stay
+        // loopback, and the TransPort is omitted entirely because the namespace relay speaks SOCKS
+        // as the application's own address (D-50).
         let app = render(&settings().with_app_core(std::net::Ipv4Addr::new(10, 200, 0, 1)));
         assert!(app.contains("SocksPort 10.200.0.1:9050"), "{app}");
-        assert!(app.contains("TransPort 10.200.0.1:9040"), "{app}");
+        assert!(
+            !app.lines()
+                .any(|line| line.trim_start().starts_with("TransPort")),
+            "APP scope must not render a TransPort directive: {app}"
+        );
         assert!(app.contains("DNSPort 127.0.0.1:9053"), "{app}");
         assert!(app.contains("ControlPort 127.0.0.1:9051"), "{app}");
         assert!(!app.contains("0.0.0.0"), "{app}");
-        for line in app.lines().filter(|line| line.contains("Port ")) {
+        for line in app
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#') && line.contains("Port "))
+        {
             assert!(
                 line.contains("127.0.0.1") || line.contains("10.200.0.1"),
                 "a listener is neither loopback nor the core address: {line}"

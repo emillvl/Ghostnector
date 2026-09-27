@@ -26,6 +26,7 @@ systemctl disable --now ghostnector-core.service ghostnector-netd.service ghostn
 
 rm -f /usr/libexec/ghostnector-core /usr/libexec/ghostnector-netd /usr/libexec/ghostnector-appd \
     /usr/libexec/ghostnector-appd-launch /usr/libexec/ghostnector-appd-probe \
+    /usr/libexec/ghostnector-appd-relay \
     /usr/libexec/ghostnector-dns /usr/libexec/ghostnector-bootguard
 rm -f /usr/bin/ghostnector /usr/bin/ghostnector-gui
 rm -f /usr/lib/systemd/system/ghostnector-core.service \

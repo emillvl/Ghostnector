@@ -60,6 +60,18 @@ pub fn app_core_element(core: Ipv4Addr) -> String {
     format!("{core}/32")
 }
 
+/// The loopback port an APP namespace's TCP DNAT targets.
+///
+/// The namespace helper runs a small transparent relay there, as the application's own uid and
+/// with no capabilities. The relay reads the original destination from the namespace's *own*
+/// conntrack (which is where the DNAT happened) and carries the stream to the core's SOCKS
+/// listener, bound to the application's address. This is what makes real Tor's transparent
+/// contract work across the namespace boundary (D-50): a DNAT straight to the core's `TransPort`
+/// cannot, because `SO_ORIGINAL_DST` is answered by the receiving namespace's conntrack table.
+///
+/// The port is bound on loopback only inside the namespace; it has no meaning on the host.
+pub const APP_RELAY_PORT: u16 = 9041;
+
 #[cfg(test)]
 mod tests {
     use super::*;

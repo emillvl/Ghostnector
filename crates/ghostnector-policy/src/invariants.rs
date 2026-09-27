@@ -212,6 +212,9 @@ pub enum ViolationCode {
     /// A namespace DNAT targets an address or port other than the configured core address and its
     /// core ports.
     AppDnatOutsideCore,
+    /// The namespace's catch-all TCP DNAT does not target the namespace relay on loopback, which is
+    /// the only local listener that may create the path to Tor (D-50).
+    AppRelayDnatTarget,
     /// An APP namespace's output chain does not default to deny.
     AppNamespaceEgressNotDeny,
     /// An APP namespace output rule accepts a destination that is neither loopback nor the core
@@ -284,6 +287,7 @@ impl ViolationCode {
             ViolationCode::AppLinkAcceptMissing => "app_link_accept_missing",
             ViolationCode::AppLinkNotClosed => "app_link_not_closed",
             ViolationCode::AppDnatOutsideCore => "app_dnat_outside_core",
+            ViolationCode::AppRelayDnatTarget => "app_relay_dnat_target",
             ViolationCode::AppNamespaceEgressNotDeny => "app_namespace_egress_not_deny",
             ViolationCode::AppNamespaceAcceptOutsideCore => "app_namespace_accept_outside_core",
             ViolationCode::AppNamespaceNatShape => "app_namespace_nat_shape",
@@ -1084,14 +1088,44 @@ fn check_app_namespace(
             match rule.verdict {
                 Verdict::Return => {}
                 Verdict::Dnat { addr, port } => {
-                    if addr != core || !ctx.app_core_ports.contains(&port) {
+                    let is_dns = dport(rule) == Some(53)
+                        && (has_proto(rule, Proto::Udp) || has_proto(rule, Proto::Tcp));
+                    let is_catch_all_tcp = has_proto(rule, Proto::Tcp) && dport(rule).is_none();
+                    if is_dns {
+                        if addr != core || Some(port) != ctx.app_dns_port {
+                            out.push(InvariantViolation::in_rule(
+                                chain,
+                                index,
+                                ViolationCode::AppDnatOutsideCore,
+                                format!(
+                                    "a DNS DNAT targets {addr}:{port}; it must target the core \
+                                     address and the DNS chokepoint"
+                                ),
+                            ));
+                        }
+                    } else if is_catch_all_tcp {
+                        if addr != std::net::Ipv4Addr::LOCALHOST
+                            || port != ghostnector_spec::app::APP_RELAY_PORT
+                        {
+                            out.push(InvariantViolation::in_rule(
+                                chain,
+                                index,
+                                ViolationCode::AppRelayDnatTarget,
+                                format!(
+                                    "the catch-all TCP DNAT targets {addr}:{port}; it must target \
+                                     the namespace relay on 127.0.0.1:{}",
+                                    ghostnector_spec::app::APP_RELAY_PORT
+                                ),
+                            ));
+                        }
+                    } else {
                         out.push(InvariantViolation::in_rule(
                             chain,
                             index,
                             ViolationCode::AppDnatOutsideCore,
                             format!(
-                                "a DNAT targets {addr}:{port}; the only permitted target is the \
-                                 core address and a core listener port"
+                                "a DNAT targets {addr}:{port}; the only permitted rewrites are the \
+                                 DNS chokepoint and the namespace relay"
                             ),
                         ));
                     }
@@ -1109,8 +1143,8 @@ fn check_app_namespace(
                     chain,
                     index,
                     ViolationCode::AppNamespaceNatShape,
-                    "a redirect inside a namespace would target the namespace's own loopback; the \
-                     core address is reached with DNAT",
+                    "a redirect is not used inside a namespace; the path is an explicit DNAT to \
+                     the core chokepoint and to the namespace relay",
                 )),
                 _ => out.push(InvariantViolation::in_rule(
                     chain,
@@ -1435,7 +1469,7 @@ mod tests {
     }
 
     /// The ports an APP ruleset may reach, in the test environment.
-    const APP_PORTS: [u16; 3] = [TRANS_PORT, DNS_PORT, 9050];
+    const APP_PORTS: [u16; 2] = [DNS_PORT, 9050];
 
     fn app_context<'a>(
         shape: PolicyShape,

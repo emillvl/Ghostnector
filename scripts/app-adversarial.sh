@@ -89,7 +89,7 @@ rm -f "$RUNDIR/core.sock" "$RUNDIR/netd.sock" "$RUNDIR/appd.sock"
 cat >"$WORKDIR/fake-tor.py" <<'PY'
 import json, socket, sys, threading, time
 
-control_port, trans_port, dns_port, core, events = (
+control_port, socks_port, dns_port, core, events = (
     int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), sys.argv[4], sys.argv[5]
 )
 READY = (
@@ -133,33 +133,50 @@ def control_server():
         threading.Thread(target=handle, args=(conn,), daemon=True).start()
 
 
-def trans_server():
+def socks_server():
     server = socket.socket()
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     for _ in range(300):
         try:
-            server.bind((core, trans_port))
+            server.bind((core, socks_port))
             break
         except OSError:
             time.sleep(0.1)
     else:
-        record("trans-unbound", address=core)
+        record("socks-unbound", address=core)
         return
     server.listen(16)
     while True:
         conn, peer = server.accept()
-        record("trans", from_address=peer[0], from_port=peer[1])
         try:
-            conn.settimeout(2)
-            request = b""
-            try:
-                request = conn.recv(4096)
-            except OSError:
-                request = b""
-            if request.startswith(b"GET "):
-                conn.sendall(b"HTTP/1.0 200 OK\r\n\r\n203.0.113.9\n")
-            else:
-                conn.sendall(b"tor-ok")
+            conn.settimeout(5)
+            greeting = conn.recv(3)
+            if len(greeting) < 3 or greeting[0] != 0x05:
+                record("socks-raw", from_address=peer[0], from_port=peer[1])
+                conn.close()
+                continue
+            conn.sendall(b"\x05\x02")
+            auth = conn.recv(2)
+            length = auth[1] if len(auth) > 1 else 0
+            user = conn.recv(length)
+            plen = conn.recv(1)
+            conn.recv(plen[0] if plen else 0)
+            conn.sendall(b"\x01\x00")
+            request = conn.recv(4)
+            destination = "unknown"
+            if len(request) == 4 and request[3] == 1:
+                address = socket.inet_ntoa(conn.recv(4))
+                dport = int.from_bytes(conn.recv(2), "big")
+                destination = f"{address}:{dport}"
+            record(
+                "socks",
+                from_address=peer[0],
+                from_port=peer[1],
+                user=user.decode(errors="replace"),
+                destination=destination,
+            )
+            conn.sendall(b"\x05\x00\x00\x01" + bytes(4) + bytes(2))
+            conn.sendall(b"tor-ok")
         except OSError:
             pass
         conn.close()
@@ -198,7 +215,7 @@ def dns_server():
 
 threading.Thread(target=control_server, daemon=True).start()
 threading.Thread(target=dns_server, daemon=True).start()
-trans_server()
+socks_server()
 PY
 
 cat >"$WORKDIR/session.py" <<'PY'
@@ -228,7 +245,7 @@ sys.stdout.write(data.decode(errors="replace"))
 PY
 
 : >"$WORKDIR/events.jsonl"
-python3 "$WORKDIR/fake-tor.py" "$CONTROL_PORT" 9040 9053 "$CORE" "$WORKDIR/events.jsonl" \
+python3 "$WORKDIR/fake-tor.py" "$CONTROL_PORT" 9050 9053 "$CORE" "$WORKDIR/events.jsonl" \
     >"$WORKDIR/tor.log" 2>&1 &
 TOR_PID=$!
 sleep 0.3
@@ -366,10 +383,10 @@ wait_for "protected — and verified" 20 >/dev/null 2>&1
 
 # ---------------------------------------------------------------- AA-3: a route injected inside
 echo "── AA-3: a route injected inside the namespace does not create a direct path"
-BEFORE="$(grep -c '"kind": "trans"' "$WORKDIR/events.jsonl" 2>/dev/null || true)"
+BEFORE="$(grep -c '"kind": "socks"' "$WORKDIR/events.jsonl" 2>/dev/null || true)"
 ip netns exec "ghapp$APP_ID" ip route add 203.0.113.0/24 dev ghlink0 2>/dev/null || true
 run_probe >/dev/null 2>&1
-AFTER="$(grep -c '"kind": "trans"' "$WORKDIR/events.jsonl" 2>/dev/null || true)"
+AFTER="$(grep -c '"kind": "socks"' "$WORKDIR/events.jsonl" 2>/dev/null || true)"
 if [ "${AFTER:-0}" -gt "${BEFORE:-0}" ]; then
     ok "the connection still went through Tor; the injected route created no direct path"
 else

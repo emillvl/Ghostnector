@@ -726,7 +726,12 @@ mod tests {
             )
             .expect("APP services come up");
         let text = std::fs::read_to_string(&torrc).expect("torrc");
-        assert!(text.contains("TransPort 10.200.0.1:19040"), "{text}");
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.trim_start().starts_with("TransPort")),
+            "APP scope must not render a TransPort directive: {text}"
+        );
         assert!(text.contains("SocksPort 10.200.0.1:19050"), "{text}");
         assert!(!text.contains("0.0.0.0"), "{text}");
     }

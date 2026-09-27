@@ -22,15 +22,14 @@ table inet ghostnector {
         ip daddr @appcore4 tcp dport 9050 counter return comment "direct SOCKS keeps its own circuit"
         udp dport 53 counter dnat ip to 10.200.0.1:53 comment "DNS goes to the chokepoint"
         tcp dport 53 counter dnat ip to 10.200.0.1:53 comment "DNS goes to the chokepoint"
-        meta l4proto tcp counter dnat ip to 10.200.0.1:9040 comment "transparent Tor for TCP"
+        meta l4proto tcp counter dnat ip to 127.0.0.1:9041 comment "transparent TCP goes to the namespace relay"
     }
     chain out_filter {
         type filter hook output priority 0; policy drop;
         ip daddr @loopback4 counter accept comment "traffic to a loopback address cannot leave the machine"
         ip6 daddr @loopback6 counter accept comment "traffic to a loopback address cannot leave the machine"
-        ip daddr @appcore4 tcp dport 9040 counter accept comment "the core listener the DNAT produced"
-        ip daddr @appcore4 tcp dport 53 counter accept comment "the core listener the DNAT produced"
-        ip daddr @appcore4 tcp dport 9050 counter accept comment "the core listener the DNAT produced"
+        ip daddr @appcore4 tcp dport 53 counter accept comment "the core listener this namespace may reach"
+        ip daddr @appcore4 tcp dport 9050 counter accept comment "the core listener this namespace may reach"
         ip daddr @appcore4 udp dport 53 counter accept comment "the DNS chokepoint"
         meta l4proto udp counter reject with icmpx type port-unreachable comment "QUIC and real-time clients must fail in milliseconds, not hang"
         meta l4proto icmp counter reject with icmpx type admin-prohibited comment "ICMP is not carried by Tor"

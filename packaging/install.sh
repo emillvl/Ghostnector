@@ -26,7 +26,7 @@ fail() {
 [ "$(id -u)" = "0" ] || fail "run this as root (sudo packaging/install.sh)"
 
 for binary in ghostnector-core ghostnector-netd ghostnector-appd ghostnector-appd-launch \
-    ghostnector-appd-probe ghostnector-dns ghostnector-bootguard ghostnector ghostnector-gui; do
+    ghostnector-appd-probe ghostnector-appd-relay ghostnector-dns ghostnector-bootguard ghostnector ghostnector-gui; do
     [ -f "$target/$binary" ] || fail "missing $target/$binary; build with 'cargo build --release --workspace --bins -p ghostnector-gui --features gtk'"
 done
 
@@ -35,6 +35,7 @@ install -D -m 0755 "$target/ghostnector-netd" "$libexec/ghostnector-netd"
 install -D -m 0755 "$target/ghostnector-appd" "$libexec/ghostnector-appd"
 install -D -m 0755 "$target/ghostnector-appd-launch" "$libexec/ghostnector-appd-launch"
 install -D -m 0755 "$target/ghostnector-appd-probe" "$libexec/ghostnector-appd-probe"
+install -D -m 0755 "$target/ghostnector-appd-relay" "$libexec/ghostnector-appd-relay"
 install -D -m 0755 "$target/ghostnector-dns" "$libexec/ghostnector-dns"
 install -D -m 0755 "$target/ghostnector-bootguard" "$libexec/ghostnector-bootguard"
 install -D -m 0755 "$target/ghostnector" "$bindir/ghostnector"

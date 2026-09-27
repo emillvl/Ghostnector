@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 #
 # The namespace helper, end to end, against the real kernel (M8.2).
 #
@@ -26,6 +26,7 @@ APPD="${1:?usage: appd-socket-test.sh <path-to-ghostnector-appd>}"
 APPD="$(cd "$(dirname "$APPD")" && pwd)/$(basename "$APPD")"
 LAUNCHER="$(dirname "$APPD")/ghostnector-appd-launch"
 PROBE="$(dirname "$APPD")/ghostnector-appd-probe"
+RELAY="$(dirname "$APPD")/ghostnector-appd-relay"
 
 RUNDIR="/run/ghostnector"
 SOCK="$RUNDIR/appd-test.sock"
@@ -154,7 +155,7 @@ print(value)' "$1" "$2"
 echo "[1] the socket is owner-only and the peer is checked"
 python3 "$WORK/client.py" "$SOCK" >/dev/null 2>&1 || true
 "$APPD" --socket "$SOCK" --peer-uid "$CORE_UID" --state-dir "$STATE" \
-    --launcher "$LAUNCHER" --probe "$PROBE" \
+    --launcher "$LAUNCHER" --probe "$PROBE" --relay "$RELAY" \
     --bridge "$BRIDGE" --core "$CORE" --prefix "$PREFIX" --dead-device "$DEAD" \
     >"$WORK/appd.log" 2>&1 &
 APPD_PID=$!
@@ -392,7 +393,7 @@ setpriv --reuid=0 --regid=0 --clear-groups \
     --bounding-set=-all,+net_admin,+sys_admin,+chown,+setuid,+setgid \
     --inh-caps +net_admin --ambient-caps +net_admin,+sys_admin,+setuid,+setgid \
     "$APPD" --socket "$SOCK3" --peer-uid "$CORE_UID" --state-dir "$STATE3" \
-    --launcher "$LAUNCHER" --probe "$PROBE" \
+    --launcher "$LAUNCHER" --probe "$PROBE" --relay "$RELAY" \
     --bridge "$BRIDGE3" --core "$CORE" --prefix "$PREFIX" --dead-device "$DEAD" \
     >"$WORK/appd3.log" 2>&1 &
 APPD3_PID=$!
@@ -435,7 +436,7 @@ setpriv --reuid=0 --regid=0 --clear-groups \
     --bounding-set=-all,+net_admin,+chown,+setuid,+setgid \
     --inh-caps +net_admin --ambient-caps +net_admin,+setuid,+setgid \
     "$APPD" --socket "$SOCK2" --peer-uid "$CORE_UID" --state-dir "$STATE2" \
-    --launcher "$LAUNCHER" --probe "$PROBE" \
+    --launcher "$LAUNCHER" --probe "$PROBE" --relay "$RELAY" \
     --bridge "$BRIDGE2" --core "$CORE" --prefix "$PREFIX" --dead-device "$DEAD" \
     >"$WORK/appd2.log" 2>&1 &
 APPD2_PID=$!
@@ -467,3 +468,4 @@ ip link del "$BRIDGE2" 2>/dev/null || true
 
 echo
 echo "PASS: appd (socket, lifecycle, effective verification, capability necessity)"
+

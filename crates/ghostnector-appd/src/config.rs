@@ -21,6 +21,8 @@ pub const DEFAULT_BRIDGE_CTL: &str = "/usr/sbin/bridge";
 pub const DEFAULT_LAUNCHER: &str = "/usr/libexec/ghostnector-appd-launch";
 /// Default path of the fixed verification probe.
 pub const DEFAULT_PROBE: &str = "/usr/libexec/ghostnector-appd-probe";
+/// Default path of the per-namespace transparent relay (D-50).
+pub const DEFAULT_RELAY: &str = "/usr/libexec/ghostnector-appd-relay";
 /// Default unprivileged user the probe runs as.
 pub const DEFAULT_PROBE_USER: &str = "nobody";
 /// Default state directory: the registry and one directory per group.
@@ -43,6 +45,8 @@ pub struct Config {
     pub launcher: PathBuf,
     /// Absolute path to the fixed verification probe.
     pub probe: PathBuf,
+    /// Absolute path to the per-namespace transparent relay.
+    pub relay: PathBuf,
     /// The unprivileged user the probe runs as.
     pub probe_user: String,
     /// Where the registry and per-group files live.
@@ -112,6 +116,7 @@ OPTIONS:
     --bridge-ctl <PATH>    bridge control tool        [default: /usr/sbin/bridge]
     --launcher <PATH>      privilege-drop helper     [default: /usr/libexec/ghostnector-appd-launch]
     --probe <PATH>         verification probe        [default: /usr/libexec/ghostnector-appd-probe]
+    --relay <PATH>         namespace TCP relay       [default: /usr/libexec/ghostnector-appd-relay]
     --probe-user <NAME>    user the probe runs as    [default: nobody]
     --state-dir <PATH>     registry and per-group files
                                            [default: /run/ghostnector/apps]
@@ -136,6 +141,7 @@ OPTIONS:
         let mut bridge_ctl = PathBuf::from(DEFAULT_BRIDGE_CTL);
         let mut launcher = PathBuf::from(DEFAULT_LAUNCHER);
         let mut probe = PathBuf::from(DEFAULT_PROBE);
+        let mut relay = PathBuf::from(DEFAULT_RELAY);
         let mut probe_user = DEFAULT_PROBE_USER.to_string();
         let mut state_dir = PathBuf::from(DEFAULT_STATE_DIR);
         let mut bridge = app::DEFAULT_APP_BRIDGE.to_string();
@@ -165,6 +171,7 @@ OPTIONS:
                 "--bridge-ctl" => bridge_ctl = absolute(&option, &value()?)?,
                 "--launcher" => launcher = absolute(&option, &value()?)?,
                 "--probe" => probe = absolute(&option, &value()?)?,
+                "--relay" => relay = absolute(&option, &value()?)?,
                 "--probe-user" => {
                     let name = value()?;
                     if name.is_empty()
@@ -319,6 +326,7 @@ OPTIONS:
             bridge_ctl,
             launcher,
             probe,
+            relay,
             probe_user,
             state_dir,
             bridge,

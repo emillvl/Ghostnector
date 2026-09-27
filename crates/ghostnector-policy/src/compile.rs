@@ -298,7 +298,7 @@ pub fn compile(
 
     let exemptions = effective_exemptions(&ruleset)?;
     let allowed_ports = [env.trans_port, env.chokepoint_port];
-    let app_ports = [env.trans_port, env.chokepoint_port, env.socks_port];
+    let app_ports = [env.chokepoint_port, env.socks_port];
     let ctx = CheckContext {
         shape,
         scope,
@@ -324,9 +324,11 @@ pub fn compile(
 /// Compile the ruleset that lives *inside* one APP namespace.
 ///
 /// This is the other half of `APP` scope. It has no exemptions and no output interface: its whole
-/// job is to rewrite every application connection to the host-local core address and to deny
-/// everything that is not either loopback or a reply to a flow the core already accepted. A
-/// separate entry point, rather than a `ProfileId`, keeps the helper's closed verb set closed: the
+/// job is to send every application TCP connection to the namespace's own relay (which reads the
+/// original destination from this namespace's conntrack and carries it to Tor as the application's
+/// address), send DNS to the chokepoint, and deny everything that is not either loopback, those two
+/// core listeners, or a reply to a flow the core already accepted. A separate entry point, rather
+/// than a `ProfileId`, keeps the helper's closed verb set closed: the
 /// namespace helper renders this from its own configuration, never from a client request.
 pub fn compile_app_namespace(env: &Environment) -> Result<CompiledPolicy, PolicyError> {
     let ruleset = Ruleset {
@@ -340,7 +342,7 @@ pub fn compile_app_namespace(env: &Environment) -> Result<CompiledPolicy, Policy
 
     let exemptions = effective_exemptions(&ruleset)?;
     let allowed_ports = [env.trans_port, env.chokepoint_port];
-    let app_ports = [env.trans_port, env.chokepoint_port, env.socks_port];
+    let app_ports = [env.chokepoint_port, env.socks_port];
     let ctx = CheckContext {
         shape: PolicyShape::AppNamespace,
         scope: Scope::App,
@@ -546,8 +548,11 @@ fn app_host_chains(env: &Environment) -> Vec<Chain> {
         "loopback delivery",
     )];
 
-    // The app link reaches exactly the core listeners the namespace DNAT targets.
-    for port in [env.trans_port, env.chokepoint_port, env.socks_port] {
+    // The app link reaches exactly the core listeners the namespace may use: the DNS chokepoint
+    // (the app's own DNS and the relay's) and the SOCKS listener (the relay, and an app that speaks
+    // SOCKS). The core's TransPort is deliberately not among them: in APP scope the path to Tor is
+    // the namespace relay, which speaks SOCKS as the application's own address (D-50).
+    for port in [env.chokepoint_port, env.socks_port] {
         rules.push(rule(
             vec![
                 bridge(),
@@ -583,12 +588,12 @@ fn app_host_chains(env: &Environment) -> Vec<Chain> {
     ));
 
     // Second line of defence: the core listeners are never for any other interface.
-    for port in [env.trans_port, env.chokepoint_port, env.socks_port] {
+    for port in [env.chokepoint_port, env.socks_port] {
         rules.push(rule(
             vec![Expr::L4Proto { proto: Proto::Tcp }, Expr::Dport { port }],
             Verdict::Drop,
             mechanism(Mechanism::ListenerGuard),
-            "the transparent proxies are not for the network",
+            "the core listeners are not for the network",
         ));
     }
     rules.push(rule(
@@ -621,7 +626,7 @@ fn app_namespace_chains(env: &Environment) -> Vec<Chain> {
     let core = || Expr::DaddrInSet {
         set: APP_CORE_SET.to_string(),
     };
-    let dnat_to = |port: u16| Verdict::Dnat {
+    let dnat_to_core = |port: u16| Verdict::Dnat {
         addr: env.app_core,
         port,
     };
@@ -645,20 +650,29 @@ fn app_namespace_chains(env: &Environment) -> Vec<Chain> {
     for proto in [Proto::Udp, Proto::Tcp] {
         nat_rules.push(rule(
             vec![Expr::L4Proto { proto }, Expr::Dport { port: 53 }],
-            dnat_to(env.chokepoint_port),
+            dnat_to_core(env.chokepoint_port),
             mechanism(Mechanism::DnsRedirect),
             "DNS goes to the chokepoint",
         ));
     }
+    // Every other TCP connection goes to the namespace's own relay. The DNAT happens here, so the
+    // relay (a process in this namespace) can read the original destination from this namespace's
+    // conntrack and carry the stream to Tor's SOCKS listener as the application's own address.
+    // A DNAT straight to the core's TransPort cannot work with real Tor (D-50).
     nat_rules.push(rule(
         vec![Expr::L4Proto { proto: Proto::Tcp }],
-        dnat_to(env.trans_port),
-        mechanism(Mechanism::TorRedirect),
-        "transparent Tor for TCP",
+        Verdict::Dnat {
+            addr: Ipv4Addr::LOCALHOST,
+            port: ghostnector_spec::app::APP_RELAY_PORT,
+        },
+        mechanism(Mechanism::AppDnat),
+        "transparent TCP goes to the namespace relay",
     ));
 
     let mut egress_rules = loopback_address_rules(Verdict::Accept);
-    for port in [env.trans_port, env.chokepoint_port, env.socks_port] {
+    // The relay's SOCKS connection and direct SOCKS both reach the core's SOCKS listener; DNS
+    // reaches the chokepoint. There is deliberately no path to the core's TransPort any more.
+    for port in [env.chokepoint_port, env.socks_port] {
         egress_rules.push(rule(
             vec![
                 core(),
@@ -667,7 +681,7 @@ fn app_namespace_chains(env: &Environment) -> Vec<Chain> {
             ],
             Verdict::Accept,
             mechanism(Mechanism::AppCore),
-            "the core listener the DNAT produced",
+            "the core listener this namespace may reach",
         ));
     }
     egress_rules.push(rule(
@@ -1443,12 +1457,16 @@ mod tests {
             "the app link must be admitted by name: {rendered}"
         );
         assert!(
-            rendered.contains("ip daddr @appcore4 tcp dport 9040 counter accept"),
-            "the app link reaches the transparent proxy: {rendered}"
+            rendered.contains("ip daddr @appcore4 tcp dport 9050 counter accept"),
+            "the app link reaches the SOCKS listener: {rendered}"
         );
         assert!(
             rendered.contains("ip daddr @appcore4 udp dport 53 counter accept"),
             "the app link reaches the chokepoint: {rendered}"
+        );
+        assert!(
+            !rendered.contains("ip daddr @appcore4 tcp dport 9040 counter accept"),
+            "the app link must not reach the core TransPort any more (D-50): {rendered}"
         );
         assert!(
             !rendered.contains("redirect to"),
@@ -1472,7 +1490,7 @@ mod tests {
     }
 
     #[test]
-    fn the_app_namespace_dnats_only_to_the_core_and_denies_everything_else() {
+    fn the_app_namespace_dnats_only_to_the_chokepoint_and_the_namespace_relay() {
         let policy = compile_app_namespace(&env()).unwrap();
         assert_eq!(
             policy.ruleset.chain_names(),
@@ -1483,13 +1501,23 @@ mod tests {
         for expected in [
             "udp dport 53 counter dnat ip to 10.200.0.1:53",
             "tcp dport 53 counter dnat ip to 10.200.0.1:53",
-            "meta l4proto tcp counter dnat ip to 10.200.0.1:9040",
+            "meta l4proto tcp counter dnat ip to 127.0.0.1:9041",
+            "ip daddr @appcore4 tcp dport 9050 counter accept",
             "ct state established counter accept",
             "ct state related counter accept",
         ] {
             assert!(
                 rendered.contains(expected),
                 "missing '{expected}' in:\n{rendered}"
+            );
+        }
+        for absent in [
+            "dnat ip to 10.200.0.1:9040",
+            "ip daddr @appcore4 tcp dport 9040 counter accept",
+        ] {
+            assert!(
+                !rendered.contains(absent),
+                "the namespace must not use the core TransPort any more (D-50): {rendered}"
             );
         }
         for forbidden in ["masquerade", "snat", "redirect to"] {

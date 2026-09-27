@@ -738,6 +738,7 @@ impl<B: Namespaces + 'static> Server<B> {
     fn request_for(&self, record: &AppRecord, ports: Ports) -> GroupRequest {
         GroupRequest {
             id: record.id,
+            owner_uid: record.owner_uid,
             address: record.address,
             bridge: self.config.bridge.clone(),
             core: self.config.core,

@@ -23,6 +23,7 @@ ExecStart=/usr/libexec/ghostnector-appd \
     --peer-user ghostnector \
     --state-dir /run/ghostnector/apps \
     --launcher /usr/libexec/ghostnector-appd-launch \
+    --relay /usr/libexec/ghostnector-appd-relay \
     --bridge ghbr0 \
     --core 10.200.0.1 \
     --prefix 24 \

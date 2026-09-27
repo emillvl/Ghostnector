@@ -73,6 +73,9 @@ mod tests {
         if !text.contains("/usr/libexec/ghostnector-appd-launch") {
             problems.push("the unit does not name the launch helper".to_string());
         }
+        if !text.contains("/usr/libexec/ghostnector-appd-relay") {
+            problems.push("the unit does not name the namespace relay (D-50)".to_string());
+        }
 
         // The bounding set may contain exactly the capabilities the design names. Anything else
         // would be a widening that a review must see.

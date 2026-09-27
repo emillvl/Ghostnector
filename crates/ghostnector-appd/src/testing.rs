@@ -115,6 +115,21 @@ impl Namespaces for MockNamespaces {
         Ok(())
     }
 
+    fn start_relay(&self, request: &GroupRequest) -> Result<(), BackendError> {
+        self.calls
+            .lock()
+            .expect("mock lock")
+            .push(format!("start_relay {}", request.id));
+        Ok(())
+    }
+
+    fn stop_relay(&self, id: u32) {
+        self.calls
+            .lock()
+            .expect("mock lock")
+            .push(format!("stop_relay {id}"));
+    }
+
     fn applied_policy(&self, id: u32) -> Result<String, BackendError> {
         Ok(self
             .groups

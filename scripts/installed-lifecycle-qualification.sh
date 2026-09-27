@@ -75,6 +75,7 @@ for unit in ghostnector-core ghostnector-netd ghostnector-appd ghostnector-bootg
 done
 for path in /usr/libexec/ghostnector-core /usr/libexec/ghostnector-netd /usr/libexec/ghostnector-appd \
     /usr/libexec/ghostnector-dns /usr/libexec/ghostnector-bootguard /usr/bin/ghostnector /usr/bin/ghostnector-gui \
+    /usr/libexec/ghostnector-appd-relay \
     /usr/lib/systemd/system/ghostnector-core.service /usr/lib/systemd/system/ghostnector-tor.service \
     /usr/lib/tmpfiles.d/ghostnector.conf /usr/share/polkit-1/rules.d/50-ghostnector.rules \
     /usr/share/polkit-1/rules.d/51-ghostnector-resolved.rules /usr/share/applications/ghostnector.desktop; do

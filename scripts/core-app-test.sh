@@ -74,6 +74,7 @@ install -m 0755 "$TARGET_DIR/ghostnector-netd" "$BINDIR/ghostnector-netd"
 install -m 0755 "$TARGET_DIR/ghostnector-appd" "$BINDIR/ghostnector-appd"
 install -m 0755 "$TARGET_DIR/ghostnector-appd-launch" "$BINDIR/ghostnector-appd-launch"
 install -m 0755 "$TARGET_DIR/ghostnector-appd-probe" "$BINDIR/ghostnector-appd-probe"
+install -m 0755 "$TARGET_DIR/ghostnector-appd-relay" "$BINDIR/ghostnector-appd-relay"
 install -m 0755 "$TARGET_DIR/ghostnector-core" "$BINDIR/ghostnector-core"
 install -m 0755 "$TARGET_DIR/ghostnector" "$BINDIR/ghostnector"
 install -m 0755 "$TARGET_DIR/ghostnector-dns" "$BINDIR/ghostnector-dns"
@@ -91,14 +92,15 @@ printf 'nameserver 192.0.2.53\n' >"$WORKDIR/root/etc/resolv.conf"
 chown -R "$CORE_UID" "$WORKDIR"
 
 cat >"$WORKDIR/fake-tor.py" <<'PY'
-"""A stand-in for Tor: control, TransPort, and DNSPort.
+"""A stand-in for Tor: control, SocksPort, and DNSPort.
 
 It does not relay anywhere: the point of the test is that an APP session reaches *these* listeners
-through the namespace DNAT, with its own source address, and gets an answer back.
+through the namespace relay, with its own source address and its intended destination, and gets an
+answer back. The relay speaks SOCKS to this port; the fake records what it asked for.
 """
 import json, socket, sys, threading, time
 
-control_port, trans_port, dns_port, core, events = (
+control_port, socks_port, dns_port, core, events = (
     int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), sys.argv[4], sys.argv[5]
 )
 READY = (
@@ -142,35 +144,53 @@ def control_server():
         threading.Thread(target=handle, args=(conn,), daemon=True).start()
 
 
-def trans_server():
+def socks_server():
     # The core address exists only after the helper has created the bridge; wait for it rather than
-    # binding a wildcard. Nothing in this double is reachable except through the namespace DNAT.
+    # binding a wildcard. Nothing in this double is reachable except through the namespace relay.
     server = socket.socket()
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     for _ in range(300):
         try:
-            server.bind((core, trans_port))
+            server.bind((core, socks_port))
             break
         except OSError:
             time.sleep(0.1)
     else:
-        record("trans-unbound", address=core)
+        record("socks-unbound", address=core)
         return
     server.listen(16)
     while True:
         conn, peer = server.accept()
-        record("trans", from_address=peer[0], from_port=peer[1])
         try:
-            conn.settimeout(2)
-            request = b""
-            try:
-                request = conn.recv(4096)
-            except OSError:
-                request = b""
-            if request.startswith(b"GET "):
-                conn.sendall(b"HTTP/1.0 200 OK\r\n\r\n203.0.113.9\n")
-            else:
-                conn.sendall(b"tor-ok")
+            conn.settimeout(5)
+            greeting = conn.recv(3)
+            if len(greeting) < 3 or greeting[0] != 0x05:
+                record("socks-raw", from_address=peer[0], from_port=peer[1])
+                conn.close()
+                continue
+            conn.sendall(b"\x05\x02")
+            auth = conn.recv(2)
+            length = auth[1] if len(auth) > 1 else 0
+            user = conn.recv(length)
+            plen = conn.recv(1)
+            conn.recv(plen[0] if plen else 0)
+            conn.sendall(b"\x01\x00")
+            request = conn.recv(4)
+            destination = "unknown"
+            if len(request) == 4 and request[3] == 1:
+                address = socket.inet_ntoa(conn.recv(4))
+                dport = int.from_bytes(conn.recv(2), "big")
+                destination = f"{address}:{dport}"
+            record(
+                "socks",
+                from_address=peer[0],
+                from_port=peer[1],
+                user=user.decode(errors="replace"),
+                destination=destination,
+            )
+            conn.sendall(b"\x05\x00\x00\x01" + bytes(4) + bytes(2))
+            # The application asked for a destination; answer it so the session completes.
+            conn.sendall(b"tor-ok")
         except OSError:
             pass
         conn.close()
@@ -210,11 +230,11 @@ def dns_server():
 
 threading.Thread(target=control_server, daemon=True).start()
 threading.Thread(target=dns_server, daemon=True).start()
-trans_server()
+socks_server()
 PY
 
 : >"$WORKDIR/events.jsonl"
-python3 "$WORKDIR/fake-tor.py" "$CONTROL_PORT" 9040 9053 "$CORE" "$WORKDIR/events.jsonl" \
+python3 "$WORKDIR/fake-tor.py" "$CONTROL_PORT" 9050 9053 "$CORE" "$WORKDIR/events.jsonl" \
     >"$WORKDIR/tor.log" 2>&1 &
 TOR_PID=$!
 sleep 0.3
@@ -230,7 +250,7 @@ for _ in $(seq 1 60); do [ -S "$RUNDIR/netd.sock" ] && break; sleep 0.1; done
 "$BINDIR/ghostnector-appd" \
     --socket "$RUNDIR/appd.sock" --peer-user "$CORE_USER" \
     --state-dir "$WORKDIR/apps" --launcher "$BINDIR/ghostnector-appd-launch" \
-    --probe "$BINDIR/ghostnector-appd-probe" \
+    --probe "$BINDIR/ghostnector-appd-probe" --relay "$BINDIR/ghostnector-appd-relay" \
     --bridge "$BRIDGE" --core "$CORE" --prefix "$PREFIX" --dead-device "$DEAD" \
     >"$WORKDIR/appd.log" 2>&1 &
 APPD_PID=$!
@@ -290,7 +310,8 @@ import socket
 
 print("uid:" + str(__import__("os").getuid()))
 
-# TCP: any destination is DNAT'ed to the core address, where Tor's TransPort answers.
+# TCP: the namespace relay DNATs the connection to itself, reads the original destination, and
+# speaks SOCKS to the core address, where this stand-in answers.
 connection = socket.socket()
 connection.settimeout(5)
 connection.connect(("198.51.100.10", 80))
@@ -314,7 +335,7 @@ case "$OUTPUT" in
 *) fail "the session did not run as the requesting user: $OUTPUT" ;;
 esac
 case "$OUTPUT" in
-*"tcp:tor-ok"*) ok "TCP reached Tor's transparent proxy through the namespace DNAT" ;;
+*"tcp:tor-ok"*) ok "TCP reached the core through the namespace relay" ;;
 *) fail "the protected TCP path did not answer: $OUTPUT" ;;
 esac
 case "$OUTPUT" in
@@ -332,10 +353,15 @@ APP_ADDR="$(printf '%s\n' "$LIST" | awk '/^  -/ { print $3; exit }')"
 [ -n "$APP_ID" ] || fail "could not read the application id from: $LIST"
 [ -n "$APP_ADDR" ] || fail "could not read the application address from: $LIST"
 
-# Source preservation: Tor saw the application's own address, not the host's and not a rewritten one.
-grep -q "\"kind\": \"trans\", \"from_address\": \"$APP_ADDR\"" "$WORKDIR/events.jsonl" ||
-    { cat "$WORKDIR/events.jsonl"; fail "Tor did not see the application's own source address"; }
-ok "Tor saw the application's source address ($APP_ADDR): no masquerade"
+# Source and destination preservation: the relay spoke SOCKS as the application's own address and
+# asked for the application's intended destination, not the relay's own or a rewritten one.
+grep -q "\"kind\": \"socks\", \"from_address\": \"$APP_ADDR\"" "$WORKDIR/events.jsonl" ||
+    { cat "$WORKDIR/events.jsonl"; fail "the core did not see the application's own source address"; }
+grep -q "\"destination\": \"198.51.100.10:80\"" "$WORKDIR/events.jsonl" ||
+    { cat "$WORKDIR/events.jsonl"; fail "the intended destination did not survive the relay"; }
+grep -q "\"user\": \"app$APP_ID\"" "$WORKDIR/events.jsonl" ||
+    { cat "$WORKDIR/events.jsonl"; fail "the relay did not authenticate with the per-group credential"; }
+ok "the core saw the application's source address and destination ($APP_ADDR -> 198.51.100.10:80): no masquerade, no rewrite"
 
 # The chokepoint forwarded the query to Tor's DNSPort from loopback, as designed.
 grep -q '"kind": "dns", "from_address": "127.0.0.1"' "$WORKDIR/events.jsonl" ||
