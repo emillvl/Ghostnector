@@ -21,7 +21,7 @@ use std::io::Write;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -175,6 +175,15 @@ pub struct Tools {
     pub relay: PathBuf,
 }
 
+/// A group's running relay: its pid, and the write end of the pipe whose close stops it. The
+/// packaged capability set has no `CAP_KILL`, and the relay holds its namespace open, so this pipe
+/// is the shutdown channel (see `bin/relay.rs`).
+#[derive(Debug)]
+struct RelayHandle {
+    pid: u32,
+    control: Option<ChildStdin>,
+}
+
 /// The real backend: `ip`, `bridge`, `nft`, and the per-namespace sysctl files.
 #[derive(Debug)]
 pub struct SystemNamespaces {
@@ -189,7 +198,7 @@ pub struct SystemNamespaces {
     /// Serialises namespace entry: one thread is inside a namespace at a time.
     namespace_lock: Mutex<()>,
     /// The transparent relay each group is running, by group id.
-    relays: Mutex<HashMap<u32, u32>>,
+    relays: Mutex<HashMap<u32, RelayHandle>>,
 }
 
 impl SystemNamespaces {
@@ -550,14 +559,15 @@ impl Namespaces for SystemNamespaces {
     }
 
     fn destroy(&self, id: u32) -> Result<(), BackendError> {
-        // The relay goes first: it is the only process the group owns, and it must not outlive the
-        // namespace it was created in.
-        self.stop_relay(id);
         let name = netns_name(id)?;
         let link = host_link(id)?;
         // Deleting either side of the veth removes both; deleting the namespace removes the rest.
+        // The relay's sockets live in that namespace, so this is also what makes it exit: the
+        // packaged capability set has no CAP_KILL, and a relay this process may not signal still
+        // dies when its namespace does.
         let _ = self.run(&self.ip, &["link", "del", &link]);
         let _ = self.run(&self.ip, &["netns", "del", &name]);
+        self.stop_relay(id);
         Ok(())
     }
 
@@ -592,7 +602,7 @@ impl Namespaces for SystemNamespaces {
             .arg(request.ports.socks.to_string())
             .arg("--source")
             .arg(request.address.to_string())
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(stdout)
             .stderr(stderr)
             .spawn()
@@ -600,11 +610,13 @@ impl Namespaces for SystemNamespaces {
                 path: self.relay.clone(),
                 reason: error.to_string(),
             })?;
+        let mut child = child;
         let pid = child.id();
+        let control = child.stdin.take();
         self.relays
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(request.id, pid);
+            .insert(request.id, RelayHandle { pid, control });
 
         // Wait until it accepts connections on the namespace's loopback. A relay that cannot come
         // up means the group has no usable path, so the caller destroys it.
@@ -634,27 +646,34 @@ impl Namespaces for SystemNamespaces {
     }
 
     /// Stop and reap the group's relay, so no process survives the group.
+    ///
+    /// The SIGTERM is polite and may be refused: the packaged capability set does not include
+    /// `CAP_KILL`, so the helper cannot signal a process that has dropped to the application's uid.
+    /// The caller deletes the namespace first, which closes the relay's sockets and makes it exit;
+    /// this then reaps it with a bounded wait (never an unbounded one — a relay that somehow
+    /// lingers must not hang the helper).
     fn stop_relay(&self, id: u32) {
-        let pid = self
+        let handle = self
             .relays
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&id);
-        let Some(pid) = pid else {
+        let Some(handle) = handle else {
             return;
         };
-        let pid = nix::unistd::Pid::from_raw(pid as i32);
+        // Closing the pipe is the shutdown channel: the relay sees end-of-file on its standard
+        // input and exits, with no capability required.
+        drop(handle.control);
+        let pid = nix::unistd::Pid::from_raw(handle.pid as i32);
         let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
-        for _ in 0..20 {
+        for _ in 0..50 {
             match nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
                 Ok(nix::sys::wait::WaitStatus::StillAlive) => {
-                    std::thread::sleep(Duration::from_millis(50));
+                    std::thread::sleep(Duration::from_millis(100));
                 }
                 _ => return,
             }
         }
-        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
-        let _ = nix::sys::wait::waitpid(pid, None);
     }
 
     fn applied_policy(&self, id: u32) -> Result<String, BackendError> {

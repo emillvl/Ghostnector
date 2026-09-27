@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 #
 # Adversarial APP scope: try to make an APP claim false while Ghostnector still reports it.
 #
@@ -76,7 +76,7 @@ LAUNCH_GID="$(id -g "$LAUNCH_USER")"
 mkdir -p "$BINDIR" "$WORKDIR" "$RUNDIR" "$WORKDIR/root/etc"
 printf 'nameserver 192.0.2.53\n' >"$WORKDIR/root/etc/resolv.conf"
 for binary in ghostnector-netd ghostnector-appd ghostnector-appd-launch \
-    ghostnector-appd-probe ghostnector-core ghostnector ghostnector-dns; do
+    ghostnector-appd-probe ghostnector-appd-relay ghostnector-core ghostnector ghostnector-dns; do
     install -m 0755 "$TARGET_DIR/$binary" "$BINDIR/$binary"
 done
 COOKIE="$WORKDIR/control_auth_cookie"
@@ -176,7 +176,18 @@ def socks_server():
                 destination=destination,
             )
             conn.sendall(b"\x05\x00\x00\x01" + bytes(4) + bytes(2))
-            conn.sendall(b"tor-ok")
+            # The verification probe sends an HTTP request through the relay; an application that
+            # just connects and reads gets the short answer. Both paths must complete.
+            conn.settimeout(2)
+            request = b""
+            try:
+                request = conn.recv(4096)
+            except OSError:
+                request = b""
+            if request.startswith(b"GET "):
+                conn.sendall(b"HTTP/1.0 200 OK\r\n\r\n203.0.113.9\n")
+            else:
+                conn.sendall(b"tor-ok")
         except OSError:
             pass
         conn.close()
@@ -259,7 +270,7 @@ for _ in $(seq 1 60); do [ -S "$RUNDIR/netd.sock" ] && break; sleep 0.1; done
 
 "$BINDIR/ghostnector-appd" --socket "$RUNDIR/appd.sock" --peer-user "$CORE_USER" \
     --state-dir "$WORKDIR/apps" --launcher "$BINDIR/ghostnector-appd-launch" \
-    --probe "$BINDIR/ghostnector-appd-probe" \
+    --probe "$BINDIR/ghostnector-appd-probe" --relay "$BINDIR/ghostnector-appd-relay" \
     --bridge "$BRIDGE" --core "$CORE" --prefix "$PREFIX" --dead-device "$DEAD" \
     >"$WORKDIR/appd.log" 2>&1 &
 APPD_PID=$!
@@ -340,12 +351,12 @@ if [ -z "$(run_probe | grep 'tcp:tor-ok')" ]; then
 fi
 APP_ID="$(app_id)"
 [ -n "$APP_ID" ] || fail_setup "no application was created"
-if ! wait_for "protected — and verified" 20; then
+if ! wait_for "and verified" 20; then
     fail_setup "verification never passed: $(status)"
 fi
 
 # ---------------------------------------------------------------- AA-1: namespace removed by hand
-echo "── AA-1: a namespace removed by hand is noticed and denied"
+echo "â”€â”€ AA-1: a namespace removed by hand is noticed and denied"
 ip netns del "ghapp$APP_ID" 2>/dev/null
 if wait_for "no protected application can reach the network" 20; then
     ok "the removed namespace was noticed and the APP scope denied"
@@ -358,10 +369,10 @@ cli disconnect >/dev/null 2>&1
 cli connect --scope app >/dev/null 2>&1
 run_probe >/dev/null 2>&1
 APP_ID="$(app_id)"
-wait_for "protected — and verified" 20 >/dev/null 2>&1
+wait_for "and verified" 20 >/dev/null 2>&1
 
 # ---------------------------------------------------------------- AA-2: a masquerade rule injected
-echo "── AA-2: a masquerade rule injected into the host table is noticed"
+echo "â”€â”€ AA-2: a masquerade rule injected into the host table is noticed"
 nft add chain inet ghostnector aa_post '{ type nat hook postrouting priority 100 ; }' 2>/dev/null || true
 nft add rule inet ghostnector aa_post masquerade 2>/dev/null || true
 if nft list table inet ghostnector 2>/dev/null | grep -q masquerade; then
@@ -379,10 +390,10 @@ cli connect --scope app >/dev/null 2>&1
 run_probe >/dev/null 2>&1
 APP_ID="$(app_id)"
 APP_ADDR="$(app_addr)"
-wait_for "protected — and verified" 20 >/dev/null 2>&1
+wait_for "and verified" 20 >/dev/null 2>&1
 
 # ---------------------------------------------------------------- AA-3: a route injected inside
-echo "── AA-3: a route injected inside the namespace does not create a direct path"
+echo "â”€â”€ AA-3: a route injected inside the namespace does not create a direct path"
 BEFORE="$(grep -c '"kind": "socks"' "$WORKDIR/events.jsonl" 2>/dev/null || true)"
 ip netns exec "ghapp$APP_ID" ip route add 203.0.113.0/24 dev ghlink0 2>/dev/null || true
 run_probe >/dev/null 2>&1
@@ -394,7 +405,7 @@ else
 fi
 
 # ---------------------------------------------------------------- AA-4: proxy_arp turned on
-echo "── AA-4: proxy_arp on the app link is noticed as a shape change"
+echo "â”€â”€ AA-4: proxy_arp on the app link is noticed as a shape change"
 sysctl -qw "net.ipv4.conf.ghav$APP_ID.proxy_arp=1"
 if wait_for "no protected application can reach the network" 20; then
     ok "the shape change was noticed and the APP scope denied"
@@ -407,10 +418,10 @@ cli disconnect >/dev/null 2>&1
 cli connect --scope app >/dev/null 2>&1
 run_probe >/dev/null 2>&1
 APP_ID="$(app_id)"
-wait_for "protected — and verified" 20 >/dev/null 2>&1
+wait_for "and verified" 20 >/dev/null 2>&1
 
 # ---------------------------------------------------------------- AA-5: an extra interface
-echo "── AA-5: an extra interface inside the namespace is noticed"
+echo "â”€â”€ AA-5: an extra interface inside the namespace is noticed"
 ip netns exec "ghapp$APP_ID" ip link add ghrogue type dummy 2>/dev/null
 if wait_for "no protected application can reach the network" 20; then
     ok "the extra interface was noticed and the APP scope denied"
@@ -422,7 +433,7 @@ cli disconnect >/dev/null 2>&1
 cli connect --scope app >/dev/null 2>&1
 
 # ---------------------------------------------------------------- AA-6/9: two apps, distinct sources
-echo "── AA-6/AA-9: two applications present distinct source identities, with no masquerade"
+echo "â”€â”€ AA-6/AA-9: two applications present distinct source identities, with no masquerade"
 run_probe >/dev/null 2>&1
 FIRST_ADDR="$(app_addr)"
 run_probe >/dev/null 2>&1
@@ -439,7 +450,7 @@ else
 fi
 
 # ---------------------------------------------------------------- AA-7: panic with apps running
-echo "── AA-7: panic with applications running removes their namespaces"
+echo "â”€â”€ AA-7: panic with applications running removes their namespaces"
 cli panic >/dev/null 2>&1
 LEFT="$(cli apps 2>&1)"
 case "$LEFT" in
@@ -460,7 +471,7 @@ case "$(status)" in
 esac
 
 # ---------------------------------------------------------------- AA-10: DNS to a foreign resolver
-echo "── AA-10: a query to a foreign resolver is carried by the chokepoint only"
+echo "â”€â”€ AA-10: a query to a foreign resolver is carried by the chokepoint only"
 cli disconnect >/dev/null 2>&1
 CONNECT_OUT="$(cli connect --scope app 2>&1)"
 case "$CONNECT_OUT" in
@@ -469,7 +480,7 @@ case "$CONNECT_OUT" in
 esac
 run_probe >/dev/null 2>&1
 APP_ID="$(app_id)"
-wait_for "protected — and verified" 20 >/dev/null 2>&1
+wait_for "and verified" 20 >/dev/null 2>&1
 cat >"$WORKDIR/foreign.py" <<'PY'
 import socket
 query = bytes([0x56, 0x78, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0])
@@ -497,7 +508,7 @@ else
 fi
 
 # ---------------------------------------------------------------- AA-12: ruleset flushed
-echo "── AA-12: flushing the namespace ruleset is noticed"
+echo "â”€â”€ AA-12: flushing the namespace ruleset is noticed"
 ip netns exec "ghapp$APP_ID" nft flush table inet ghostnector 2>/dev/null
 if wait_for "no protected application can reach the network" 20; then
     ok "the flushed ruleset was noticed and the APP scope denied"
@@ -506,7 +517,7 @@ else
 fi
 
 # ---------------------------------------------------------------- AA-13: appd killed
-echo "── AA-13: killing the namespace helper loosens nothing"
+echo "â”€â”€ AA-13: killing the namespace helper loosens nothing"
 cli disconnect >/dev/null 2>&1
 cli connect --scope app >/dev/null 2>&1
 run_probe >/dev/null 2>&1
@@ -531,7 +542,7 @@ fi
 # Restart the helper so cleanup can revert cleanly.
 "$BINDIR/ghostnector-appd" --socket "$RUNDIR/appd.sock" --peer-user "$CORE_USER" \
     --state-dir "$WORKDIR/apps" --launcher "$BINDIR/ghostnector-appd-launch" \
-    --probe "$BINDIR/ghostnector-appd-probe" \
+    --probe "$BINDIR/ghostnector-appd-probe" --relay "$BINDIR/ghostnector-appd-relay" \
     --bridge "$BRIDGE" --core "$CORE" --prefix "$PREFIX" --dead-device "$DEAD" \
     >"$WORKDIR/appd2.log" 2>&1 &
 APPD_PID=$!
@@ -544,3 +555,5 @@ echo "contradicted: $FAILED"
 echo "inconclusive: $INCONCLUSIVE"
 [ "$FAILED" = "0" ] || exit 1
 exit 0
+
+

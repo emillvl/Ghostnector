@@ -25,6 +25,13 @@
 //!   `SO_ORIGINAL_DST` needs no privilege in the namespace that created the NAT.
 //! * Its only reachable peer is the core's SOCKS listener; the namespace policy allows nothing else.
 //!
+//! ## Shutdown
+//!
+//! The relay holds its network namespace open, so deleting the namespace cannot stop it, and the
+//! helper's packaged capability set has no `CAP_KILL`. Instead, the helper keeps the write end of
+//! this process's standard input: when it closes that pipe, the relay sees end-of-file and exits.
+//! A `SIGTERM` is also honoured when the helper is allowed to send one.
+//!
 //! ```text
 //! ghostnector-appd-relay --id <N> --uid <UID> --listen-port <P> --core <IP> --socks-port <P> --source <IP>
 //! ```
@@ -34,12 +41,15 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
+use std::os::fd::AsFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use caps::{CapSet, CapsHashSet};
 use ghostnector_spec::app::MAX_APP_GROUPS;
+use nix::errno::Errno;
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::sys::socket::{getsockopt, sockopt};
 use nix::unistd::{Gid, Uid, User};
 
@@ -363,9 +373,32 @@ fn serve(options: &Options) -> Result<(), String> {
         )
     })?;
     let live = Arc::new(AtomicUsize::new(0));
-    for incoming in listener.incoming() {
-        let stream = match incoming {
-            Ok(stream) => stream,
+    let stdin = std::io::stdin();
+    loop {
+        let mut fds = [
+            PollFd::new(listener.as_fd(), PollFlags::POLLIN),
+            PollFd::new(stdin.as_fd(), PollFlags::POLLIN),
+        ];
+        match poll(&mut fds, PollTimeout::NONE) {
+            Ok(0) => continue,
+            Ok(_) => {}
+            Err(Errno::EINTR) => continue,
+            Err(error) => return Err(format!("poll failed: {error}")),
+        }
+        // The helper closes the write end of this pipe to ask the relay to stop.
+        if fds[1].revents().is_some_and(|flags| {
+            flags.intersects(PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR)
+        }) {
+            return Ok(());
+        }
+        if !fds[0]
+            .revents()
+            .is_some_and(|flags| flags.contains(PollFlags::POLLIN))
+        {
+            continue;
+        }
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
             Err(error) if error.kind() == ErrorKind::Interrupted => continue,
             Err(error) => return Err(format!("accept failed: {error}")),
         };
@@ -381,7 +414,6 @@ fn serve(options: &Options) -> Result<(), String> {
             live.fetch_sub(1, Ordering::SeqCst);
         });
     }
-    Ok(())
 }
 
 fn main() -> std::process::ExitCode {

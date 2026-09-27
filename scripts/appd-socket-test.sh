@@ -29,12 +29,15 @@ PROBE="$(dirname "$APPD")/ghostnector-appd-probe"
 RELAY="$(dirname "$APPD")/ghostnector-appd-relay"
 
 RUNDIR="/run/ghostnector"
-SOCK="$RUNDIR/appd-test.sock"
+# The packaged capability set has no CAP_DAC_OVERRIDE, so these sockets must live in a root-owned
+# directory, exactly as the installed unit's does (`/run/ghostnector/appd/`).
+TESTDIR="$RUNDIR/appd-test"
+SOCK="$TESTDIR/appd-test.sock"
 STATE="/tmp/gh-appd-test/state"
 STATE2="/tmp/gh-appd-test/state2"
 STATE3="/tmp/gh-appd-test/state3"
-SOCK2="$RUNDIR/appd-test2.sock"
-SOCK3="$RUNDIR/appd-test3.sock"
+SOCK2="$TESTDIR/appd-test2.sock"
+SOCK3="$TESTDIR/appd-test3.sock"
 BRIDGE="ghbtest0"
 BRIDGE2="ghbtest1"
 BRIDGE3="ghbtest2"
@@ -56,13 +59,13 @@ cleanup() {
     ip link del "$BRIDGE" 2>/dev/null || true
     ip link del "$BRIDGE2" 2>/dev/null || true
     ip link del "$BRIDGE3" 2>/dev/null || true
-    rm -rf "$WORK" "$SOCK" "$SOCK2" "$SOCK3"
+    rm -rf "$WORK" "$TESTDIR"
 }
 trap cleanup EXIT
 
 fail() {
     echo "FAIL: $*" >&2
-    for log in "$WORK/appd.log" "$WORK/appd2.log"; do
+    for log in "$WORK/appd.log" "$WORK/appd2.log" "$WORK/appd3.log"; do
         [ -f "$log" ] && { echo "--- $log ---"; tail -20 "$log"; }
     done
     exit 1
@@ -91,8 +94,8 @@ LAUNCH_GID="$(id -g "$LAUNCH_USER")"
 [ -x "$LAUNCHER" ] || fail "the launch helper was not found at $LAUNCHER"
 [ -x "$PROBE" ] || fail "the probe was not found at $PROBE"
 
-mkdir -p "$WORK" "$RUNDIR" "$STATE" "$STATE2"
-chmod 0755 "$RUNDIR"
+mkdir -p "$WORK" "$RUNDIR" "$TESTDIR" "$STATE" "$STATE2"
+chmod 0755 "$RUNDIR" "$TESTDIR"
 
 cat >"$WORK/client.py" <<'PY'
 import socket, sys

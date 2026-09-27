@@ -28,6 +28,7 @@ table inet ghostnector {
         type filter hook output priority 0; policy drop;
         ip daddr @loopback4 counter accept comment "traffic to a loopback address cannot leave the machine"
         ip6 daddr @loopback6 counter accept comment "traffic to a loopback address cannot leave the machine"
+        oifname "lo" counter accept comment "loopback delivery cannot leave the machine"
         ip daddr @appcore4 tcp dport 53 counter accept comment "the core listener this namespace may reach"
         ip daddr @appcore4 tcp dport 9050 counter accept comment "the core listener this namespace may reach"
         ip daddr @appcore4 udp dport 53 counter accept comment "the DNS chokepoint"

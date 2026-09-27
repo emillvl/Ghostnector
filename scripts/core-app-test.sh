@@ -189,8 +189,18 @@ def socks_server():
                 destination=destination,
             )
             conn.sendall(b"\x05\x00\x00\x01" + bytes(4) + bytes(2))
-            # The application asked for a destination; answer it so the session completes.
-            conn.sendall(b"tor-ok")
+            # The verification probe sends an HTTP request through the relay; an application that
+            # just connects and reads gets the short answer. Both paths must complete.
+            conn.settimeout(2)
+            request = b""
+            try:
+                request = conn.recv(4096)
+            except OSError:
+                request = b""
+            if request.startswith(b"GET "):
+                conn.sendall(b"HTTP/1.0 200 OK\r\n\r\n203.0.113.9\n")
+            else:
+                conn.sendall(b"tor-ok")
         except OSError:
             pass
         conn.close()
