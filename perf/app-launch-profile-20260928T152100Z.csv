@@ -1,0 +1,17 @@
+label,mode,t0_epoch,self_epoch,exec_ms,netns_ms,relay_ms,launcher_ms,session_ms,app_ms,note
+run1,direct,1790608972.162,,,,,,,44.7,no self timestamp
+run1,product,1790608975.603,,,83.2,450.4,641.1,577.7,669.8,child exited 0 before the app started
+run2,product,1790609037.288,,,77.9,382.3,577.5,540.7,617.0,child exited 0 before the app started
+run2,direct,1790609099.045,,,,,,,64.0,no self timestamp
+run3,direct,1790609102.563,1790609102.601,38.7,,,,,42.5,
+run3,product,1790609105.934,,,121.2,438.1,626.1,580.0,651.2,child exited 0 before the app started
+run4,product,1790609167.653,,,77.2,440.6,636.6,582.1,661.4,child exited 0 before the app started
+run4,direct,1790609229.489,,,,,,,55.0,no self timestamp
+run5,direct,1790609232.947,,,,,,,36.5,no self timestamp
+run5,product,1790609236.441,,,137.2,465.0,734.2,644.4,750.8,child exited 0 before the app started
+run6,product,1790609298.111,,,75.1,389.5,564.4,522.5,569.9,child exited 0 before the app started
+run6,direct,1790609359.823,1790609359.868,45.3,,,,,46.3,
+run7,direct,1790609363.321,,,,,,,62.5,no self timestamp
+run7,product,1790609366.780,,,95.1,462.8,637.9,590.2,670.0,child exited 0 before the app started
+run8,product,1790609428.652,,,107.2,517.2,709.6,652.5,721.2,child exited 0 before the app started
+run8,direct,1790609490.294,1790609490.342,48.0,,,,,65.8,

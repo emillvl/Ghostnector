@@ -1,0 +1,48 @@
+# netd: pid 49846: /usr/libexec/ghostnector-netd --socket /run/ghostnector/netd/netd.sock --peer-user ghostnector --nft
+# core: pid 49856: /usr/libexec/ghostnector-core --group ghostnector --dns-helper /usr/libexec/ghostnector-dns --resolv
+# appd: pid 49855: /usr/libexec/ghostnector-appd --socket /run/ghostnector/appd/appd.sock --peer-user ghostnector --sta
+# dns: pid 49898: /usr/libexec/ghostnector-dns --listen 127.0.0.1:53 --upstream 127.0.0.1:9053 --app-core 10.200.0.1 -
+# tor: pid 49883: /usr/sbin/tor -f /run/ghostnector/torrc
+
+== SYSTEM protected idle (product) [same-instance (equivalent route reaches the product's own Tor: isolates Ghostnector's increment)] resources over 60.0s ==
+process         cpu%    rss_kb   vol_sw nonvol_sw
+appd           0.000      2676        0         0
+core           0.033      3172        0         0
+dns            0.000      2232        0         0
+netd           0.000      3684        0         0
+tor            0.150    101356       82         1
+system cpu over window: 0.0% of all cores
+== paired HTTP samples ==
+samples: 129
+
+-- route_product: 43 usable / 43 attempted --
+   dns_ms     n=43 p10=177.5 med=192.9 p90=282.2
+   connect_ms n=43 p10=3.1 med=5.5 p90=7.5
+   ttfb_ms    n=43 p10=350.7 med=372.4 p90=479.7
+   body_ms    n=43 p10=0.0 med=0.0 p90=1.7
+   total_ms   n=43 p10=551.8 med=574.6 p90=1387.0
+
+-- route_equivalent: 43 usable / 43 attempted --
+   dns_ms     n=43 p10=152.3 med=168.9 p90=230.5
+   connect_ms n=43 p10=2.3 med=4.9 p90=7.3
+   ttfb_ms    n=43 p10=305.6 med=375.8 p90=517.0
+   body_ms    n=43 p10=0.0 med=0.0 p90=1.2
+   total_ms   n=43 p10=520.6 med=552.8 p90=1227.9
+
+-- route_socks: 43 usable / 43 attempted --
+   connect_ms n=43 p10=3.4 med=4.1 p90=7.2
+   socks_ms   n=43 p10=211.0 med=230.2 p90=317.3
+   ttfb_ms    n=43 p10=206.1 med=223.8 p90=276.9
+   body_ms    n=43 p10=0.0 med=0.0 p90=178.1
+   total_ms   n=43 p10=427.8 med=474.1 p90=829.1
+
+paired route_product - route_equivalent (total_ms): n=43 p10=-134.4 med=22.9 p90=842.2 mean=57.0
+
+paired route_product - route_socks (total_ms): n=43 p10=-75.7 med=111.7 p90=960.2 mean=213.5
+
+paired route_equivalent - route_socks (total_ms): n=43 p10=-94.3 med=90.8 p90=708.3 mean=271.0
+
+== throughput rows (bytes > 100000) ==
+-- route_product: n=3 med=1.09 MiB/s p10=0.88 p90=1.10
+-- route_equivalent: n=3 med=0.97 MiB/s p10=0.51 p90=1.12
+-- route_socks: n=3 med=1.44 MiB/s p10=0.82 p90=1.46

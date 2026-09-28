@@ -1,0 +1,34 @@
+== paired HTTP samples ==
+samples: 15
+
+-- route_product: 5 usable / 5 attempted --
+   dns_ms     n=5 p10=111.7 med=118.4 p90=140.8
+   connect_ms n=5 p10=2.5 med=5.9 p90=7.2
+   ttfb_ms    n=5 p10=210.3 med=292.8 p90=1260.5
+   body_ms    n=5 p10=0.0 med=675.6 p90=1344.0
+   total_ms   n=5 p10=411.9 med=1050.9 p90=2254.9
+
+-- route_equivalent: 5 usable / 5 attempted --
+   dns_ms     n=5 p10=441.0 med=646.9 p90=1177.5
+   connect_ms n=5 p10=1.9 med=7.5 p90=10.1
+   ttfb_ms    n=5 p10=343.4 med=445.7 p90=10091.0
+   body_ms    n=5 p10=0.0 med=677.6 p90=1078.0
+   total_ms   n=5 p10=998.0 med=1796.7 p90=12403.2
+
+-- route_socks: 5 usable / 5 attempted --
+   connect_ms n=5 p10=3.5 med=7.0 p90=8.6
+   socks_ms   n=5 p10=176.3 med=240.1 p90=893.0
+   ttfb_ms    n=5 p10=173.2 med=259.0 p90=338.6
+   body_ms    n=5 p10=0.0 med=1258.7 p90=2361.7
+   total_ms   n=5 p10=367.7 med=2513.9 p90=3339.0
+
+paired route_product - route_equivalent (total_ms): n=5 p10=-647.8 med=52.9 p90=1185.8 mean=84.6
+
+paired route_product - route_socks (total_ms): n=5 p10=-1084.1 med=44.2 p90=1877.9 mean=312.5
+
+paired route_equivalent - route_socks (total_ms): n=5 p10=-1502.2 med=692.1 p90=12035.5 mean=2656.4
+
+== throughput rows (bytes > 100000) ==
+-- route_product: n=3 med=1.30 MiB/s p10=0.78 p90=1.55
+-- route_equivalent: n=3 med=1.26 MiB/s p10=0.97 p90=1.55
+-- route_socks: n=3 med=0.47 MiB/s p10=0.44 p90=0.83

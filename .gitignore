@@ -13,6 +13,7 @@ state/
 *.swp
 .DS_Store
 Thumbs.db
+__pycache__/
 
 # Local test fixtures that may contain captured environment data
 /testdata/local/
