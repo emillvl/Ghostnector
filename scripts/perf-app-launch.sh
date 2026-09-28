@@ -24,7 +24,6 @@ CORE_ENV_BAK=/var/tmp/gh-app-profile-core.env.bak
 WATCH=/usr/local/lib/gh-perf/perf-launch-watch.py
 RESOURCES=/usr/local/lib/gh-perf/perf-resources.py
 CLI=(runuser -u ghost -g ghostnector -- /usr/bin/ghostnector)
-SELF=/tmp/gh-launch-self.ts
 
 mkdir -p "$LOGDIR"
 exec >>"$LOG" 2>&1
@@ -78,7 +77,7 @@ sleep 2
 
 cat >/usr/local/bin/gh-perf-app <<'EOF'
 #!/bin/sh
-date +%s.%N > /tmp/gh-launch-self.ts
+date +%s.%N
 sleep 6
 EOF
 chmod 0755 /usr/local/bin/gh-perf-app
@@ -116,7 +115,6 @@ echo "-- warmups (1 per mode, not recorded) --"
 for mode in direct product; do
     pkill -f "/usr/local/bin/gh-perf-app" 2>/dev/null || true
     remove_groups
-    rm -f "$SELF"
     sleep 1
     python3 "$WATCH" --mode "$mode" --label warmup 2>&1 | sed 's/^/    /'
 done
@@ -133,7 +131,6 @@ for round in $(seq 1 "$N"); do
     for mode in $order; do
         pkill -f "/usr/local/bin/gh-perf-app" 2>/dev/null || true
         remove_groups
-        rm -f "$SELF"
         sleep 1
         line="$(python3 "$WATCH" --mode "$mode" --label "run$round")"
         [ -n "$line" ] && echo "$line" | tee -a "$CSV" | sed 's/^/    /'

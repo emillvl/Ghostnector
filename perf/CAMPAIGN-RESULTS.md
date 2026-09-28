@@ -249,3 +249,8 @@ The helpers are effectively idle (≈1 wake/s total, from core's verification ti
 The campaign's non-negotiable constraint held throughout: no Tor anonymity, isolation, DNS,
 D-50, namespace, nftables, fail-closed, bootguard, or least-privilege property was changed to
 obtain any number in this record.
+
+> **Update:** items 1–3 were executed against this list. APP launch fell from 665.6 ms to
+> 320.9 ms median (added overhead ≈615 → ≈263 ms); the measured attributions, CPU/RSS impact,
+> regression results and the rejected item-3 fold are in `perf/APP-LAUNCH-OPTIMIZATION.md`.
+> Nothing outside `ghostnector-appd` changed.

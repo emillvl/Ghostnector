@@ -3,12 +3,14 @@
 
 Usage:
   perf-launch-watch.py --mode direct|product --label NAME --app /usr/local/bin/gh-perf-app \
-      --self-file /var/log/ghostnector-qual/launch-self.ts --timeout 60
+      [--timeout 60]
 
-The application is a script whose first action is to write `date +%s.%N` to --self-file;
-that removes the polling granularity from the exec measurement. Every other milestone is
-observed from outside by scanning /proc, /run/netns and the helper state directory, so no
-product code is instrumented or changed.
+The application's first action is to print `date +%s.%N` on its standard output. The CLI
+relays a session's output to its own stdout, and this process holds that pipe, so the
+timestamp is read without touching the product or the sandboxed filesystem (the APP unit has
+PrivateTmp, so a file written by the application is not visible to the host). Every other
+milestone is observed from outside by scanning /proc, /run/netns and the helper state
+directory, so no product code is instrumented or changed.
 
 Output: one CSV line on stdout.
 
@@ -19,6 +21,7 @@ import argparse
 import os
 import subprocess
 import sys
+import threading
 import time
 
 GHOST = ["runuser", "-u", "ghost", "-g", "ghostnector", "--"]
@@ -81,14 +84,9 @@ def main():
     parser.add_argument("--mode", required=True, choices=["direct", "product"])
     parser.add_argument("--label", required=True)
     parser.add_argument("--app", default="/usr/local/bin/gh-perf-app")
-    parser.add_argument("--self-file", default="/tmp/gh-launch-self.ts")
-    parser.add_argument("--timeout", type=float, default=60.0)
+    parser.add_argument("--timeout", type=float, default=45.0)
     args = parser.parse_args()
 
-    try:
-        os.remove(args.self_file)
-    except OSError:
-        pass
     netns_before = netns_set()
     sessions_before = session_sockets()
     relays_before = set(processes_matching("ghostnector-appd-relay"))
@@ -104,18 +102,25 @@ def main():
     child = subprocess.Popen(
         command,
         stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
 
-    milestones = {
-        "netns": None,
-        "relay": None,
-        "launcher": None,
-        "session": None,
-        "app": None,
-    }
+    lines = []
+
+    def read_output():
+        try:
+            for line in child.stdout:
+                lines.append(line.decode("utf-8", "replace").strip())
+        except Exception:  # noqa: BLE001
+            pass
+
+    reader = threading.Thread(target=read_output, daemon=True)
+    reader.start()
+
+    milestones = {"netns": None, "relay": None, "launcher": None, "session": None, "app": None}
+    self_epoch = None
     deadline = t0_mono + args.timeout
     while time.monotonic() < deadline:
         if milestones["netns"] is None:
@@ -137,15 +142,16 @@ def main():
         if milestones["app"] is None:
             if app_processes(args.app):
                 milestones["app"] = time.monotonic()
-        if milestones["app"] is not None and os.path.exists(args.self_file):
+        if self_epoch is None:
+            for line in lines:
+                try:
+                    self_epoch = float(line)
+                    break
+                except ValueError:
+                    continue
+        if milestones["app"] is not None and self_epoch is not None:
             break
         time.sleep(0.005)
-
-    try:
-        with open(args.self_file, "r") as handle:
-            self_epoch = float(handle.read().strip())
-    except (OSError, ValueError):
-        self_epoch = None
 
     def ms(key):
         value = milestones[key]
@@ -154,9 +160,9 @@ def main():
     exec_ms = f"{(self_epoch - t0) * 1000.0:.1f}" if self_epoch is not None else ""
     note = ""
     if self_epoch is None:
-        note = "no self timestamp"
-    if child.poll() is not None and self_epoch is None:
-        note = f"child exited {child.returncode} before the app started"
+        note = "no stdout timestamp"
+        if child.poll() is not None:
+            note = f"child exited {child.returncode} before the app printed"
 
     print(
         ",".join(
