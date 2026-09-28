@@ -33,6 +33,9 @@ use nix::sched::{setns, CloneFlags};
 /// Where `ip netns` keeps its named namespaces (iproute2's fixed choice).
 pub const NETNS_DIR: &str = "/run/netns";
 
+/// Where the kernel lists the network devices of the namespace the caller is in.
+pub const SYS_CLASS_NET: &str = "/sys/class/net";
+
 /// The name of the link inside a namespace. Fixed: the app cannot name it and neither can a client.
 pub const APP_LINK: &str = "ghlink0";
 
@@ -60,6 +63,39 @@ fn bounded(id: u32) -> Result<(), BackendError> {
         )));
     }
     Ok(())
+}
+
+/// The host-side `ip` batch that creates a group's namespace and veth and enslaves the host link.
+///
+/// The port is deliberately **not** brought up here: [`SystemNamespaces::create`] runs
+/// `bridge link set ... isolated on` between this batch and the up batch, and a port that is up
+/// before it is isolated could forward a frame to another group's port in the gap. The batch stops
+/// at the first failure, like the sequential calls it replaces.
+fn host_setup_batch(name: &str, link: &str, peer: &str, bridge: &str) -> String {
+    format!(
+        "netns add {name}\n\
+         link add {link} type veth peer name {peer}\n\
+         link set {peer} netns {name}\n\
+         link set {link} master {bridge}\n"
+    )
+}
+
+/// The in-namespace `ip` batch: loopback, the link's final name and address, the core route, and
+/// the dead-end default route (the names and addresses come from the helper's own registry).
+fn namespace_setup_batch(peer: &str, request: &GroupRequest) -> String {
+    format!(
+        "link set lo up\n\
+         link set {peer} name {APP_LINK}\n\
+         link set {APP_LINK} up\n\
+         addr add {address}/32 dev {APP_LINK}\n\
+         route add {core}/32 dev {APP_LINK}\n\
+         link add {dead} type dummy\n\
+         link set {dead} up\n\
+         route add default dev {dead}\n",
+        address = request.address,
+        core = request.core,
+        dead = request.dead_device,
+    )
 }
 
 /// Everything the backend needs to create or verify one group. Built by the server from its own
@@ -278,12 +314,32 @@ impl SystemNamespaces {
     }
 
     /// Run a tool for real only if it says the object exists; "not found" is not an error here.
-    fn exists(&self, args: &[&str]) -> Result<bool, BackendError> {
-        match self.run(&self.ip, args) {
-            Ok(_) => Ok(true),
-            Err(BackendError::Command { .. }) => Ok(false),
-            Err(error) => Err(error),
-        }
+    ///
+    /// This is the read-only presence probe. It answers the same question `ip link show dev`
+    /// answered, as a `stat` instead of a fork: `/sys/class/net/<name>` exists exactly when the
+    /// kernel has a netdevice of that name in the namespace the calling thread is in. These probes
+    /// are never called from inside [`SystemNamespaces::with_namespace`], so that namespace is the
+    /// host's, which is where the bridge and the host-side link live.
+    fn device_present(&self, name: &str) -> bool {
+        Path::new(SYS_CLASS_NET).join(name).exists()
+    }
+
+    /// Run one batch of `ip` commands through a single invocation.
+    ///
+    /// `ip -batch` reads one command per line from standard input and stops at the first failure,
+    /// which is the sequential `run`-per-command semantics the callers used before; the error text
+    /// names the failing line. The commands are the helper's own fixed vocabulary (names derived
+    /// from a bounded id, typed addresses), never client input.
+    fn run_batch(&self, commands: &str) -> Result<(), BackendError> {
+        self.run_with_stdin(&self.ip, &["-batch", "-"], Some(commands))
+            .map(|_| ())
+    }
+
+    /// A batch where every command must be attempted even if an earlier one fails, for idempotent
+    /// teardown. The overall status is ignored by the caller for the same reason.
+    fn run_batch_force(&self, commands: &str) -> Result<(), BackendError> {
+        self.run_with_stdin(&self.ip, &["-force", "-batch", "-"], Some(commands))
+            .map(|_| ())
     }
 
     /// Enter a namespace, run the closure, and always come back.
@@ -419,7 +475,7 @@ impl SystemNamespaces {
 
 impl Namespaces for SystemNamespaces {
     fn bridge_present(&self) -> Result<bool, BackendError> {
-        self.exists(&["link", "show", "dev", &self.bridge])
+        Ok(self.device_present(&self.bridge))
     }
 
     fn ensure_bridge(&self) -> Result<(), BackendError> {
@@ -447,8 +503,7 @@ impl Namespaces for SystemNamespaces {
     fn group_present(&self, id: u32) -> Result<bool, BackendError> {
         let name = netns_name(id)?;
         let link = host_link(id)?;
-        Ok(Path::new(&format!("{NETNS_DIR}/{name}")).exists()
-            && self.exists(&["link", "show", "dev", &link])?)
+        Ok(Path::new(&format!("{NETNS_DIR}/{name}")).exists() && self.device_present(&link))
     }
 
     fn create(&self, request: &GroupRequest) -> Result<(), BackendError> {
@@ -461,27 +516,21 @@ impl Namespaces for SystemNamespaces {
             ));
         }
 
-        // 1. The namespace.
-        self.run(&self.ip, &["netns", "add", &name])?;
-
-        // 2. The link, moved into the namespace.
-        self.run(
-            &self.ip,
-            &["link", "add", &link, "type", "veth", "peer", "name", &peer],
-        )?;
-        let moved = self.run(&self.ip, &["link", "set", &peer, "netns", &name]);
-        if let Err(error) = moved {
-            // Leave nothing half-created behind.
-            let _ = self.run(&self.ip, &["link", "del", &link]);
-            let _ = self.run(&self.ip, &["netns", "del", &name]);
+        // 1-2. The namespace and its link, as one `ip` transaction. The batch stops at the first
+        //      failure, so the semantics are exactly the sequential calls it replaces; a failure
+        //      leaves nothing half-created because the teardown below is idempotent.
+        let host_batch = host_setup_batch(&name, &link, &peer, &self.bridge);
+        if let Err(error) = self.run_batch(&host_batch) {
+            let _ = self.destroy(request.id);
             return Err(error);
         }
 
         // 3. The host side: a bridge port, isolated from every other port, never a proxy.
+        //    The port is deliberately brought up only after `isolated on` is in force: a port that
+        //    is up first could forward a frame to another group's port in the gap.
         let host_side = (|| -> Result<(), BackendError> {
-            self.run(&self.ip, &["link", "set", &link, "master", &self.bridge])?;
             self.bridge_ctl(&["link", "set", "dev", &link, "isolated", "on"])?;
-            self.run(&self.ip, &["link", "set", &link, "up"])?;
+            self.run_batch(&format!("link set {link} up\n"))?;
             self.write_sysctl(&format!("net/ipv4/conf/{link}/proxy_arp"), "0")?;
             Ok(())
         })();
@@ -490,42 +539,11 @@ impl Namespaces for SystemNamespaces {
             return Err(error);
         }
 
-        // 4. The namespace itself, then its policy.
+        // 4. The namespace itself, then its policy. The eight setup commands are one `ip`
+        //    transaction with the same order and the same stop-on-first-error behavior.
         let inside = self.with_namespace(&name, || {
-            self.run(&self.ip, &["link", "set", "lo", "up"])?;
-            self.run(&self.ip, &["link", "set", &peer, "name", APP_LINK])?;
-            self.run(&self.ip, &["link", "set", APP_LINK, "up"])?;
-            self.run(
-                &self.ip,
-                &[
-                    "addr",
-                    "add",
-                    &format!("{}/32", request.address),
-                    "dev",
-                    APP_LINK,
-                ],
-            )?;
-            self.run(
-                &self.ip,
-                &[
-                    "route",
-                    "add",
-                    &format!("{}/32", request.core),
-                    "dev",
-                    APP_LINK,
-                ],
-            )?;
-
-            // The dead end: a device with no peer. A flushed ruleset routes here and dies.
-            self.run(
-                &self.ip,
-                &["link", "add", &request.dead_device, "type", "dummy"],
-            )?;
-            self.run(&self.ip, &["link", "set", &request.dead_device, "up"])?;
-            self.run(
-                &self.ip,
-                &["route", "add", "default", "dev", &request.dead_device],
-            )?;
+            let inside_batch = namespace_setup_batch(&peer, request);
+            self.run_batch(&inside_batch)?;
 
             // No IPv6 and no redirects: nothing to leak and nothing to be redirected by.
             self.write_sysctl("net/ipv6/conf/all/disable_ipv6", "1")?;
@@ -564,9 +582,10 @@ impl Namespaces for SystemNamespaces {
         // Deleting either side of the veth removes both; deleting the namespace removes the rest.
         // The relay's sockets live in that namespace, so this is also what makes it exit: the
         // packaged capability set has no CAP_KILL, and a relay this process may not signal still
-        // dies when its namespace does.
-        let _ = self.run(&self.ip, &["link", "del", &link]);
-        let _ = self.run(&self.ip, &["netns", "del", &name]);
+        // dies when its namespace does. Both deletions are attempted even when one fails (a link
+        // that is already gone must not stop the namespace deletion), which is what `-force`
+        // means; the result is deliberately ignored for the same idempotence reason as before.
+        let _ = self.run_batch_force(&format!("link del {link}\nnetns del {name}\n"));
         self.stop_relay(id);
         Ok(())
     }
@@ -782,7 +801,7 @@ impl Namespaces for SystemNamespaces {
         if !Path::new(&format!("{NETNS_DIR}/{name}")).exists() {
             return Ok(vec!["the namespace is missing".to_string()]);
         }
-        if !self.exists(&["link", "show", "dev", &link])? {
+        if !self.device_present(&link) {
             return Ok(vec!["the host-side link is missing".to_string()]);
         }
 
@@ -939,5 +958,55 @@ mod tests {
             describe_failure(b"", Some(2)),
             "the tool exited with status 2"
         );
+    }
+
+    #[test]
+    fn the_host_batch_brings_the_port_up_only_after_isolation() {
+        let batch = host_setup_batch("ghapp3", "ghav3", "ghpeer3", "ghbr0");
+        assert_eq!(
+            batch,
+            "netns add ghapp3\n\
+             link add ghav3 type veth peer name ghpeer3\n\
+             link set ghpeer3 netns ghapp3\n\
+             link set ghav3 master ghbr0\n"
+        );
+        assert!(
+            !batch.contains(" up\n") && !batch.contains("isolated"),
+            "bringing the port up and isolating it are separate steps, in that order: {batch}"
+        );
+    }
+
+    #[test]
+    fn the_namespace_batch_is_the_exact_dead_end_setup() {
+        let request = GroupRequest {
+            id: 3,
+            owner_uid: 1000,
+            address: Ipv4Addr::new(10, 200, 0, 4),
+            bridge: "ghbr0".to_string(),
+            core: Ipv4Addr::new(10, 200, 0, 1),
+            prefix: 24,
+            dead_device: "ghdead".to_string(),
+            ports: Ports::default(),
+            state_dir: PathBuf::from("/run/ghostnector/apps"),
+        };
+        let batch = namespace_setup_batch("ghpeer3", &request);
+        assert_eq!(
+            batch,
+            "link set lo up\n\
+             link set ghpeer3 name ghlink0\n\
+             link set ghlink0 up\n\
+             addr add 10.200.0.4/32 dev ghlink0\n\
+             route add 10.200.0.1/32 dev ghlink0\n\
+             link add ghdead type dummy\n\
+             link set ghdead up\n\
+             route add default dev ghdead\n"
+        );
+        // The default route terminates on the dead end and comes after the core route, so a
+        // flushed ruleset still has nowhere to send an un-rewritten packet.
+        let dead_end = batch.find("route add default").expect("the dead-end route");
+        let core = batch
+            .find("route add 10.200.0.1/32")
+            .expect("the core route");
+        assert!(core < dead_end, "{batch}");
     }
 }
