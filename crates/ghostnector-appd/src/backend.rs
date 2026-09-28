@@ -36,6 +36,14 @@ pub const NETNS_DIR: &str = "/run/netns";
 /// Where the kernel lists the network devices of the namespace the caller is in.
 pub const SYS_CLASS_NET: &str = "/sys/class/net";
 
+/// How often the helper checks whether a freshly spawned relay is listening.
+///
+/// The relay is a separate process (usually a few tens of milliseconds from exec to bind), so the
+/// first check right after spawn often misses. A 10 ms bound keeps the wait proportional to the
+/// startup it is waiting for instead of the old fixed 100 ms that dominated a fast start; the
+/// overall deadline and the fail-on-exit check are what make a dead relay fail safely.
+const RELAY_READY_POLL: Duration = Duration::from_millis(10);
+
 /// The name of the link inside a namespace. Fixed: the app cannot name it and neither can a client.
 pub const APP_LINK: &str = "ghlink0";
 
@@ -638,10 +646,17 @@ impl Namespaces for SystemNamespaces {
             .insert(request.id, RelayHandle { pid, control });
 
         // Wait until it accepts connections on the namespace's loopback. A relay that cannot come
-        // up means the group has no usable path, so the caller destroys it.
+        // up means the group has no usable path, so the caller destroys it. The wrapper is asked
+        // whether it already exited as well: a relay that died (or failed to exec) must fail the
+        // creation now, not after the deadline.
         let name = netns_name(request.id)?;
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
+            if let Ok(Some(status)) = child.try_wait() {
+                return Err(BackendError::Refused(format!(
+                    "the namespace relay exited before it listened ({status})"
+                )));
+            }
             let listening = self.with_namespace(&name, || {
                 std::net::TcpStream::connect_timeout(
                     &std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, APP_RELAY_PORT)),
@@ -660,7 +675,7 @@ impl Namespaces for SystemNamespaces {
                     "the namespace relay did not start".to_string(),
                 ));
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(RELAY_READY_POLL);
         }
     }
 

@@ -36,11 +36,14 @@ SOCK="$TESTDIR/appd-test.sock"
 STATE="/tmp/gh-appd-test/state"
 STATE2="/tmp/gh-appd-test/state2"
 STATE3="/tmp/gh-appd-test/state3"
+STATE4="/tmp/gh-appd-test/state4"
 SOCK2="$TESTDIR/appd-test2.sock"
 SOCK3="$TESTDIR/appd-test3.sock"
+SOCK4="$TESTDIR/appd-test4.sock"
 BRIDGE="ghbtest0"
 BRIDGE2="ghbtest1"
 BRIDGE3="ghbtest2"
+BRIDGE4="ghbtest3"
 CORE="10.231.0.1"
 PREFIX="24"
 DEAD="ghdead"
@@ -50,22 +53,25 @@ WORK="/tmp/gh-appd-test"
 APPD_PID=""
 APPD2_PID=""
 APPD3_PID=""
+APPD4_PID=""
 
 cleanup() {
     [ -n "$APPD_PID" ] && kill "$APPD_PID" 2>/dev/null || true
     [ -n "$APPD2_PID" ] && kill "$APPD2_PID" 2>/dev/null || true
     [ -n "$APPD3_PID" ] && kill "$APPD3_PID" 2>/dev/null || true
+    [ -n "$APPD4_PID" ] && kill "$APPD4_PID" 2>/dev/null || true
     for ns in ghapp1 ghapp2 ghapp3 ghapp4; do ip netns del "$ns" 2>/dev/null || true; done
     ip link del "$BRIDGE" 2>/dev/null || true
     ip link del "$BRIDGE2" 2>/dev/null || true
     ip link del "$BRIDGE3" 2>/dev/null || true
+    ip link del "$BRIDGE4" 2>/dev/null || true
     rm -rf "$WORK" "$TESTDIR"
 }
 trap cleanup EXIT
 
 fail() {
     echo "FAIL: $*" >&2
-    for log in "$WORK/appd.log" "$WORK/appd2.log" "$WORK/appd3.log"; do
+    for log in "$WORK/appd.log" "$WORK/appd2.log" "$WORK/appd3.log" "$WORK/appd4.log"; do
         [ -f "$log" ] && { echo "--- $log ---"; tail -20 "$log"; }
     done
     exit 1
@@ -450,6 +456,56 @@ ok "the packaged set stops and reaps the relay without CAP_KILL"
 kill "$APPD3_PID" 2>/dev/null || true
 wait "$APPD3_PID" 2>/dev/null || true
 APPD3_PID=""
+
+echo "[8b] a relay that exits before listening fails the group creation, quickly, and leaves nothing"
+# The readiness loop must not wait out its deadline for a relay that is already dead, and the
+# failed create must clean up the namespace it made. This is the D-50 property ("no relay means no
+# usable group") under the tighter, exit-checking readiness mechanism.
+cat >"$WORK/fake-relay" <<'EOF'
+#!/bin/sh
+exit 7
+EOF
+chmod 0755 "$WORK/fake-relay"
+setpriv --reuid=0 --regid=0 --clear-groups \
+    --bounding-set=-all,+net_admin,+sys_admin,+chown,+setuid,+setgid \
+    --inh-caps +net_admin --ambient-caps +net_admin,+sys_admin,+setuid,+setgid \
+    "$APPD" --socket "$SOCK4" --peer-uid "$CORE_UID" --state-dir "$STATE4" \
+    --launcher "$LAUNCHER" --probe "$PROBE" --relay "$WORK/fake-relay" \
+    --bridge "$BRIDGE4" --core "$CORE" --prefix "$PREFIX" --dead-device "$DEAD" \
+    >"$WORK/appd4.log" 2>&1 &
+APPD4_PID=$!
+for _ in $(seq 1 60); do [ -S "$SOCK4" ] && break; sleep 0.1; done
+[ -S "$SOCK4" ] || fail "the helper with the dead relay did not start"
+
+fake_call() {
+    setpriv --reuid="$CORE_UID" --regid="$CORE_GID" --clear-groups \
+        python3 "$WORK/client.py" "$SOCK4" "$handshake" "$@" | tail -n1
+}
+ANSWER="$(fake_call '{"verb":"ensure_bridge","ports":{"trans":19140,"chokepoint":19053,"socks":19050}}')"
+case "$ANSWER" in
+*'"result":"applied"'*) ;;
+*) fail "the dead-relay helper could not build the bridge: $ANSWER" ;;
+esac
+STARTED_NS="$(date +%s%N)"
+ANSWER="$(fake_call "{\"verb\":\"create\",\"user_uid\":$CORE_UID}")"
+ELAPSED_MS=$(( ($(date +%s%N) - STARTED_NS) / 1000000 ))
+case "$ANSWER" in
+*'"code":"backend_failure"'*) ok "the dead relay fails the group creation" ;;
+*) fail "the dead relay did not fail the creation: $ANSWER" ;;
+esac
+[ ! -e /run/netns/ghapp1 ] || fail "the failed create left a namespace behind"
+ANSWER="$(fake_call '{"verb":"report_registry"}')"
+case "$ANSWER" in
+*'"entries":[]'*) ok "no half-created group was recorded" ;;
+*) fail "the failed create left a registry entry: $ANSWER" ;;
+esac
+[ "$ELAPSED_MS" -lt 3000 ] ||
+    fail "the dead relay took ${ELAPSED_MS}ms to fail; the readiness check is not failing fast"
+ok "the dead relay failed in ${ELAPSED_MS}ms, not after the 5s deadline"
+kill "$APPD4_PID" 2>/dev/null || true
+wait "$APPD4_PID" 2>/dev/null || true
+APPD4_PID=""
+ip link del "$BRIDGE4" 2>/dev/null || true
 
 # The same state minus CAP_SYS_ADMIN. The bridge still works (CAP_NET_ADMIN), the socket is still
 # prepared (CAP_CHOWN), and creating a namespace fails with EPERM: this is the empirical
