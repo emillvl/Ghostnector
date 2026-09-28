@@ -34,7 +34,6 @@ fn main() -> std::process::ExitCode {
         ghostnector_appd::backend::Tools {
             nft: config.nft.clone(),
             ip: config.ip.clone(),
-            bridge_ctl: config.bridge_ctl.clone(),
             probe: config.probe.clone(),
             relay: config.relay.clone(),
         },

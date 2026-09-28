@@ -73,18 +73,21 @@ fn bounded(id: u32) -> Result<(), BackendError> {
     Ok(())
 }
 
-/// The host-side `ip` batch that creates a group's namespace and veth and enslaves the host link.
+/// The host-side `ip` batch that creates a group's namespace and veth, enslaves the host link to
+/// the bridge, isolates the port from every other port, and brings it up.
 ///
-/// The port is deliberately **not** brought up here: [`SystemNamespaces::create`] runs
-/// `bridge link set ... isolated on` between this batch and the up batch, and a port that is up
-/// before it is isolated could forward a frame to another group's port in the gap. The batch stops
-/// at the first failure, like the sequential calls it replaces.
+/// The order is the security property: `master` enslaves, `bridge_slave isolated on` makes the
+/// port unable to forward to another group's port, and only then does `up` make it usable. All of
+/// it is one `ip` transaction that stops at the first failure, so a port can never come up
+/// un-isolated or half-created.
 fn host_setup_batch(name: &str, link: &str, peer: &str, bridge: &str) -> String {
     format!(
         "netns add {name}\n\
          link add {link} type veth peer name {peer}\n\
          link set {peer} netns {name}\n\
-         link set {link} master {bridge}\n"
+         link set {link} master {bridge}\n\
+         link set {link} type bridge_slave isolated on\n\
+         link set {link} up\n"
     )
 }
 
@@ -211,8 +214,6 @@ pub struct Tools {
     pub nft: PathBuf,
     /// Absolute path to `ip`.
     pub ip: PathBuf,
-    /// Absolute path to `bridge` (used only for port isolation).
-    pub bridge_ctl: PathBuf,
     /// Absolute path to the fixed verification probe.
     pub probe: PathBuf,
     /// Absolute path to the per-namespace transparent relay.
@@ -228,12 +229,11 @@ struct RelayHandle {
     control: Option<ChildStdin>,
 }
 
-/// The real backend: `ip`, `bridge`, `nft`, and the per-namespace sysctl files.
+/// The real backend: `ip`, `nft`, and the per-namespace sysctl files.
 #[derive(Debug)]
 pub struct SystemNamespaces {
     nft: PathBuf,
     ip: PathBuf,
-    bridge_ctl: PathBuf,
     probe: PathBuf,
     relay: PathBuf,
     bridge: String,
@@ -255,13 +255,11 @@ impl SystemNamespaces {
     ) -> Result<Self, BackendError> {
         check_tool(&tools.nft)?;
         check_tool(&tools.ip)?;
-        check_tool(&tools.bridge_ctl)?;
         check_tool(&tools.probe)?;
         check_tool(&tools.relay)?;
         Ok(Self {
             nft: tools.nft,
             ip: tools.ip,
-            bridge_ctl: tools.bridge_ctl,
             probe: tools.probe,
             relay: tools.relay,
             bridge,
@@ -409,10 +407,6 @@ impl SystemNamespaces {
             })
     }
 
-    fn bridge_ctl(&self, args: &[&str]) -> Result<(), BackendError> {
-        self.run(&self.bridge_ctl, args).map(|_| ())
-    }
-
     fn namespace_policy(&self, request: &GroupRequest) -> Result<String, BackendError> {
         let environment = ghostnector_policy::Environment {
             tor_uid: None,
@@ -524,25 +518,17 @@ impl Namespaces for SystemNamespaces {
             ));
         }
 
-        // 1-2. The namespace and its link, as one `ip` transaction. The batch stops at the first
-        //      failure, so the semantics are exactly the sequential calls it replaces; a failure
-        //      leaves nothing half-created because the teardown below is idempotent.
-        let host_batch = host_setup_batch(&name, &link, &peer, &self.bridge);
-        if let Err(error) = self.run_batch(&host_batch) {
+        // 1-3. The namespace, its link, and the host side, as one `ip` transaction: created,
+        //      enslaved to the bridge, isolated from every other port, and brought up only then.
+        //      The batch stops at the first failure, so nothing is left half-created (the
+        //      teardown below is idempotent) and a port can never come up un-isolated.
+        if let Err(error) = self.run_batch(&host_setup_batch(&name, &link, &peer, &self.bridge)) {
             let _ = self.destroy(request.id);
             return Err(error);
         }
-
-        // 3. The host side: a bridge port, isolated from every other port, never a proxy.
-        //    The port is deliberately brought up only after `isolated on` is in force: a port that
-        //    is up first could forward a frame to another group's port in the gap.
-        let host_side = (|| -> Result<(), BackendError> {
-            self.bridge_ctl(&["link", "set", "dev", &link, "isolated", "on"])?;
-            self.run_batch(&format!("link set {link} up\n"))?;
-            self.write_sysctl(&format!("net/ipv4/conf/{link}/proxy_arp"), "0")?;
-            Ok(())
-        })();
-        if let Err(error) = host_side {
+        // The bridge answers for the core address and never proxies for a destination: an
+        // un-rewritten packet must not find a next hop through it (M8 decision 1).
+        if let Err(error) = self.write_sysctl(&format!("net/ipv4/conf/{link}/proxy_arp"), "0") {
             let _ = self.destroy(request.id);
             return Err(error);
         }
@@ -983,11 +969,16 @@ mod tests {
             "netns add ghapp3\n\
              link add ghav3 type veth peer name ghpeer3\n\
              link set ghpeer3 netns ghapp3\n\
-             link set ghav3 master ghbr0\n"
+             link set ghav3 master ghbr0\n\
+             link set ghav3 type bridge_slave isolated on\n\
+             link set ghav3 up\n"
         );
+        let slave = batch.find("master ghbr0").expect("enslavement");
+        let isolated = batch.find("isolated on").expect("isolation");
+        let up = batch.find(" up\n").expect("the up state");
         assert!(
-            !batch.contains(" up\n") && !batch.contains("isolated"),
-            "bringing the port up and isolating it are separate steps, in that order: {batch}"
+            slave < isolated && isolated < up,
+            "a port must be isolated before it is up: {batch}"
         );
     }
 

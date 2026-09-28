@@ -15,8 +15,6 @@ use ghostnector_spec::app::valid_interface_name;
 pub const DEFAULT_NFT: &str = "/usr/sbin/nft";
 /// Default path of the network configuration tool.
 pub const DEFAULT_IP: &str = "/usr/sbin/ip";
-/// Default path of the bridge control tool (port isolation).
-pub const DEFAULT_BRIDGE_CTL: &str = "/usr/sbin/bridge";
 /// Default path of the privilege-dropping launch helper.
 pub const DEFAULT_LAUNCHER: &str = "/usr/libexec/ghostnector-appd-launch";
 /// Default path of the fixed verification probe.
@@ -39,8 +37,6 @@ pub struct Config {
     pub nft: PathBuf,
     /// Absolute path to `ip`.
     pub ip: PathBuf,
-    /// Absolute path to `bridge` (used only for port isolation).
-    pub bridge_ctl: PathBuf,
     /// Absolute path to the privilege-dropping launch helper.
     pub launcher: PathBuf,
     /// Absolute path to the fixed verification probe.
@@ -113,7 +109,6 @@ REQUIRED:
 OPTIONS:
     --nft <PATH>           policy tool                [default: /usr/sbin/nft]
     --ip <PATH>            network tool               [default: /usr/sbin/ip]
-    --bridge-ctl <PATH>    bridge control tool        [default: /usr/sbin/bridge]
     --launcher <PATH>      privilege-drop helper     [default: /usr/libexec/ghostnector-appd-launch]
     --probe <PATH>         verification probe        [default: /usr/libexec/ghostnector-appd-probe]
     --relay <PATH>         namespace TCP relay       [default: /usr/libexec/ghostnector-appd-relay]
@@ -138,7 +133,6 @@ OPTIONS:
         let mut peer_uid: Option<u32> = None;
         let mut nft = PathBuf::from(DEFAULT_NFT);
         let mut ip = PathBuf::from(DEFAULT_IP);
-        let mut bridge_ctl = PathBuf::from(DEFAULT_BRIDGE_CTL);
         let mut launcher = PathBuf::from(DEFAULT_LAUNCHER);
         let mut probe = PathBuf::from(DEFAULT_PROBE);
         let mut relay = PathBuf::from(DEFAULT_RELAY);
@@ -168,7 +162,6 @@ OPTIONS:
                 "--socket" => socket = Some(absolute(&option, &value()?)?),
                 "--nft" => nft = absolute(&option, &value()?)?,
                 "--ip" => ip = absolute(&option, &value()?)?,
-                "--bridge-ctl" => bridge_ctl = absolute(&option, &value()?)?,
                 "--launcher" => launcher = absolute(&option, &value()?)?,
                 "--probe" => probe = absolute(&option, &value()?)?,
                 "--relay" => relay = absolute(&option, &value()?)?,
@@ -323,7 +316,6 @@ OPTIONS:
             peer_uid,
             nft,
             ip,
-            bridge_ctl,
             launcher,
             probe,
             relay,
