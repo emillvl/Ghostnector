@@ -249,13 +249,28 @@ python3 "$WORKDIR/fake-tor.py" "$CONTROL_PORT" 9050 9053 "$CORE" "$WORKDIR/event
 TOR_PID=$!
 sleep 0.3
 
+# Wait until a helper socket exists AND carries its final mode.
+#
+# The daemons bind and then set the socket's group/mode immediately; a client that connects inside
+# that microsecond window gets EACCES on a socket that is briefly owner-only behind the process's
+# umask. The gate hit that race once (`core-app rc=1`, `FAIL: connect failed`). Waiting for the
+# final mode removes the race without touching the product.
+wait_socket() { # path expected-mode label
+    local i
+    for i in $(seq 1 100); do
+        [ -S "$1" ] && [ "$(stat -c %a "$1" 2>/dev/null)" = "$2" ] && return 0
+        sleep 0.1
+    done
+    return 1
+}
+
 "$BINDIR/ghostnector-netd" \
     --socket "$RUNDIR/netd.sock" --peer-uid "$CORE_UID" \
     --app-bridge "$BRIDGE" --app-core "$CORE" \
     --fallback-path "$WORKDIR/fail-closed.nft" >"$WORKDIR/netd.log" 2>&1 &
 NETD_PID=$!
-for _ in $(seq 1 60); do [ -S "$RUNDIR/netd.sock" ] && break; sleep 0.1; done
-[ -S "$RUNDIR/netd.sock" ] || fail "the firewall helper did not start"
+wait_socket "$RUNDIR/netd.sock" 600 "the firewall helper" ||
+    fail "the firewall helper did not start"
 
 "$BINDIR/ghostnector-appd" \
     --socket "$RUNDIR/appd.sock" --peer-user "$CORE_USER" \
@@ -264,8 +279,8 @@ for _ in $(seq 1 60); do [ -S "$RUNDIR/netd.sock" ] && break; sleep 0.1; done
     --bridge "$BRIDGE" --core "$CORE" --prefix "$PREFIX" --dead-device "$DEAD" \
     >"$WORKDIR/appd.log" 2>&1 &
 APPD_PID=$!
-for _ in $(seq 1 60); do [ -S "$RUNDIR/appd.sock" ] && break; sleep 0.1; done
-[ -S "$RUNDIR/appd.sock" ] || fail "the namespace helper did not start"
+wait_socket "$RUNDIR/appd.sock" 600 "the namespace helper" ||
+    fail "the namespace helper did not start"
 
 setpriv --reuid="$CORE_UID" --regid="$CORE_GID" --clear-groups \
     --inh-caps +net_bind_service --ambient-caps +net_bind_service \
@@ -282,8 +297,8 @@ setpriv --reuid="$CORE_UID" --regid="$CORE_GID" --clear-groups \
     --group "$CORE_USER" \
     >"$WORKDIR/core.log" 2>&1 &
 CORE_PID=$!
-for _ in $(seq 1 60); do [ -S "$RUNDIR/core.sock" ] && break; sleep 0.1; done
-[ -S "$RUNDIR/core.sock" ] || fail "the control plane did not start"
+wait_socket "$RUNDIR/core.sock" 660 "the control plane" ||
+    fail "the control plane did not start"
 
 # The CLI runs as the launch user, with the control plane's group so it may reach the socket.
 cli() {
@@ -338,7 +353,7 @@ answer, _ = udp.recvfrom(1024)
 print("dns:" + ".".join(str(byte) for byte in answer[-4:]))
 PY
 
-OUTPUT="$(cli run -- python3 "$WORKDIR/probe.py" 2>&1)" || { echo "$OUTPUT"; fail "run failed"; }
+OUTPUT="$(cli run -- python3 "$WORKDIR/probe.py" </dev/null 2>&1)" || { echo "$OUTPUT"; fail "run failed"; }
 note "the session said: $OUTPUT"
 case "$OUTPUT" in
 *"uid:$LAUNCH_UID"*) ok "the command ran as uid $LAUNCH_UID inside the namespace" ;;
@@ -378,6 +393,32 @@ grep -q '"kind": "dns", "from_address": "127.0.0.1"' "$WORKDIR/events.jsonl" ||
     { cat "$WORKDIR/events.jsonl"; fail "the chokepoint did not forward the query"; }
 ok "the chokepoint forwarded the query to Tor's DNSPort"
 
+echo "[2b] a session returns when its command ends even if the caller's stdin stays open"
+# The CLI relays standard input; after the session ends it must not wait for that input to close,
+# or an interactive terminal (or any pipe that stays open) would hang after the protected command
+# has already finished. `sleep 30` holds stdin open via process substitution; the session runs
+# `/bin/true` and must return promptly.
+STARTED_AT="$(date +%s)"
+if timeout 25 setpriv --reuid="$LAUNCH_UID" --regid="$LAUNCH_GID" --groups "$CORE_GID" \
+    "$BINDIR/ghostnector" --socket "$RUNDIR/core.sock" run -- /bin/true \
+    < <(sleep 30) >/dev/null 2>&1; then
+    SESSION_RC=0
+else
+    SESSION_RC=$?
+fi
+SESSION_SECS=$(( $(date +%s) - STARTED_AT ))
+[ "$SESSION_RC" = "0" ] ||
+    fail "a session with held-open stdin did not return cleanly (rc=$SESSION_RC, ${SESSION_SECS}s)"
+[ "$SESSION_SECS" -lt 15 ] ||
+    fail "a session with held-open stdin took ${SESSION_SECS}s; it must return when the command does"
+ok "the session returned in ${SESSION_SECS}s with its stdin still open"
+# The [2b] session created its own group (its command has exited, but a group lives until it is
+# stopped); remove every group except the one step [2] owns so the later listing assertions see
+# the state they expect.
+for extra in $(cli apps 2>&1 | awk '/^  -/ { print $2 }'); do
+    [ "$extra" = "$APP_ID" ] || cli stop-app "$extra" >/dev/null 2>&1 || true
+done
+
 echo "[3] verification runs inside the namespace and is the only route to Protected"
 VERIFIED=""
 for _ in $(seq 1 20); do
@@ -405,7 +446,7 @@ esac
 ok "the namespace is gone"
 
 echo "[5] a tampered namespace blocks the APP scope and removes the namespaces"
-OUTPUT="$(cli run -- python3 "$WORKDIR/probe.py" 2>&1)" || { echo "$OUTPUT"; fail "run failed"; }
+OUTPUT="$(cli run -- python3 "$WORKDIR/probe.py" </dev/null 2>&1)" || { echo "$OUTPUT"; fail "run failed"; }
 LIST="$(cli apps 2>&1)"
 APP_ID="$(printf '%s\n' "$LIST" | awk '/^  -/ { print $2; exit }')"
 [ -n "$APP_ID" ] || fail "no application to tamper with: $LIST"
