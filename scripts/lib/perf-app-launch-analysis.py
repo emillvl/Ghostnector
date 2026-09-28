@@ -22,6 +22,11 @@ def median_of(rows, key):
     return statistics.median(values) if values else None
 
 
+def percentile(values, fraction):
+    ordered = sorted(values)
+    return ordered[int(round(fraction * (len(ordered) - 1)))]
+
+
 def main():
     rows = list(csv.DictReader(open(sys.argv[1], newline="", encoding="utf-8")))
     for mode in ("direct", "product"):
@@ -31,10 +36,10 @@ def main():
             values = [number(row, field) for row in subset]
             values = [value for value in values if value is not None]
             if values:
-                values.sort()
                 print(
-                    f"   {field:10s} n={len(values):2d} med={statistics.median(values):7.1f} "
-                    f"min={values[0]:7.1f} max={values[-1]:7.1f}"
+                    f"   {field:10s} n={len(values):2d} p10={percentile(values, 0.10):7.1f} "
+                    f"med={statistics.median(values):7.1f} p90={percentile(values, 0.90):7.1f} "
+                    f"min={min(values):7.1f} max={max(values):7.1f}"
                 )
     product = [row for row in rows if row["mode"] == "product"]
     direct = [row for row in rows if row["mode"] == "direct"]

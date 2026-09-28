@@ -28,13 +28,13 @@ Product process-appearance (`app_ms`) medians:
 
 | build | product p10 / med / p90 | direct med | added over direct | netns→relay | relay→app |
 |---|---|---|---|---|---|
-| qualified `f82adf9` (N=8) | 555 / **665.6** / 751 | 50.6 | ~615 ms | 356.4 ms | 220.1 ms |
-| item 1 `012e9c0` (N=10) | 370 / **423.0** / 956 | 66.2 | ~357 ms | 176.9 ms | 169.3 ms |
-| items 1+2 `6a53d20` (N=10) | 332 / **362.4** / 651 | 70.7 | ~292 ms | 186.7 ms | 92.3 ms |
-| final `0d947df` (N=10) | 288 / **320.9** / 603 | 57.9 | ~263 ms | 146.8 ms | 100.4 ms |
+| qualified `f82adf9` (N=8) | 617.0 / **665.6** / 721.2 | 50.6 | ~615 ms | 356.4 ms | 220.1 ms |
+| item 1 `012e9c0` (N=10) | 377.2 / **423.0** / 441.7 | 66.2 | ~357 ms | 176.9 ms | 169.3 ms |
+| items 1+2 `6a53d20` (N=10) | 340.1 / **362.4** / 404.7 | 70.7 | ~292 ms | 186.7 ms | 92.3 ms |
+| final `0d947df` (N=10) | 289.6 / **320.9** / 357.9 | 57.9 | ~263 ms | 146.8 ms | 100.4 ms |
 
 With the app's own stdout timestamp (available for the final build, both modes): product
-`exec_ms` median **331.8 ms** vs direct **56.5 ms**.
+`exec_ms` p10/med/p90 = 300.0 / **331.8** / 372.1 ms vs direct 43.6 / **56.5** / 67.6 ms.
 
 ### Exact attribution (same profiler, same VM)
 
