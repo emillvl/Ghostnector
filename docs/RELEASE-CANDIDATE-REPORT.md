@@ -41,7 +41,7 @@ product on `ghostnector-qual`:
 
 | area | evidence | verdict |
 |---|---|---|
-| APP launch | `app-launch-profile-20260928T173332Z.csv` (N=10) | 298.3 / **326.5** / 366.7 ms p10/med/p90 vs 665.6 ms before (−51 %); app-added ≈274 ms; helper CPU 21.7 ms/launch (was 56.7), RSS ≈2.95 MB (unchanged) |
+| APP launch | `app-launch-profile-20260928T173332Z.csv` (N=10 at the optimization commit) and `…T202434Z.csv` (N=10, final installed commit) | final installed: 291.9 / **301.9** / 352.7 ms p10/med/p90 vs 665.6 ms before (−54.6 %); app-added ≈238 ms against a 63.4 ms direct launch in the same run; helper CPU 21.7 ms/launch (was 56.7), RSS ≈2.95 MB (unchanged) |
 | Paired HTTP | `paired-http-20260928T171914Z` (two-instance), `…T172817Z` (same-instance) | product total 501.8 ms vs standalone 918.3 ms (instance variance); same-instance 526.4 vs 510.3 ms; focused chokepoint DNS +3.9 ms (`dns-focus-20260928T174245Z`) |
 | Leakage | `leak-20260928T200642Z.log` + host observer | VM **30 held / 0 contradicted / 0 inconclusive**; analyzer exit 0: 3 expected arrivals, 2 self-probes, **0 violations / 0 ambiguous**, heartbeats spanning the window |
 | Real-Tor APP | `app-real-tor-20260928T200015Z.log` | **17 held / 0 contradicted / 0 inconclusive** |

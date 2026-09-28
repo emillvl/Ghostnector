@@ -258,7 +258,7 @@ obtain any number in this record.
 > **Requalification (2026-09-28/29):** the optimized candidate was re-qualified on the installed
 > product and is qualified to replace `f82adf9`. Final tested product commit `9b0fe5d` (the appd
 > optimization commits plus the one CLI session-exit fix the requalification found). Installed APP
-> launch 326.5 ms median (298.3/366.7 p10/p90); leakage 30/0/0 with analyzer exit 0 and 0
-> violations/0 ambiguous; real-Tor APP 17/0/0; lifecycle 33/0/0; boot guard 8/7/4; M1–M10 gate
-> 21/21 rc 0 with 463 unit tests. Details in `docs/RELEASE-CANDIDATE-REPORT.md` §0 and
-> `perf/APP-LAUNCH-OPTIMIZATION.md`.
+> launch **301.9 ms median** (291.9/352.7 p10/p90) at the final commit, 326.5 ms at the optimization
+> commit (was 665.6); leakage 30/0/0 with analyzer exit 0 and 0 violations/0 ambiguous; real-Tor APP
+> 17/0/0; lifecycle 33/0/0; boot guard 8/7/4; M1–M10 gate 21/21 rc 0 with 463 unit tests. Details in
+> `docs/RELEASE-CANDIDATE-REPORT.md` §0 and `perf/APP-LAUNCH-OPTIMIZATION.md`.

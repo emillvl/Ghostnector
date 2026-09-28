@@ -458,10 +458,12 @@ was reset to a frozen commit through a git bundle before each phase, the release
 installed with `packaging/install.sh`, and every installed run used the same detached / durable-log
 procedure as the original campaign. Records (all under `/var/log/ghostnector-qual/` unless noted):
 
-* **APP launch** (`perf/app-launch-profile-20260928T173332Z.csv`, N=10): product process appearance
-  p10/med/p90 = 298.3 / **326.5** / 366.7 ms (was 665.6 at `f82adf9`); the application's own exec
-  timestamp 315.3 / 349.4 / 396.0 ms against a direct launch of 52.4 ms; helper CPU 21.7 ms/launch
-  and RSS ≈2.95 MB (was 56.7 ms; RSS unchanged). The per-optimization attribution is in
+* **APP launch** (`perf/app-launch-profile-20260928T173332Z.csv`, N=10; and the final installed
+  commit re-run `…T202434Z.csv`, N=10): the final installed product appears in p10/med/p90 =
+  291.9 / **301.9** / 352.7 ms (was 665.6 at `f82adf9`), with the application's own exec timestamp
+  302.9 / 314.4 / 363.7 ms against a direct launch of 63.4 ms in the same run; the earlier run at
+  the optimization commit measured 326.5 ms median. Helper CPU 21.7 ms/launch and RSS ≈2.95 MB (was
+  56.7 ms; RSS unchanged). The per-optimization attribution is in
   `perf/APP-LAUNCH-OPTIMIZATION.md`.
 * **Paired HTTP** (`paired-http-20260928T171914Z` two-instance, `…T172817Z` same-instance,
   `dns-focus-20260928T174245Z`): product total 501.8 ms vs a standalone transparent Tor at 918.3 ms

@@ -121,16 +121,19 @@ safe, measurable reduction was found that does not add concurrency or change the
 ## Requalification (2026-09-28/29, installed product)
 
 The optimized tree was frozen, rebuilt and installed from `packaging/install.sh` on
-`ghostnector-qual`, and the same profiler re-ran it (N=10, order alternated, `perf/app-launch-profile-20260928T173332Z.csv`):
+`ghostnector-qual`, and the same profiler re-ran it (N=10, order alternated). The first run was at
+the optimization commit (`perf/app-launch-profile-20260928T173332Z.csv`); the last run is the final
+installed commit (`perf/app-launch-profile-20260928T202434Z.csv`):
 
 | build | p10 | median | p90 | direct median | added over direct |
 |---|---|---|---|---|---|
 | `f82adf9` qualified | 617.0 | 665.6 | 721.2 | 50.6 | ~615 ms |
-| optimized, installed | **298.3** | **326.5** | **366.7** | 52.4 | **~274 ms** |
+| optimized (optimization commit) | 298.3 | 326.5 | 366.7 | 52.4 | ~274 ms |
+| optimized (final installed commit) | **291.9** | **301.9** | **352.7** | 63.4 | **~238 ms** |
 
-The application's own exec timestamp: 315.3 / 349.4 / 396.0 ms against a direct launch of
-43.6 / 56.5 / 67.6 ms. Per-phase medians: t0→netns 76.1 ms, netns→relay 153.5 ms,
-relay→app 96.9 ms. Helper CPU is 21.7 ms/launch (core 6.7; pre-optimization 56.7 and 20.0) and
+The application's own exec timestamp at the final commit: 302.9 / 314.4 / 363.7 ms against a direct
+launch of 45.8 / 57.5 / 69.8 ms. Per-phase medians (final): t0→netns 78.3 ms, netns→relay 147.6 ms,
+relay→app 76.0 ms. Helper CPU is 21.7 ms/launch (core 6.7; pre-optimization 56.7 and 20.0) and
 RSS ≈2.95 / 3.14 MB (unchanged).
 
 The complete requalification verdicts — leakage 30/0/0 with a clean analyzer, real-Tor APP 17/0/0,
