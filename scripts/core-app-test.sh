@@ -249,16 +249,24 @@ python3 "$WORKDIR/fake-tor.py" "$CONTROL_PORT" 9050 9053 "$CORE" "$WORKDIR/event
 TOR_PID=$!
 sleep 0.3
 
-# Wait until a helper socket exists AND carries its final mode.
+# Wait until a helper socket exists, carries its final mode, and a client can actually connect.
 #
-# The daemons bind and then set the socket's group/mode immediately; a client that connects inside
-# that microsecond window gets EACCES on a socket that is briefly owner-only behind the process's
-# umask. The gate hit that race once (`core-app rc=1`, `FAIL: connect failed`). Waiting for the
-# final mode removes the race without touching the product.
-wait_socket() { # path expected-mode label
+# The daemons bind and then set the socket's group/mode immediately; the gate hit the microsecond
+# window between those steps once (core-app rc=1, `FAIL: connect failed`). A mode check alone can
+# still race a daemon that is mid-startup, so the definitive readiness check is a real connect as
+# the identity the daemon expects. The probe just connects and closes; the servers read EOF.
+wait_socket() { # path expected-mode label [uid gid [groups]]
     local i
     for i in $(seq 1 100); do
-        [ -S "$1" ] && [ "$(stat -c %a "$1" 2>/dev/null)" = "$2" ] && return 0
+        if [ -S "$1" ] && [ "$(stat -c %a "$1" 2>/dev/null)" = "$2" ]; then
+            if [ -z "${4:-}" ]; then
+                return 0
+            fi
+            if setpriv --reuid="$4" --regid="$5" --groups="${6:-$5}" \
+                python3 -c "import socket; socket.socket(socket.AF_UNIX).connect('$1')" 2>/dev/null; then
+                return 0
+            fi
+        fi
         sleep 0.1
     done
     return 1
@@ -269,7 +277,7 @@ wait_socket() { # path expected-mode label
     --app-bridge "$BRIDGE" --app-core "$CORE" \
     --fallback-path "$WORKDIR/fail-closed.nft" >"$WORKDIR/netd.log" 2>&1 &
 NETD_PID=$!
-wait_socket "$RUNDIR/netd.sock" 600 "the firewall helper" ||
+wait_socket "$RUNDIR/netd.sock" 600 "the firewall helper" "$CORE_UID" "$CORE_GID" ||
     fail "the firewall helper did not start"
 
 "$BINDIR/ghostnector-appd" \
@@ -279,7 +287,7 @@ wait_socket "$RUNDIR/netd.sock" 600 "the firewall helper" ||
     --bridge "$BRIDGE" --core "$CORE" --prefix "$PREFIX" --dead-device "$DEAD" \
     >"$WORKDIR/appd.log" 2>&1 &
 APPD_PID=$!
-wait_socket "$RUNDIR/appd.sock" 600 "the namespace helper" ||
+wait_socket "$RUNDIR/appd.sock" 600 "the namespace helper" "$CORE_UID" "$CORE_GID" ||
     fail "the namespace helper did not start"
 
 setpriv --reuid="$CORE_UID" --regid="$CORE_GID" --clear-groups \
@@ -297,7 +305,7 @@ setpriv --reuid="$CORE_UID" --regid="$CORE_GID" --clear-groups \
     --group "$CORE_USER" \
     >"$WORKDIR/core.log" 2>&1 &
 CORE_PID=$!
-wait_socket "$RUNDIR/core.sock" 660 "the control plane" ||
+wait_socket "$RUNDIR/core.sock" 660 "the control plane" "$LAUNCH_UID" "$LAUNCH_GID" "$CORE_GID" ||
     fail "the control plane did not start"
 
 # The CLI runs as the launch user, with the control plane's group so it may reach the socket.
