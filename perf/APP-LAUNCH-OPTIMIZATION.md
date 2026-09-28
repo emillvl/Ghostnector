@@ -117,3 +117,28 @@ On this VM the fixed costs that remain are ~4 process spawns in the namespace ph
 relay spawn (~14 ms each), the PC-08 `nft list`, the launcher spawn, and the CLI/core control
 plane. The final measured median is **320.9 ms** (versus a ~50 ms direct launch); no further
 safe, measurable reduction was found that does not add concurrency or change the architecture.
+
+## Requalification (2026-09-28/29, installed product)
+
+The optimized tree was frozen, rebuilt and installed from `packaging/install.sh` on
+`ghostnector-qual`, and the same profiler re-ran it (N=10, order alternated, `perf/app-launch-profile-20260928T173332Z.csv`):
+
+| build | p10 | median | p90 | direct median | added over direct |
+|---|---|---|---|---|---|
+| `f82adf9` qualified | 617.0 | 665.6 | 721.2 | 50.6 | ~615 ms |
+| optimized, installed | **298.3** | **326.5** | **366.7** | 52.4 | **~274 ms** |
+
+The application's own exec timestamp: 315.3 / 349.4 / 396.0 ms against a direct launch of
+43.6 / 56.5 / 67.6 ms. Per-phase medians: t0→netns 76.1 ms, netns→relay 153.5 ms,
+relay→app 96.9 ms. Helper CPU is 21.7 ms/launch (core 6.7; pre-optimization 56.7 and 20.0) and
+RSS ≈2.95 / 3.14 MB (unchanged).
+
+The complete requalification verdicts — leakage 30/0/0 with a clean analyzer, real-Tor APP 17/0/0,
+lifecycle 33/0/0, boot guard 8/7/4, create-path failure probes 4/4, and the M1–M10 gate 21/21 rc 0
+with 463 unit tests — are recorded in `docs/RELEASE-CANDIDATE-REPORT.md` §0 and
+`docs/QUALIFICATION-NOTES.md`.
+
+One product defect found by the requalification itself is fixed on top of the optimization:
+`ghostnector-cli` no longer waits for the caller's standard input after a session ends (D-55). It
+changes process lifetime only; the launch figures above are unaffected (the session-exit happens
+after the measured exec, and the profiler terminates the CLI itself).

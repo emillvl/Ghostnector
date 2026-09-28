@@ -19,6 +19,48 @@ remaining items are documented limitations, not open product decisions.
 
 ---
 
+## 0. Post-optimization requalification (final candidate)
+
+**Tested product commit: `9b0fe5d`** (`fix(cli): run returns when the session ends even if stdin
+stays open`). This commit supersedes `f82adf9` as the v1.0 product baseline. The optimization under
+test is the APP-launch work in `ghostnector-appd` (`012e9c0`, `6a53d20`, `0d947df`); `9b0fe5d` is the
+one product fix the requalification itself found. The commits after the tested product commit are
+qualification tooling and documentation only: `764d917`, `9cfd0f1`, and the documentation commits
+that carry this report. No release tag was created or moved.
+
+**Product delta over `f82adf9`:** `crates/ghostnector-appd/src/{backend,config,main}.rs` — one
+`ip -batch` transaction per namespace phase, `/sys/class/net` presence probes, a 10 ms
+relay-readiness poll with fail-fast on a dead relay, bridge isolation folded into the batch, and the
+`bridge` tool dropped; and `crates/ghostnector-cli/src/main.rs` — a session returns when its command
+ends even if the caller's standard input stays open. No Tor configuration, policy, namespace shape,
+DNS chokepoint, D-50 relay data path, PC-08 comparison, fail-closed, boot-guard or least-privilege
+behaviour changed.
+
+**Result: the optimized build retains every qualified guarantee.** Requalified on the installed
+product on `ghostnector-qual`:
+
+| area | evidence | verdict |
+|---|---|---|
+| APP launch | `app-launch-profile-20260928T173332Z.csv` (N=10) | 298.3 / **326.5** / 366.7 ms p10/med/p90 vs 665.6 ms before (−51 %); app-added ≈274 ms; helper CPU 21.7 ms/launch (was 56.7), RSS ≈2.95 MB (unchanged) |
+| Paired HTTP | `paired-http-20260928T171914Z` (two-instance), `…T172817Z` (same-instance) | product total 501.8 ms vs standalone 918.3 ms (instance variance); same-instance 526.4 vs 510.3 ms; focused chokepoint DNS +3.9 ms (`dns-focus-20260928T174245Z`) |
+| Leakage | `leak-20260928T200642Z.log` + host observer | VM **30 held / 0 contradicted / 0 inconclusive**; analyzer exit 0: 3 expected arrivals, 2 self-probes, **0 violations / 0 ambiguous**, heartbeats spanning the window |
+| Real-Tor APP | `app-real-tor-20260928T200015Z.log` | **17 held / 0 contradicted / 0 inconclusive** |
+| Lifecycle | `lifecycle-20260928T184225Z.log` | **33 held / 0 contradicted / 0 inconclusive** (uninstall/reinstall, lockout/recovery) |
+| Boot guard | `boot-guard-qualification.log` (re-run with a flush before each reset) | prepare **8/0/0**, verify-protected **7/0/0** (guard finished 20097696 µs ≤ network-pre barrier 20100763 µs), verify-off **4/0/0** |
+| Create failure modes | `create-failure-probe-20260928T174828Z.log` | partial `ip -batch`, nft apply, relay early death, relay never-listening: all refused with no residue; the silent relay was refused at the 5 s deadline |
+| M1–M10 gate | `gate-final2.log` (HEAD `9cfd0f1`) | **21/21 steps rc=0, 463 unit tests passed**; app-adversarial 13/0/0, i2p-adversarial 26/0/0, adversarial 27/0/1 (documented no-IPv6 case), watch-oracle PASS |
+
+The lifecycle/performance records were collected at the optimization commit `f84ec81`; the CLI fix
+changes only the process lifetime after a session ends (no packet path, namespace, policy or
+launch-timing change), and the leakage run, the real-Tor APP run and the full gate were re-run
+against the final commit. One earlier leakage run at `f84ec81` was preserved as INCOMPLETE after a
+later clock-offset measurement failed to correlate (VM clock movement); it is superseded by the
+definitive run above, which the fixed controller analysed with its own contemporaneous offset.
+Defects found and fixed during this requalification are recorded in §3 (D-55 product; D-56…D-58
+qualification harness).
+
+---
+
 ## 1. Environment
 
 | | |
@@ -199,6 +241,10 @@ Product defects (each with the regression that now guards it):
 | D-52 | The first `netd` start after a fresh install failed (`226/NAMESPACE`); the boot guard too | `StateDirectory=ghostnector` on netd and bootguard; a test now covers `/var/lib` paths | `55da224`, `e35cb75` |
 | D-53 | **Applying APP scope over a Tor instance left running from another profile kept its listeners on loopback** (found while requalifying D-50; pre-existing, previously masked). The APP apply wrote the APP torrc but only *started* the unit, a no-op for an active unit, so the relay's dial to the core address was refused and every application fetch returned an empty reply within seconds while the relay itself was healthy. | the supervisor gains `restart`, composed of the two verbs the polkit rule grants (`stop` then `start`; systemd's own `restart` verb is refused without interactive authentication and would need a wider rule for the same two actions); the Tor bring-up restarts when the rendered torrc differs from the file, and starts on a first apply or an unchanged file. | `af89bc9`, `167ee85` |
 | D-54 | **The installed boot guard could not deny by either route, so the fail-closed policy was not in place before the network on a protected reboot** (found in the close-out verification; fixed). Three layers: netd (root, no `CAP_DAC_OVERRIDE`) could not create the copy in the control plane's state directory at all and wrote it only on a fail-closed apply; a copy that existed was unreadable to the root guard; and the guard could not reach netd's `0600` socket. The control plane's reconcile applied the baseline after the network. | netd keeps the copy in its own root-owned state directory on **every** apply, hands the finished `0600` file to the control plane's user with the `CAP_CHOWN` it already has, and replaces it atomically; the guard runs as that same user with exactly `CAP_NET_ADMIN` ambient and `NoNewPrivileges`, owns the socket and the copy, and writes nothing. No permission-bypassing capability and no widened mode. | `544018f`, `f82adf9` |
+| D-55 | **`ghostnector run` never returned when the caller's standard input stayed open** (pre-existing since before `f82adf9`; found during the post-optimization requalification). After the protected session reached EOF, `run_session` joined the standard-input relay thread, which is blocked in `stdin.read()` for a terminal or a pipe that stays open. The protected command had already finished; an interactive session hung until the terminal closed, and a standalone suite run over SSH hung for 45 minutes. The gate never saw it because systemd runs the suites with `stdin=/dev/null`. | drop the thread handle instead of joining it: after the session ends, nothing typed can be delivered. Regression `core-app-test.sh [2b]` holds stdin open with `sleep 30` and requires the session to return in under 15 s (fails rc=124 against the pre-fix binary; passes in 0 s after). | `9b0fe5d` |
+| D-56 | **Qualification harness: the leakage controller could not terminate** (found while finishing the post-optimization leak run). The host observer was started with `Start-Process`, which inherits the controller's standard-output handle; the observer outlived the controller, so the caller's `| Select-Object -Last N` never saw EOF. The controller had actually finished — its analysis had run and the verdict was clean — but the buffered output was invisible and the pipeline stayed alive. | the fixed controller stops the observer after the run and before analysis, and writes the clock offset and the analyzer output to a durable result file. The controller's own contemporaneous offset was recovered from the flushed buffer (`-402.299 s`) and the run was analysed clean with it; the later manual offset (`-396.887 s`) is preserved as INCOMPLETE evidence. Primarily a working-aid defect, recorded here because the verdict depended on it. | working aid (not shipped) |
+| D-57 | **Qualification harness/environment: the boot-guard log lost its `verify-protected` section to a hard reset.** The section was written to the durable log but not flushed; the reset left a run of NUL bytes where it should be, and the earlier lifecycle controller printed a stale tail. | the pre-rerun log is preserved (`boot-guard-qualification.pre-rerun-20260928T184534Z.log`); the focused rerun syncs each phase before the reset, asserts the appended region directly and records prepare 8/0/0, verify-protected 7/0/0 (finished 20097696 µs ≤ barrier 20100763 µs) and verify-off 4/0/0. | working aid (not shipped) |
+| D-58 | **Qualification harness: `core-app-test.sh` could connect to the control socket before the daemon had set its group/mode** (or before it was accepting), producing `EACCES` at the first CLI connect. The gate hit it once (`core-app rc=1`, `FAIL: connect failed`) after the optimization. | the socket waits now require the final mode **and** a real connect as the identity the daemon expects (the launch user with the control group for core, the control-plane user for the helpers), and the session runs take stdin from `/dev/null` except the deliberate `[2b]` case. Product unchanged. | `764d917`, `9cfd0f1` |
 
 Earlier in the same campaign (D-29–D-38) the installed stack was made to work at all: shared
 runtime directory ownership (D-29), a bounded polkit rule (D-30), the Tor control cookie (D-31), the

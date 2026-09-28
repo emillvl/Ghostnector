@@ -449,3 +449,58 @@ refused, missing and corrupt copies failing safely), and the hardening tests pin
 identity, capability set and read-only posture plus the helper's own state directory. The full gate
 at `f82adf9` is 21/21 rc 0 with 461 unit tests passing and the boot-guard suite PASS. The ordering
 claim itself (no packet leaves before the deny) remains G6; the mechanism gap G14 is closed.
+
+## Post-optimization requalification (2026-09-28/29)
+
+The optimized candidate (`ghostnector-appd` APP-launch work in `012e9c0`, `6a53d20`, `0d947df`, plus
+the `ghostnector-cli` session-exit fix `9b0fe5d`) was requalified on the same VM. Method: the VM tree
+was reset to a frozen commit through a git bundle before each phase, the release tree was rebuilt and
+installed with `packaging/install.sh`, and every installed run used the same detached / durable-log
+procedure as the original campaign. Records (all under `/var/log/ghostnector-qual/` unless noted):
+
+* **APP launch** (`perf/app-launch-profile-20260928T173332Z.csv`, N=10): product process appearance
+  p10/med/p90 = 298.3 / **326.5** / 366.7 ms (was 665.6 at `f82adf9`); the application's own exec
+  timestamp 315.3 / 349.4 / 396.0 ms against a direct launch of 52.4 ms; helper CPU 21.7 ms/launch
+  and RSS ≈2.95 MB (was 56.7 ms; RSS unchanged). The per-optimization attribution is in
+  `perf/APP-LAUNCH-OPTIMIZATION.md`.
+* **Paired HTTP** (`paired-http-20260928T171914Z` two-instance, `…T172817Z` same-instance,
+  `dns-focus-20260928T174245Z`): product total 501.8 ms vs a standalone transparent Tor at 918.3 ms
+  in the two-instance window (instance variance); same-instance 526.4 vs 510.3 ms; the focused
+  chokepoint-vs-DNSPort paired difference is +3.9 ms. The corrected `/proc`-delta resource method is
+  unchanged from the campaign record.
+* **Leakage** (`leak-20260928T200642Z.log`, host observer):
+  VM-side **30 held / 0 contradicted / 0 inconclusive** (run exit 0); the analyzer returns exit 0
+  with 30 phases, 5 arrivals, **3 expected open-validation arrivals**, 2 harness self-probes,
+  **0 violations and 0 ambiguous**, the protected path reporting `192.42.116.103` against the host's
+  `94.20.98.15`, and heartbeats spanning the run window. The APP window's two groups reached the
+  network through Tor with the intended destination, a direct namespace connection produced no data
+  and a direct relay connection was refused.
+* **Focused real-Tor APP** (`app-real-tor-20260928T200015Z.log`): **17 held / 0 contradicted / 0
+  inconclusive**.
+* **Create-path failure probes** (`create-failure-probe-20260928T174828Z.log`): a partial `ip -batch`
+  failure, an nft apply failure, a relay that exits immediately, and a relay that runs but never
+  listens are each refused with no namespace, no host link and no registry entry; the silent relay
+  is refused at the 5 s readiness deadline.
+* **Lifecycle** (`lifecycle-20260928T184225Z.log`): **33 held / 0 contradicted / 0 inconclusive**
+  (uninstall residue-free and networking restored, reinstall, ordinary use, lockout and the
+  documented recovery).
+* **Boot guard**: the first pass lost its `verify-protected` section to a hard reset (unflushed NUL
+  region; D-57). The preserved pre-rerun log is
+  `boot-guard-qualification.pre-rerun-20260928T184534Z.log`; the focused rerun flushed before each
+  reset and records prepare **8/0/0**, verify-protected **7/0/0** (guard finished 20097696 µs ≤
+  network-pre barrier 20100763 µs, fail-closed table present, `blocked`, recovery to off) and
+  verify-off **4/0/0**.
+* **Full M1–M10 gate** (`gate-final2.log`, tree at `9cfd0f1`): **21/21 steps rc=0, 463 unit tests
+  passed** (461 at `f82adf9` plus the two new batch-order regressions); app-adversarial 13/0/0,
+  i2p-adversarial 26/0/0, adversarial 27/0/1 (the documented no-IPv6 case), watch-oracle PASS, and
+  the installed product restored (three units active, state `off`, no table) after the gate.
+
+Two qualification-harness defects were found and fixed while obtaining this evidence: the leakage
+controller kept the observer's inherited standard-output handle open after it had finished, hiding a
+clean analysis behind a stalled pipeline (D-56; the recovered contemporaneous offset was `-402.299 s`,
+and a later manual re-measurement of `-396.887 s` is preserved as INCOMPLETE — the VM clock moves, so
+a re-measurement after the run is not a substitute for the controller's own offset); and
+`core-app-test.sh` could connect to a helper socket before it was ready (D-58). The session-exit
+defect D-55 was found because a standalone suite run over SSH inherited the SSH standard input.
+None of the fixes changes a security, anonymity, isolation or fail-closed property; D-55 changes only
+the CLI process lifetime after a session ends.

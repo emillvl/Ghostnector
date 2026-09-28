@@ -42,6 +42,16 @@ The comparison is text from the same formatter on both sides, so it is exact rat
 `Protected` does **not** mean anonymous, unlinkable, or safe from a compromised host. It does not mean
 "nothing can escape". Those are not claims this program makes anywhere.
 
+> **Requalification (2026-09-28/29, product commit `9b0fe5d`).** The optimized candidate was
+> re-qualified with the same tools and the same assertions. The definitive installed leakage run
+> (`leak-20260928T200642Z.log`) is **30 held / 0 contradicted / 0 inconclusive** and the analyzer
+> exits 0 with 3 expected open-validation arrivals, 2 harness self-probes, **0 violations and 0
+> ambiguous**; the real-Tor APP run (`app-real-tor-20260928T200015Z.log`) is **17/0/0**; the lifecycle
+> run (`lifecycle-20260928T184225Z.log`) is **33/0/0**; the boot-guard rerun records prepare 8/0/0,
+> verify-protected 7/0/0 and verify-off 4/0/0; the create-path failure probes refuse every partial
+> construction with no residue; and the full M1–M10 gate is **21/21 rc 0 with 463 unit tests passed**.
+> No claim text changed; the evidence adds the requalification run names.
+
 ## Claims about confinement
 
 A **confinement** claim says that traffic which should not leave does not leave. Falsifying one is an
@@ -214,7 +224,7 @@ reason reported is different, and it must read differently to a person.
 | Confirms | The policy exists before the network is up, and an independent boundary observes no packet from a protected scope during boot. |
 | Falsifies | An egress packet observed at the boundary while the machine is booting with protection requested and the policy is not yet present. |
 | Inconclusive | Nothing attempted traffic during the window. |
-| Evidence today | **Verified on the installed product (D-54 fixed).** The guard runs as the control plane's own user with exactly `CAP_NET_ADMIN` and `NoNewPrivileges`; it owns the helper's socket and the fail-closed copy (netd hands both to that user, and keeps the copy current on every apply in its own root-owned state directory), so it reaches both with no capability that bypasses file permissions and writes nothing. `installed-boot-guard-qualification.sh` on the installed VM: a protected session leaves a fresh `0600` copy owned by the guard's user (prepare **8/0/0**); on a protected hard reset the guard exits 0, its own journal says the helper denied everything, it finishes **at or before the network-pre barrier**, the fail-closed table is present and the machine reports `blocked — no traffic can leave` (verify-protected **7/0/0**); an off boot applies nothing (verify-off **4/0/0**); missing and corrupt copies fail safely (hermetic). **The ordering claim** ("no packet before") is still not independently observed (G6), but the mechanism is now in place and asserted; G14 is closed. |
+| Evidence today | **Verified on the installed product (D-54 fixed).** The guard runs as the control plane's own user with exactly `CAP_NET_ADMIN` and `NoNewPrivileges`; it owns the helper's socket and the fail-closed copy (netd hands both to that user, and keeps the copy current on every apply in its own root-owned state directory), so it reaches both with no capability that bypasses file permissions and writes nothing. `installed-boot-guard-qualification.sh` on the installed VM: a protected session leaves a fresh `0600` copy owned by the guard's user (prepare **8/0/0**); on a protected hard reset the guard exits 0, its own journal says the helper denied everything, it finishes **at or before the network-pre barrier**, the fail-closed table is present and the machine reports `blocked — no traffic can leave` (verify-protected **7/0/0**); an off boot applies nothing (verify-off **4/0/0**); missing and corrupt copies fail safely (hermetic). **The ordering claim** ("no packet before") is still not independently observed (G6), but the mechanism is now in place and asserted; G14 is closed. **Requalification (optimized candidate `9b0fe5d`, 2026-09-28):** the same verdicts on the installed product — prepare 8/0/0, verify-protected 7/0/0 with the guard finishing 20097696 µs at or before the 20100763 µs network-pre barrier, verify-off 4/0/0 (`boot-guard-qualification.log`). |
 
 ### PC-12 — The control plane dying changes nothing
 
@@ -286,7 +296,7 @@ observation is marked **closed**, with the case that closed it; a gap that chang
 | G11 | **Narrowing.** The DHCP exemption is IPv4 only, because IPv6 is denied in every profile. A network whose connectivity can only be maintained by DHCPv6 lease renewal is not supported while protected. | PC-09 |
 | G12 | **New, availability.** A transient loss of connectivity can leave the machine `Blocked` until a person acts, because a verification failure is answered with the fail-closed baseline (observed in AN-1). This is deliberate, and it is a cost rather than a leak. | PC-06, PC-14 |
 | G13 | **New, residual.** The exemption list is derived from the rules that cite it and the invariant checker refuses an accept citing no listed exemption, but a one-by-one kernel-versus-report diff is not executed end to end. | PC-09 |
-| G14 | **Closed (D-54 fixed).** The installed guard reaches the helper's socket and the fail-closed copy as the control-plane user with `CAP_NET_ADMIN` only, and the copy is kept current on every apply in the helper's own root-owned state directory (handed over with the `CAP_CHOWN` the helper already carries, replaced atomically). The focused installed qualification asserts the guard's own success and its completion at or before the network-pre barrier. The ordering claim itself (no packet leaves before the deny) remains G6. | PC-10 |
+| G14 | **Closed (D-54 fixed).** The installed guard reaches the helper's socket and the fail-closed copy as the control-plane user with `CAP_NET_ADMIN` only, and the copy is kept current on every apply in the helper's own root-owned state directory (handed over with the `CAP_CHOWN` the helper already carries, replaced atomically). The focused installed qualification asserts the guard's own success and its completion at or before the network-pre barrier. The ordering claim itself (no packet leaves before the deny) remains G6. Requalified at `9b0fe5d` with the same verdicts (prepare 8/0/0, verify-protected 7/0/0, verify-off 4/0/0). | PC-10 |
 
 ## APP scope (M8): what was demonstrated
 
