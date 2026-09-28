@@ -244,7 +244,12 @@ OPTIONS:
                 Err(error) => return Err(format!("the session ended unexpectedly: {error}")),
             }
         }
-        let _ = input.join();
+        // The session has ended, so nothing the caller types can be delivered any more. The input
+        // relay thread is blocked in `stdin.read()` when the caller's standard input is a terminal
+        // or a pipe that stays open; joining it would keep this process alive after the protected
+        // command has already finished. Dropping the handle detaches the thread; the process exits
+        // as soon as this function returns.
+        drop(input);
         Ok(())
     }
 
