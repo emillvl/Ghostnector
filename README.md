@@ -2,11 +2,12 @@
   <img src="docs/assets/ghostnector-logo.png" alt="Ghostnector" width="640">
 </p>
 
-**Network-level privacy for Linux.** Ghostnector routes traffic through Tor — or, machine-wide,
-through I2P — behind a fail-closed nftables policy, for the whole machine or for selected
-applications, so a protection failure denies traffic instead of quietly falling back to the clearnet.
-A small privileged stack applies and continuously verifies the policy in the kernel; an unprivileged
-GTK4 window and a command-line client drive it.
+# Ghostnector
+
+Ghostnector routes Linux traffic through Tor, either for the whole machine or for selected
+applications. It also supports machine-wide I2P. An nftables policy blocks direct traffic when
+protection fails. Privileged services apply and verify the kernel policy; you control them through
+an unprivileged GTK4 window or command-line client.
 
 - **Status:** the v1.0 product baseline is commit `9b0fe5d`, qualified and frozen. The evidence is in
   [`docs/RELEASE-CANDIDATE-REPORT.md`](docs/RELEASE-CANDIDATE-REPORT.md) and
@@ -20,23 +21,20 @@ GTK4 window and a command-line client drive it.
 
 ---
 
-## What Ghostnector is, and what problem it solves
+## How protection works
 
-Most "use Tor" setups fail in the same way: they configure an application, or the desktop, to use a
-proxy, and then trust that configuration. If the proxy dies, the DNS is misconfigured, or an
-application ignores the setting, traffic silently takes the direct path. The user often cannot tell
-the difference, because from inside the machine a failed proxy and a working one look alike.
+Proxy settings alone leave enforcement to the application. A stopped proxy, a DNS
+misconfiguration, or an application that ignores the setting can allow traffic to take a direct
+path. A working connection does not by itself show that traffic went through Tor.
 
 Ghostnector moves enforcement out of application configuration and into the kernel. It owns one
 nftables table, applies it atomically, and keeps the machine in a deny-first state throughout. A
 protected process cannot reach the network except through the configured path, and when Ghostnector
 cannot prove the path is working it blocks instead of returning to the clearnet.
 
-The design is stated up front, and it is the reason the project exists:
-
-> **Fail closed.** When protection was requested, the fail-closed baseline is applied before anything
-> else and removed last. A contradiction, a missing policy, or a router that has died does not open a
-> path — it closes one.
+The fail-closed baseline is applied before other protection steps and removed last. If a check
+contradicts the claimed protection, the policy disappears, or a router stops, Ghostnector blocks
+traffic.
 
 ## Platform: Linux only
 
@@ -45,40 +43,40 @@ capabilities, cgroup and socket ownership. There is no Windows equivalent, and W
 deployment target: a WSL2 instance is a separate VM behind its own NAT, so a daemon running inside it
 cannot filter or redirect Windows applications' traffic.
 
-The code is deliberately split so that everything except the kernel-facing backend is portable:
+The shared specification and policy engine are portable. The services and clients target Linux:
 
 | Layer | Portability |
 |---|---|
-| `ghostnector-spec` — profiles, scopes, state, exemptions, IPC, helper verbs | Portable, no OS calls |
-| `ghostnector-policy` — desired state → ruleset IR, invariant checks | Portable, pure functions |
-| `ghostnector-netd` — privileged helper that owns the host firewall | Linux only |
-| `ghostnector-appd` — privileged helper that owns APP namespaces and their relays | Linux only |
-| `ghostnector-core` — control plane: state machine, journal, orchestration, verification | Linux only |
-| `ghostnector-cli` — command-line client | Linux only |
-| `ghostnector-gui` — the GTK4 window | Linux only (GTK 4.12+) |
-| `ghostnector-bootguard` — early fail-closed baseline after a reboot | Linux only |
-| `ghostnector-dns` — the DNS chokepoint relay | Linux only |
+| `ghostnector-spec`: profiles, scopes, state, exemptions, IPC, helper verbs | Portable, no OS calls |
+| `ghostnector-policy`: desired state → ruleset IR, invariant checks | Portable, pure functions |
+| `ghostnector-netd`: privileged helper that owns the host firewall | Linux only |
+| `ghostnector-appd`: privileged helper that owns APP namespaces and their relays | Linux only |
+| `ghostnector-core`: control plane: state machine, journal, orchestration, verification | Linux only |
+| `ghostnector-cli`: command-line client | Linux only |
+| `ghostnector-gui`: the GTK4 window | Linux only (GTK 4.12+) |
+| `ghostnector-bootguard`: early fail-closed baseline after a reboot | Linux only |
+| `ghostnector-dns`: the DNS chokepoint relay | Linux only |
 
-A future non-Linux backend is possible without rewriting the policy engine, but it would be a
-different product with materially weaker protections.
+A non-Linux backend could reuse the policy engine, but would need its own enforcement design and
+protection claims.
 
 ## Concepts
 
-### SYSTEM scope — machine-wide transparent Tor
+### SYSTEM scope: machine-wide transparent Tor
 
 `ghostnector connect` protects every local process. Locally generated TCP is redirected to Tor's
 `TransPort`; port 53 is redirected to the DNS chokepoint; everything else is denied. The redirects
 and the default-deny verdict live in one nftables table (`inet ghostnector`) applied as a single
 atomic transaction, so the machine is never in a half-applied state. A small, enumerated set of
 exemptions exists (Tor's own uid, the DHCP client, loopback, and an opt-in LAN set); the exemption
-list is derived from the rules that cite it and shown in the interface, so a hole that exists is
-listed and one that is not listed does not exist.
+list is derived from the rules that cite it and shown in the interface, so users can inspect the
+exceptions the policy permits.
 
-Transparent Tor carries outbound TCP only. UDP is denied — and **rejected rather than dropped**, so
+Transparent Tor carries outbound TCP only. UDP packets are **rejected rather than dropped**, so
 QUIC and real-time clients fail fast instead of hanging. This is a deliberate availability cost
 documented in the protection claims.
 
-### APP scope — per-application namespace isolation
+### APP scope: per-application namespace isolation
 
 `ghostnector connect --scope app` leaves the machine open and protects only applications launched
 through `ghostnector run`. Each protected application gets its own network namespace whose default
@@ -98,16 +96,15 @@ the NAT happens inside the namespace, each namespace runs a small **per-namespac
 - the namespace may reach only the DNS chokepoint and the SocksPort, and IPv6 is absent by
   construction rather than denied by a rule.
 
-Source identity is preserved: no masquerade or SNAT exists anywhere on the path, and the friendly
-consequence — distinct source addresses — is what gives each group its own isolation key. Whether
-Tor maps that to distinct circuits is Tor's behaviour and is not claimed.
+Source identity is preserved: the path uses neither masquerade nor SNAT. Each group has a distinct
+source address and its own isolation key. Whether Tor maps that to distinct circuits is Tor's behaviour and is not claimed.
 
 APP scope has a structurally different claim set (PC-17…PC-21) and its own adversarial suite; see
 [`docs/PROTECTION-CLAIMS.md`](docs/PROTECTION-CLAIMS.md).
 
 ### Tor and I2P
 
-Tor and I2P are **alternatives, never layers**. The validator refuses a request that enables both,
+Choose either Tor or I2P. The validator refuses a request that enables both,
 and refuses APP+I2P outright, because a per-application I2P conduit does not exist in v1. I2P runs
 client-only, with no clearnet outproxy; the I2P ruleset carries exactly the router's own exemption
 plus DHCP, and no redirect. I2P `Protected` requires a configured canary fetched through the
@@ -117,25 +114,25 @@ router's loopback proxy; without one the state stays `Degraded` by design.
 
 - **Deny first.** The fail-closed baseline is applied before any service starts and removed last.
 - **Escalate, never fall back.** Once protection is requested, a failure produces `Blocked` and the
-  baseline — never the clearnet. Rollback to the open network is allowed only from a
+  baseline. It does not reopen direct access. Rollback to the open network is allowed only from a
   pre-protection state.
 - **Bounded claims.** `Protected` means "a policy is applied, at least one configured check has
-  passed since it was applied, and no configured check has contradicted a claim since then" — and
-  the result expires after the verification interval plus its timeout.
+  passed since it was applied, and no configured check has contradicted a claim since then".
+  The result expires after the verification interval plus its timeout.
 - **Unactionable evidence is not a pass.** A check that cannot run is `inconclusive`, never a leak
   and never a pass. The interface lists the checks that did not run.
 
 ### DNS chokepoint
 
 Every DNS query from a protected process is redirected to a loopback chokepoint relay, which
-forwards to the configured upstream — Tor's `DNSPort` in Tor mode, or an encrypted resolver in
+forwards to the configured upstream: Tor's `DNSPort` in Tor mode, or an encrypted resolver in
 DNS-lockdown mode. The relay forwards bytes; it does not answer from cache, rewrite names, or log
 queries (only a throttled drop counter). Pointing an application at a hard-coded resolver does not
 bypass it: the packet is redirected. If the relay stops, resolution stops rather than falling back.
 
 ### nftables enforcement
 
-One owned table, `inet ghostnector`, applied by atomic ruleset replacement. Foreign tables are never
+Ghostnector owns one table, `inet ghostnector`, and replaces its rules atomically. Foreign tables are never
 touched. `netd` is the only component that writes it, and the policy engine refuses a ruleset that
 would accept traffic citing no listed exemption.
 
@@ -144,9 +141,9 @@ would accept traffic citing no listed exemption.
 Ghostnector generates Tor's configuration, starts and stops it through a bounded polkit rule, waits
 for bootstrap with a timeout, and treats "started and immediately exited" as a failed connect. A
 profile change (for example, moving from SYSTEM to APP) rewrites the torrc and **restarts** Tor,
-because the listeners move; leaving an old instance listening on loopback was a real defect found and
-fixed during qualification (D-53). Health is read over Tor's control port using cookie authentication,
-and only aggregate statistics — never destinations — are used.
+because the listeners move. Qualification defect D-53 records the earlier failure to restart an
+instance that was still listening on loopback. Health is read over Tor's control port using cookie authentication,
+and only aggregate statistics are used. Destinations are not collected.
 
 ### Boot guard
 
@@ -162,10 +159,10 @@ policy that `netd` keeps current on every apply, and it writes nothing. The orde
 Enforcement lives in the kernel and in independent services; the control plane holds no policy, so
 killing it changes nothing. Verification is two-layered:
 
-1. **Probes that are themselves subject to policy** — a UDP check that must not leave, an HTTP check
+1. **Probes that are themselves subject to policy**: a UDP check that must not leave, an HTTP check
    that must leave through the protected path and report a foreign address, and a DNS canary through
    the chokepoint. If a probe can reach the internet directly, that is the alarm.
-2. **An effective-policy comparison** — `netd` records what the kernel holds and compares it against
+2. **An effective-policy comparison**: `netd` records what the kernel holds and compares it against
    what it applied. This catches a change that no probe traverses. It is exact (both sides use the
    same formatter) but not cryptographic; a process holding `CAP_NET_ADMIN` can replace its subject,
    which is the same out-of-scope line as root (G10).
@@ -183,7 +180,7 @@ blocked machine.
 
 ## Threat model
 
-The full model — adversaries, what is in scope, the residual risk for each — is
+The full model, including adversaries, scope, and residual risks, is in
 [`ARCHITECTURE-REVIEW.md`](ARCHITECTURE-REVIEW.md) §1, and the falsifiable claims are
 [`docs/PROTECTION-CLAIMS.md`](docs/PROTECTION-CLAIMS.md). In summary:
 
@@ -237,7 +234,7 @@ and the fact that a network can often tell that Tor is being used, even when it 
 being carried. Bridges raise the cost of blocking Tor, but they do not eliminate it. Distinct source
 addresses between two APP groups give Tor an isolation key; they are not proof of distinct circuits.
 The qualification measures what Ghostnector's own enforcement does, under a documented test
-environment — it is not a proof of anonymity.
+environment. It does not prove anonymity.
 
 ## Install and build
 
@@ -259,6 +256,11 @@ cargo build --workspace --release
 cargo build -p ghostnector-gui --features gtk        # the window, on Linux with GTK 4.12+
 ```
 
+The installer expects all binaries in one build directory, including the GTK-enabled GUI. The GUI
+command above creates a debug build by default. For a release installation, build it with
+`cargo build -p ghostnector-gui --features gtk --release` as well, then use `target/release` as the
+installer's `<target-dir>`. If you set `CARGO_TARGET_DIR`, use its `release` subdirectory.
+
 ### Install
 
 ```bash
@@ -271,6 +273,10 @@ exactly `ghostnector-tor.service` and `ghostnector-i2pd.service`; the other lets
 resolver at the DNS chokepoint on connect and revert that on disconnect. Without them the
 unprivileged control plane could not manage its own routers or resolver. The firewall remains the
 enforcement in both cases.
+
+The installer enables the system units but does not start the control plane immediately. After
+logging back in with the new group membership, run `sudo systemctl start ghostnector-core` before
+using the client.
 
 ### Basic usage
 
@@ -307,14 +313,16 @@ GHOSTNECTOR_VERIFY=--udp-check 203.0.113.10:9999 --check-url http://203.0.113.10
     --canary canary.example@203.0.113.9 --canary-resolver 127.0.0.1:53
 ```
 
+Replace the example addresses and domain with endpoints you control before enabling verification.
+
 The UDP endpoint must answer a datagram if one reaches it; the HTTP endpoint must answer `200` with
 the address it sees in the body; the canary must resolve to the expected address through the
 chokepoint. All of them must be outside the local network, or `connect --lan` is refused with an
 explanation (the exception would make the check meaningless). The HTTP endpoint must be reachable
-**from a Tor exit** — a private or NAT-internal address is refused by Tor's own guard, which is a
+**from a Tor exit**. Tor's own guard refuses a private or NAT-internal address. That is a
 correct fail-closed response, not a product failure.
 
-Two operational notes that matter in real use:
+Before connecting:
 
 - Starting whole-system protection **cuts remote SSH sessions** as soon as it begins (the deny-first
   baseline drops the server's replies, and transparent Tor carries outbound TCP only). Run the
@@ -324,8 +332,8 @@ Two operational notes that matter in real use:
 
 ### Build and test notes
 
-**Windows is for editing and static checks** — its Smart App Control policy blocks execution of
-locally built unsigned binaries, so tests do not run there:
+In the documented Windows development environment, Smart App Control blocks locally built
+unsigned binaries. Windows was used for editing and static checks:
 
 ```powershell
 $cargo = "$env:USERPROFILE\.cargo\bin\cargo.exe"
@@ -334,7 +342,7 @@ $cargo = "$env:USERPROFILE\.cargo\bin\cargo.exe"
 & $cargo check --workspace --target x86_64-unknown-linux-gnu
 ```
 
-**Linux/WSL2 is where everything executes** — unit tests, nftables, namespaces, systemd:
+Run the unit tests and the nftables, namespace, and systemd checks on Linux or WSL2:
 
 ```bash
 CARGO_TARGET_DIR=/root/ghostnector-target cargo test --workspace
@@ -364,9 +372,9 @@ xvfb-run -a ./target/debug/ghostnector-gui --socket /run/ghostnector/core.sock  
 ```
 
 `CARGO_TARGET_DIR` keeps build artefacts on the Linux filesystem; building directly into `/mnt/c` is
-dramatically slower.
+slower in the documented development environment.
 
-## Architecture at a high level
+## Architecture
 
 ```
 crates/
@@ -384,8 +392,8 @@ packaging/                systemd units, sysusers, tmpfiles, desktop entry, icon
 perf/                     performance campaign records and APP-launch optimization results
 ```
 
-The architecture is a deliberate split into a portable policy core and two narrow, capability-scoped
-helpers:
+The architecture separates the portable policy engine from two privileged helpers with limited
+operations:
 
 - **`ghostnector-core`** owns the state machine and the journal, orchestrates Tor/I2P and the
   resolver, runs verification, and serves IPC. It holds **no** firewall capability and **no**
@@ -405,7 +413,7 @@ invariants are in [`ARCHITECTURE-REVIEW.md`](ARCHITECTURE-REVIEW.md); the milest
 ## Security model
 
 The security model is defined by the review and made falsifiable by
-[`docs/PROTECTION-CLAIMS.md`](docs/PROTECTION-CLAIMS.md). Its load-bearing properties:
+[`docs/PROTECTION-CLAIMS.md`](docs/PROTECTION-CLAIMS.md). The main properties are:
 
 - **Kernel enforcement.** The policy is an nftables ruleset applied in one atomic transaction;
   application configuration is not the enforcement.
@@ -425,7 +433,7 @@ The security model is defined by the review and made falsifiable by
 
 Ghostnector was qualified as an installed product on a native Ubuntu VM, not only as source. The
 method is adversarial: the goal is to make `Protected` false while the product still believes it is
-true, and to classify every observation as a held claim, a contradiction, or inconclusive — with an
+true, and to classify every observation as a held claim, a contradiction, or inconclusive, using an
 observation point that is **not** Ghostnector. The methodology, observation points, control-traffic
 inventory and the defect ledger are in
 [`docs/ADVERSARIAL-TEST-PLAN.md`](docs/ADVERSARIAL-TEST-PLAN.md). Environment facts and workarounds
@@ -434,8 +442,8 @@ inventory and the defect ledger are in
 
 The campaign covered: leakage with a host-side far-side observer and clock correlation; real-Tor APP
 transparency; lifecycle (install/uninstall/reinstall/reboot/lockout recovery); the installed boot
-guard across hard resets; create-path failure injection; APP and I2P adversarial suites; the M1–M7
-adversarial suite; a full M1–M10 release gate; and a performance campaign followed by an APP-launch
+guard across hard resets; create-path failure injection; APP and I2P adversarial suites; the M1-M7
+adversarial suite; a full M1-M10 release gate; and a performance campaign followed by an APP-launch
 optimization and its requalification.
 
 **These are qualification results under the documented test environment and threat model.** They
@@ -450,14 +458,14 @@ them. They are not a universal proof of anonymity, and an unconcluded check is n
 | External leakage analyzer | **0 violations / 0 ambiguous**, observation channel proven live (expected arrivals and heartbeats observed) |
 | Real-Tor APP | **17 / 0 / 0** |
 | Lifecycle | **33 / 0 / 0** |
-| Boot guard — prepare | **8 / 0 / 0** |
-| Boot guard — verify protected | **7 / 0 / 0** |
-| Boot guard — verify off | **4 / 0 / 0** |
+| Boot guard: prepare | **8 / 0 / 0** |
+| Boot guard: verify protected | **7 / 0 / 0** |
+| Boot guard: verify off | **4 / 0 / 0** |
 | Create-path failure injections | **4 / 4 PASS** (partial `ip -batch`, nft apply, relay early death, relay never listening) |
 | APP adversarial | **13 / 0 / 0** |
 | I2P adversarial | **26 / 0 / 0** |
-| M1–M7 adversarial | **27 / 0 / 1** (the one inconclusive is the documented no-IPv6 case, AS-4) |
-| Full M1–M10 gate | **21 / 21**, all `rc=0` |
+| M1-M7 adversarial | **27 / 0 / 1** (the one inconclusive is the documented no-IPv6 case, AS-4) |
+| Full M1-M10 gate | **21 / 21**, all `rc=0` |
 | Unit tests | **463 passed / 0 failed** |
 | Release blockers at qualification close | **0** |
 
@@ -541,24 +549,22 @@ replaced it with `/proc` deltas.
 
 ## Known and documented limitations
 
-These are recorded, not hidden. They are the honest edges of the claims above.
-
-- **G6 — boot ordering is not independently observed.** The boot guard applies the deny before the
+- **G6: boot ordering is not independently observed.** The boot guard applies the deny before the
   network-pre barrier and its own success is asserted on the installed product, but "no packet left
   before the deny" has not been observed at an independent boundary.
-- **G8 — no external vantage.** There is no ISP-facing observation point, so "the exit is not your
+- **G8: no external vantage.** There is no ISP-facing observation point, so "the exit is not your
   ISP" and the external half of the DNS claim cannot be established from this machine.
-- **G9 — `Protected` is reachable with a subset of checks configured.** The interface names the
+- **G9: `Protected` is reachable with a subset of checks configured.** The interface names the
   checks that did not run, but nothing forces a minimum set.
-- **G10 — privileged attackers are out of scope.** Root and anything holding `CAP_NET_ADMIN` can
+- **G10: privileged attackers are out of scope.** Root and anything holding `CAP_NET_ADMIN` can
   replace the policy or the comparison that watches it. This is the host-trusted line.
-- **G11 — the DHCP exemption is IPv4 only**, because IPv6 is denied in every profile.
-- **G12 — a transient outage can leave the machine `Blocked`** until a person acts, because a failed
+- **G11: the DHCP exemption is IPv4 only**, because IPv6 is denied in every profile.
+- **G12: a transient outage can leave the machine `Blocked`** until a person acts, because a failed
   verification is answered with the fail-closed baseline. This is deliberate.
 - **GUI automation gaps.** Under Xvfb the header popover and the GTK file picker could not be driven
   by automation; their product-side behavior rests on model/unit tests, a D-Bus action probe, and the
   core API the picker calls.
-- **No-IPv6 qualification case (AS-4).** The M1–M7 adversarial suite has one inconclusive case
+- **No-IPv6 qualification case (AS-4).** The M1-M7 adversarial suite has one inconclusive case
   because the qualification link had no global IPv6; a failed IPv6 attempt there proves nothing
   about the policy. IPv6 denial is verified on a v6-capable link (AS-3).
 - **APP adversarial boundary (GA-1).** The APP suite has no ISP-facing vantage: "nothing crossed" is
@@ -579,8 +585,8 @@ These are recorded, not hidden. They are the honest edges of the claims above.
 
 ## Repository documentation
 
-Not sure where to start? The architecture is the map; the claims document is the contract; the release
-report is the evidence.
+Start with the architecture review for the design, the protection claims for guarantees and limits,
+and the release report for test evidence.
 
 | Document | What it is |
 |---|---|
@@ -592,7 +598,7 @@ report is the evidence.
 | [`perf/CAMPAIGN-RESULTS.md`](perf/CAMPAIGN-RESULTS.md) | The performance campaign: HTTP, DNS, APP launch, resources, and the methodology corrections. |
 | [`perf/APP-LAUNCH-OPTIMIZATION.md`](perf/APP-LAUNCH-OPTIMIZATION.md) | The APP-launch optimization: measured attribution, CPU/RSS impact, regressions, and the rejected change. |
 | [`docs/RECOVERY.md`](docs/RECOVERY.md) | How to get a blocked machine back. |
-| [`docs/IMPLEMENTATION-PLAN.md`](docs/IMPLEMENTATION-PLAN.md) | The milestone execution view (M0–M10) and the risk register. |
+| [`docs/IMPLEMENTATION-PLAN.md`](docs/IMPLEMENTATION-PLAN.md) | The milestone execution view (M0-M10) and the risk register. |
 | [`docs/M8-DECISIONS.md`](docs/M8-DECISIONS.md) | APP-scope decisions (dead-end namespaces, launcher, per-namespace relay amendment). |
 | [`docs/M9-DECISIONS.md`](docs/M9-DECISIONS.md) | I2P decisions (independence, client-only, canary, explicit refusals). |
 | [`docs/M10-DECISIONS.md`](docs/M10-DECISIONS.md) | GUI decisions, the Phase-1 findings, and the campaign decisions. |
@@ -602,20 +608,19 @@ report is the evidence.
 
 Ghostnector's implementation was produced with AI-assisted code generation. I acted as the project's architect and supervisor throughout: I defined the system architecture and threat model, made the design and security decisions, reviewed and directed implementation changes, chose debugging and remediation strategies, interpreted qualification failures, and decided which fixes or architectural changes were acceptable. The AI generated the code under that direction; I do not claim to have hand-written the repository line by line.
 
-The engineering record is intentionally preserved so that this distinction is visible. The design documents, defect ledger, qualification reports, adversarial findings, performance work, and release history show the decisions, failures, corrections, and evidence that shaped the final product.
+The design documents, defect ledger, qualification reports, adversarial findings, performance work, and release history record those decisions and the evidence used to assess them.
 
 ## Engineering history
 
-Ghostnector's engineering record is kept, not rewritten. Later commits supersede earlier
-measurements and findings, and the documents say which is which:
+The repository retains earlier measurements and findings. Later documents identify the results
+that supersede them:
 
 - The qualified v1.0 **product** baseline is commit `9b0fe5d`. Commits after it are qualification
   tooling and documentation only.
 - `v1.0.0-rc1` … `v1.0.0-rc4` are historical checkpoints. RC1 was **not** a candidate whose claims
   all held: the M7 adversarial campaign falsified two claims (PC-03, PC-06) and found three more
   defects behind them. That falsification is preserved in
-  [`docs/PROTECTION-CLAIMS.md`](docs/PROTECTION-CLAIMS.md) Appendix A, because a claim that was never
-  falsified has not been tested.
+  [`docs/PROTECTION-CLAIMS.md`](docs/PROTECTION-CLAIMS.md) Appendix A, including the findings that led to corrections.
 - Earlier performance numbers (for example the 93 ms and "~0.7 % CPU idle" figures) were produced by
   a different, inequivalent benchmark and were superseded by the campaign in
   [`perf/CAMPAIGN-RESULTS.md`](perf/CAMPAIGN-RESULTS.md); the earlier `APP-scope launch` numbers in
