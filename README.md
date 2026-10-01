@@ -598,6 +598,12 @@ report is the evidence.
 | [`docs/M10-DECISIONS.md`](docs/M10-DECISIONS.md) | GUI decisions, the Phase-1 findings, and the campaign decisions. |
 | [`docs/HANDOFF-M10.md`](docs/HANDOFF-M10.md) | Historical milestone handoff (superseded: M10 is complete and qualified). Kept for the engineering record. |
 
+## Development transparency
+
+Ghostnector's implementation was produced with AI-assisted code generation. I acted as the project's architect and supervisor throughout: I defined the system architecture and threat model, made the design and security decisions, reviewed and directed implementation changes, chose debugging and remediation strategies, interpreted qualification failures, and decided which fixes or architectural changes were acceptable. The AI generated the code under that direction; I do not claim to have hand-written the repository line by line.
+
+The engineering record is intentionally preserved so that this distinction is visible. The design documents, defect ledger, qualification reports, adversarial findings, performance work, and release history show the decisions, failures, corrections, and evidence that shaped the final product.
+
 ## Engineering history
 
 Ghostnector's engineering record is kept, not rewritten. Later commits supersede earlier
