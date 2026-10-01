@@ -16,6 +16,7 @@ GTK4 window and a command-line client drive it.
   Ghostnector does **not** provide anonymity against every adversary, and does not protect a
   compromised host. Read [What Ghostnector does not protect against](#what-ghostnector-does-not-protect-against)
   before relying on it.
+- **License:** [Apache License 2.0](LICENSE).
 
 ---
 
@@ -571,9 +572,9 @@ These are recorded, not hidden. They are the honest edges of the claims above.
   for a future change rather than altered during the closed campaign.
 - **Disconnect latency (D-51 residual).** A router that ignores `SIGTERM` costs at most 20 s on
   disconnect instead of 90 s.
-- **License.** Not yet chosen. The dependency set is deliberately permissive (MIT / Apache-2.0); the
-  one prominent nftables crate, `rustables`, is GPL-3.0, which is why the project uses the
-  MIT-licensed netlink crates instead. See the risk register (R3) in
+- **Dependency licensing.** Ghostnector itself is Apache-2.0. The dependency set is deliberately
+  permissive (MIT / Apache-2.0); the one prominent nftables crate, `rustables`, is GPL-3.0, which is
+  why the project uses the MIT-licensed netlink crates instead. See the risk register (R3) in
   [`docs/IMPLEMENTATION-PLAN.md`](docs/IMPLEMENTATION-PLAN.md).
 
 ## Repository documentation
@@ -617,5 +618,7 @@ measurements and findings, and the documents say which is which:
 
 ## License
 
-Not yet chosen. See the note in [Known and documented limitations](#known-and-documented-limitations)
-and Risk R3 in [`docs/IMPLEMENTATION-PLAN.md`](docs/IMPLEMENTATION-PLAN.md).
+Licensed under the [Apache License, Version 2.0](LICENSE). The dependency set is deliberately
+permissive (MIT / Apache-2.0); see Risk R3 in
+[`docs/IMPLEMENTATION-PLAN.md`](docs/IMPLEMENTATION-PLAN.md) for why `rustables` (GPL-3.0) is not
+used.
