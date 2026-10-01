@@ -2,6 +2,16 @@
 target/
 **/*.rs.bk
 
+# Build output / packaging stage directories
+/dist/
+/pkg/
+
+# Patch and scratch residue
+*.orig
+*.rej
+*.tmp
+*.bak
+
 # Local runtime/state artefacts (never commit; may contain protection intent)
 *.log
 /run/
@@ -14,6 +24,7 @@ state/
 .DS_Store
 Thumbs.db
 __pycache__/
+*.pyc
 
 # Local test fixtures that may contain captured environment data
 /testdata/local/

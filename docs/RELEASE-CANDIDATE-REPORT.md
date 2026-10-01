@@ -41,7 +41,7 @@ product on `ghostnector-qual`:
 
 | area | evidence | verdict |
 |---|---|---|
-| APP launch | `app-launch-profile-20260928T173332Z.csv` (N=10 at the optimization commit) and `…T202434Z.csv` (N=10, final installed commit) | final installed: 291.9 / **301.9** / 352.7 ms p10/med/p90 vs 665.6 ms before (−54.6 %); app-added ≈238 ms against a 63.4 ms direct launch in the same run; helper CPU 21.7 ms/launch (was 56.7), RSS ≈2.95 MB (unchanged) |
+| APP launch | N=10 at the optimization commit (VM-side record) and `app-launch-profile-20260928T202434Z.csv` (N=10, final installed commit) | final installed: 291.9 / **301.9** / 352.7 ms p10/med/p90 vs 665.6 ms before (−54.6 %); app-added ≈238 ms against a 63.4 ms direct launch in the same run; helper CPU 21.7 ms/launch (was 56.7), RSS ≈2.95 MB (unchanged) |
 | Paired HTTP | `paired-http-20260928T171914Z` (two-instance), `…T172817Z` (same-instance) | product total 501.8 ms vs standalone 918.3 ms (instance variance); same-instance 526.4 vs 510.3 ms; focused chokepoint DNS +3.9 ms (`dns-focus-20260928T174245Z`) |
 | Leakage | `leak-20260928T200642Z.log` + host observer | VM **30 held / 0 contradicted / 0 inconclusive**; analyzer exit 0: 3 expected arrivals, 2 self-probes, **0 violations / 0 ambiguous**, heartbeats spanning the window |
 | Real-Tor APP | `app-real-tor-20260928T200015Z.log` | **17 held / 0 contradicted / 0 inconclusive** |
@@ -66,7 +66,7 @@ qualification harness).
 | | |
 |---|---|
 | VM | `ghostnector-qual`, Ubuntu 24.04.5, kernel 6.8.0-142, 4 vCPU, 7.9 GB RAM |
-| Network | NAT via `enp0s3` (10.0.2.15); SSH on the host's port 2222; guest timezone UTC (host UTC+4) |
+| Network | NAT via `enp0s3` (10.0.2.15); SSH forwarded to the host on port 2222; guest timezone UTC (host timezone offset measured per run) |
 | Product | installed from the repository's `packaging/install.sh` with the release binaries built from the tested commit |
 | Verification config | machine-wide phases: `--udp-check 10.0.2.2:18081 --check-url http://<validated IPv4>/`; APP phases: `--udp-check` only (the namespace denies UDP, and the probe treats that as the pass) |
 | Far side (leakage) | a host-side observer on the host loopback (the VM reaches it as 10.0.2.2) on UDP 18081, TCP 18082, UDP/TCP 53, with a 15 s liveness heartbeat |
@@ -124,7 +124,7 @@ probe and the core API the picker calls.
 `leak-20260927T135503Z.log`: VM-side **30 held / 0 contradicted / 0 inconclusive** (run exit 0);
 analyzer exit 0 with **30 phase records, 3 expected open-validation arrivals, 2 observer
 self-probes, 0 violations, 0 ambiguous**, heartbeats spanning the whole run window (18 beats, gaps
-≤ 38 s), and the protected path reporting `185.220.101.20` against the host's public `94.20.98.15`.
+≤ 38 s), and the protected path reporting `185.220.101.20` against the host's public `<host public IPv4>`.
 
 **While protection was reported, nothing reached the far side** — across the Tor SYSTEM, tamper,
 router-death, panic, I2P and APP windows. The APP window's two groups left through different

@@ -1,6 +1,9 @@
 # Ghostnector — Architecture Review & Recommended Design
 
-**Status:** design review, no implementation. Version 0.1 (draft for discussion).
+**Status:** design review that the implementation follows. Version 0.1 (the decisions here are the
+ones the qualified v1.0 product baseline `9b0fe5d` implements; where implementation corrected the
+review — for example the M8.0 dead-end wording and the D-50 per-namespace relay — the correction is
+recorded in the M8/M9/M10 decision records and the protection claims).
 **Scope:** Linux desktop (systemd-based), single-host. Not a router, not a VM gateway.
 **Author's stance:** challenge everything; keep only what survives.
 

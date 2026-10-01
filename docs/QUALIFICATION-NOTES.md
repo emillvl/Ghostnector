@@ -283,7 +283,7 @@ Result of the conclusive run (`leak-20260927T073453Z.log`, VM-side **27 held / 0
 inconclusive**; analyzer exit 0 after the heartbeat check was corrected): 30 phase records; the only
 far-side arrivals were the three open-validation probes (HTTP, UDP, DNS) and the two observer
 self-probes; **zero arrivals in any protected, tamper, router-death, panic, I2P or APP window**; the
-protected path reported `185.181.61.203` against a host public address of `94.20.98.15`; the
+protected path reported `185.181.61.203` against a host public address of `<host public IPv4>`; the
 observer's heartbeats span the whole run window. The two VM-side inconclusive items are the APP
 exit-address observations: the applications launch, are confined and are listed, but their
 transparent TCP cannot work with real Tor (D-50) — the addresses are therefore absent, and this is a
@@ -392,7 +392,7 @@ phase order that exposed the defect.
 * **Leakage** (`leak-20260927T135503Z.log`): VM-side **30/0/0** (run exit 0); analyzer exit 0 with
   30 phase records, 3 expected open-validation arrivals, 2 observer self-probes, **0 violations, 0
   ambiguous**, heartbeats spanning the run; the protected path reported `185.220.101.20` against
-  the host's public `94.20.98.15`; nothing reached the far side in any protected window; the APP
+  the host's public `<host public IPv4>`; nothing reached the far side in any protected window; the APP
   window's two groups left through different observed addresses.
 * **Performance** (`perf-20260927T144529Z.log`): direct DNS 1.91 ms; chokepoint DNS 162.6 ms
   (baseline Tor 276.3 ms); HTTP 0.896 s (baseline 0.803 s); machine-wide throughput 180.3 kB/s
@@ -458,8 +458,8 @@ was reset to a frozen commit through a git bundle before each phase, the release
 installed with `packaging/install.sh`, and every installed run used the same detached / durable-log
 procedure as the original campaign. Records (all under `/var/log/ghostnector-qual/` unless noted):
 
-* **APP launch** (`perf/app-launch-profile-20260928T173332Z.csv`, N=10; and the final installed
-  commit re-run `…T202434Z.csv`, N=10): the final installed product appears in p10/med/p90 =
+* **APP launch** (N=10 at the optimization commit, VM-side record; and the final installed
+  commit re-run `perf/app-launch-profile-20260928T202434Z.csv`, N=10): the final installed product appears in p10/med/p90 =
   291.9 / **301.9** / 352.7 ms (was 665.6 at `f82adf9`), with the application's own exec timestamp
   302.9 / 314.4 / 363.7 ms against a direct launch of 63.4 ms in the same run; the earlier run at
   the optimization commit measured 326.5 ms median. Helper CPU 21.7 ms/launch and RSS ≈2.95 MB (was
@@ -474,7 +474,7 @@ procedure as the original campaign. Records (all under `/var/log/ghostnector-qua
   VM-side **30 held / 0 contradicted / 0 inconclusive** (run exit 0); the analyzer returns exit 0
   with 30 phases, 5 arrivals, **3 expected open-validation arrivals**, 2 harness self-probes,
   **0 violations and 0 ambiguous**, the protected path reporting `192.42.116.103` against the host's
-  `94.20.98.15`, and heartbeats spanning the run window. The APP window's two groups reached the
+  `<host public IPv4>`, and heartbeats spanning the run window. The APP window's two groups reached the
   network through Tor with the intended destination, a direct namespace connection produced no data
   and a direct relay connection was refused.
 * **Focused real-Tor APP** (`app-real-tor-20260928T200015Z.log`): **17 held / 0 contradicted / 0

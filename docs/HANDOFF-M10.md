@@ -1,5 +1,11 @@
 # HANDOFF-M10 — build the Ghostnector GUI (GTK4)
 
+> **Historical.** This is the milestone kickoff note for M10, written before the GUI was built. M10 is
+> complete and qualified; the current records are
+> [`RELEASE-CANDIDATE-REPORT.md`](RELEASE-CANDIDATE-REPORT.md) and
+> [`QUALIFICATION-NOTES.md`](QUALIFICATION-NOTES.md). The repository state, hashes and counts below
+> are those at the time of writing and are deliberately left as they were.
+
 This document is for a fresh agent starting milestone **M10**. It assumes no knowledge of the
 conversation that produced it. Read this first, then the documents it points at. **Do not implement
 M10 before its architecture questions are answered and reviewed** (see §6).
@@ -41,8 +47,8 @@ M10 before its architecture questions are answered and reviewed** (see §6).
   **26 held / 0 contradicted / 1 inconclusive** — AS-4 by design).
 - **Native real-`i2pd` qualification** (`scripts/i2p-real-router-test.sh`): **29 held / 0
   contradicted / 0 inconclusive** on a clean Ubuntu 24.04.5 VM with real i2pd **2.61.0**.
-- Gate logs from the qualification run: `C:\Users\user\Desktop\m9-native-gate.log`,
-  `m9-native-qualification.log` (host artifacts; not in the repo).
+- Gate logs from the qualification run were kept on the host (`m9-native-gate.log`,
+  `m9-native-qualification.log`) and were not committed to the repository.
 
 **Recent commits worth knowing:** `4ad93da`…`8747afa` (M8/M9 phases), `264c208` (D-24 fix — the Tor
 control client), `b9499af` (M9.5 docs + qualification script; tagged rc4).
@@ -55,7 +61,7 @@ control client), `b9499af` (M9.5 docs + qualification script; tagged rc4).
   (M9), and the defect ledger **D-15…D-24**.
 - `docs/IMPLEMENTATION-PLAN.md` — per-milestone status.
 - `docs/M8-DECISIONS.md`, `docs/M9-DECISIONS.md` — binding decisions per milestone.
-- `docs/ARCHITECTURE-REVIEW.md`, `docs/RECOVERY.md` — the review the design answers to, and the
+- `../ARCHITECTURE-REVIEW.md`, `docs/RECOVERY.md` — the review the design answers to, and the
   documented recovery/escape paths.
 
 **How to run things (WSL):** `/root/gh <cmd>` sets the environment; `/root/m9-gate.sh` is the WSL

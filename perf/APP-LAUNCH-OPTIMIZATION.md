@@ -122,7 +122,7 @@ safe, measurable reduction was found that does not add concurrency or change the
 
 The optimized tree was frozen, rebuilt and installed from `packaging/install.sh` on
 `ghostnector-qual`, and the same profiler re-ran it (N=10, order alternated). The first run was at
-the optimization commit (`perf/app-launch-profile-20260928T173332Z.csv`); the last run is the final
+the optimization commit (a VM-side record, not kept in this repository); the last run is the final
 installed commit (`perf/app-launch-profile-20260928T202434Z.csv`):
 
 | build | p10 | median | p90 | direct median | added over direct |
