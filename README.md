@@ -1,5 +1,7 @@
 <p align="center">
   <img src="docs/assets/ghostnector-logo.png" alt="Ghostnector" width="640">
+  <br>
+  <sub><strong>LINUX · TOR / I2P · FAIL-CLOSED BY DESIGN</strong></sub>
 </p>
 
 # Ghostnector
@@ -19,6 +21,15 @@ an unprivileged GTK4 window or command-line client.
   before relying on it.
 - **License:** [Apache License 2.0](LICENSE).
 
+<p align="center">
+  <a href="#install-and-build">Set up</a> ·
+  <a href="#concepts">Choose a route</a> ·
+  <a href="#threat-model">Threat model</a> ·
+  <a href="#qualification-methodology">Qualification</a> ·
+  <a href="#benchmarks">Benchmarks</a> ·
+  <a href="#repository-documentation">Docs</a>
+</p>
+
 ---
 
 ## How protection works
@@ -32,9 +43,10 @@ nftables table, applies it atomically, and keeps the machine in a deny-first sta
 protected process cannot reach the network except through the configured path, and when Ghostnector
 cannot prove the path is working it blocks instead of returning to the clearnet.
 
-The fail-closed baseline is applied before other protection steps and removed last. If a check
-contradicts the claimed protection, the policy disappears, or a router stops, Ghostnector blocks
-traffic.
+> [!IMPORTANT]
+> The fail-closed baseline is applied before other protection steps and removed last. If a check
+> contradicts the claimed protection, the policy disappears, or a router stops, Ghostnector blocks
+> traffic.
 
 ## Platform: Linux only
 
@@ -61,6 +73,14 @@ A non-Linux backend could reuse the policy engine, but would need its own enforc
 protection claims.
 
 ## Concepts
+
+### Choose a route
+
+| Network | Scope | What it covers |
+|---|---|---|
+| Tor | [SYSTEM](#system-scope-machine-wide-transparent-tor) | Local processes across the machine |
+| Tor | [APP](#app-scope-per-application-namespace-isolation) | Only applications launched through `ghostnector run` |
+| I2P | [SYSTEM](#tor-and-i2p) | Machine-wide, client-only |
 
 ### SYSTEM scope: machine-wide transparent Tor
 
@@ -236,6 +256,8 @@ addresses between two APP groups give Tor an isolation key; they are not proof o
 The qualification measures what Ghostnector's own enforcement does, under a documented test
 environment. It does not prove anonymity.
 
+---
+
 ## Install and build
 
 ### Requirements
@@ -277,6 +299,15 @@ enforcement in both cases.
 The installer enables the system units but does not start the control plane immediately. After
 logging back in with the new group membership, run `sudo systemctl start ghostnector-core` before
 using the client.
+
+> [!WARNING]
+> Before connecting:
+>
+> - Starting whole-system protection **cuts remote SSH sessions** as soon as it begins (the deny-first
+>   baseline drops the server's replies, and transparent Tor carries outbound TCP only). Run the
+>   command from the console, or drive it from a detached script that disconnects when it is done.
+> - A persisted `Blocked` intent re-applies the baseline on the next start of the control plane. The
+>   documented recovery path is [`docs/RECOVERY.md`](docs/RECOVERY.md).
 
 ### Basic usage
 
@@ -321,14 +352,6 @@ chokepoint. All of them must be outside the local network, or `connect --lan` is
 explanation (the exception would make the check meaningless). The HTTP endpoint must be reachable
 **from a Tor exit**. Tor's own guard refuses a private or NAT-internal address. That is a
 correct fail-closed response, not a product failure.
-
-Before connecting:
-
-- Starting whole-system protection **cuts remote SSH sessions** as soon as it begins (the deny-first
-  baseline drops the server's replies, and transparent Tor carries outbound TCP only). Run the
-  command from the console, or drive it from a detached script that disconnects when it is done.
-- A persisted `Blocked` intent re-applies the baseline on the next start of the control plane. The
-  documented recovery path is [`docs/RECOVERY.md`](docs/RECOVERY.md).
 
 ### Build and test notes
 
@@ -429,6 +452,8 @@ The security model is defined by the review and made falsifiable by
 - **Honest state.** An inconclusive check is never shown as protection or as a leak; unconfigured
   checks are named; a verification result expires.
 
+---
+
 ## Qualification methodology
 
 Ghostnector was qualified as an installed product on a native Ubuntu VM, not only as source. The
@@ -446,9 +471,10 @@ guard across hard resets; create-path failure injection; APP and I2P adversarial
 adversarial suite; a full M1-M10 release gate; and a performance campaign followed by an APP-launch
 optimization and its requalification.
 
-**These are qualification results under the documented test environment and threat model.** They
-show that, on that environment, the claims held and the listed adversarial cases failed to falsify
-them. They are not a universal proof of anonymity, and an unconcluded check is never a pass.
+> [!NOTE]
+> **These are qualification results under the documented test environment and threat model.** They
+> show that, on that environment, the claims held and the listed adversarial cases failed to falsify
+> them. They are not a universal proof of anonymity, and an unconcluded check is never a pass.
 
 ### Qualification scoreboard (v1.0 product baseline `9b0fe5d`)
 
@@ -582,6 +608,8 @@ replaced it with `/proc` deltas.
   permissive (MIT / Apache-2.0); the one prominent nftables crate, `rustables`, is GPL-3.0, which is
   why the project uses the MIT-licensed netlink crates instead. See the risk register (R3) in
   [`docs/IMPLEMENTATION-PLAN.md`](docs/IMPLEMENTATION-PLAN.md).
+
+---
 
 ## Repository documentation
 
